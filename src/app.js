@@ -2390,7 +2390,6 @@ document.addEventListener("pointerdown", (e) => {
 // ---------- group voice mesh ----------
 let gpc = {}, groupCall = null;
 let ginBuf = {};
-function myNick() { return profile.nickname || settings.device_name; }
 function ensureGPC(peerIp) {
   if (gpc[peerIp]?.pc) return gpc[peerIp].pc;
   const c = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
