@@ -533,3 +533,24 @@ details.set-sec > .card:first-of-type { border-top: 0; }
 .scan-manual-row button { border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; }
 .scan-manual-row button:hover { color: #ff8085; }
 #scan-progress.hidden { display: none; }
+
+
+/* watch together mini window */
+#watch-together.wt-min {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  width: 360px;
+  z-index: 9999;
+  padding: 6px;
+}
+#watch-together.wt-min .modal {
+  width: 100%;
+  max-height: none;
+  overflow: visible;
+  background: var(--panel, #1a1d28);
+  border-radius: 12px;
+  box-shadow: 0 16px 40px rgba(0,0,0,.5);
+  border: 1px solid var(--line);
+}
+#watch-together .wt-modal-base { width: min(820px,94vw); max-height:86vh; overflow-y:auto; }

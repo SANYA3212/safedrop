@@ -4330,8 +4330,9 @@ window.onYouTubeIframeAPIReady = function () {
   wtState.ready = true; // guard re-entry
   try {
     wtState.player = new window.YT.Player("yt-player", {
+      host: "https://www.youtube-nocookie.com",
       videoId: "M7lc1UVf-VE",
-      playerVars: { enablejsapi: 1, rel: 0, modestbranding: 1, playsinline: 1 },
+      playerVars: { enablejsapi: 1, rel: 0, modestbranding: 1, playsinline: 1, origin: location.origin },
       events: {
         onReady: () => {
           wtState.ready = true;
@@ -4366,10 +4367,19 @@ function wg(t) { const e = $("#yt-status"); if (e) e.textContent = t; }
 
 function __wtTargets() {
   if (typeof inVoice !== "function" || !inVoice()) return [];
-  if (currentCall) return [currentCall];
-  if (groupCall && Array.isArray(groupCall.members)) return groupCall.members.filter((m) => m !== (typeof myIp === "function" ? myIp() : undefined));
+  if (currentCall) {
+    const p = peers.find((x) => x.ip === currentCall);
+    return (p && p.supports_watch === false) ? [] : [currentCall];
+  }
+  if (groupCall && Array.isArray(groupCall.members)) return groupCall.members.filter((m, i) => {
+    const q = peers.find((x) => x.ip === m);
+    return q ? (q.supports_watch !== false) : true;
+  });
   // group call mesh peers
-  return Object.keys(typeof gpc !== "undefined" ? gpc : {});
+  return Object.keys(typeof gpc !== "undefined" ? gpc : {}).filter((ip) => {
+    const q = peers.find((x) => x.ip === ip);
+    return q ? (q.supports_watch !== false) : true;
+  });
 }
 window.__wtTargets = __wtTargets;
 
@@ -4385,8 +4395,28 @@ function __wtSend(p) {
   });
 }
 
+function wtNick(ip, fallback) {
+  const pp = peers.find((x) => x.ip === ip);
+  return (pp && (pp.nickname || pp.name)) || fallback || ip || "Участник";
+}
+function wtHasSession() { return !!window.__wtId; }
+
+function wtStartSync() {
+  if (wtState.syncTimer) return;
+  wtState.syncTimer = setInterval(() => {
+    if (!wtHasSession() || !wtState.player || !wtState.player.getCurrentTime) return;
+    __wtSend({ action: "state", video: window.__wtId || wtState.player.getVideoData?.().video_id || "M7lc1UVf-VE", pos: wtState.player.getCurrentTime(), paused: wtState.player.getPlayerState() !== 1, at: Date.now() });
+  }, 4000);
+}
 function __apply(p) {
-  if (!wtState.player) return;
+  const who = wtNick(wtState.lastSrcIp || p.fromIp, p.from);
+  if (p.action === "load") wg(who + ": включил видео " + (p.video || ""));
+  else if (p.action === "play") wg(who + ": продолжил");
+  else if (p.action === "pause") wg(who + ": поставил на паузу");
+  if (p.action === "state-request" && wtHasSession()) {
+    if (wtState.player) __wtSend({ action: "state", video: window.__wtId || wtState.player.getVideoData()?.video_id, pos: wtState.player.getCurrentTime(), paused: wtState.player.getPlayerState() !== 1, at: Date.now() });
+    return;
+  }
   wtState.suppress = true;
   const lastMsg = p.from + "|" + (p.action) + "|" + (p.video || "") + "|" + (p.at || "");
   if (wtState.lastMsg === lastMsg) { wtState.suppress = false; return; }
@@ -4404,7 +4434,7 @@ function __apply(p) {
   else { try { wtState.player.playVideo(); } catch (e) {} }
   const v = Number($("#wt-vol")?.value || 70);
   try { wtState.player.setVolume(v); } catch (e) {}
-  setTimeout(() => { wtState.suppress = false; }, 1000);
+  setTimeout(() => { wtState.suppress = false; }, 300);
 }
 
 // инжект IFrame API если ещё не загружен
@@ -4415,8 +4445,13 @@ if (!document.querySelector('script[src*="youtube.com/iframe_api"]')) {
 }
 
 $("#vb-watch").onclick = function () {
-  const box = $("#watch-together"); if (box) { box.classList.remove("hidden"); wg("Инициализация..."); ensurePlayRoot(); }
+  const box = $("#watch-together"); if (box) { box.classList.remove("hidden"); wg("Инициализация..."); ensurePlayRoot(); __wtSend({ action: "state-request", video: window.__wtId || "", pos: 0, paused: true, at: Date.now() }); wtStartSync(); }
   $("#vb-watch").classList.add("hidden");
+};
+$("#cs-yt").onclick = function () {
+  const box = $("#watch-together"); if (box) { box.classList.remove("hidden"); wg("Инициализация..."); ensurePlayRoot(); __wtSend({ action: "state-request", video: window.__wtId || "", pos: 0, paused: true, at: Date.now() }); wtStartSync(); }
+  $("#vb-watch").classList.add("hidden");
+  $("#cs-yt").classList.add("on");
 };
 function ensurePlayRoot() {
   if (wtState.player) return;
@@ -4425,7 +4460,9 @@ function ensurePlayRoot() {
   setTimeout(ensurePlayRoot, 500);
 }
 
-$("#wt-close-me").onclick = function () {
+$("#wt-min").onclick = function () {
+  $("#watch-together").classList.toggle("wt-min");
+};
   $("#watch-together").classList.add("hidden"); $("#vb-watch").classList.remove("hidden");
 };
 $("#wt-stop-all").onclick = function () {
@@ -4464,13 +4501,15 @@ $("#wt-vol").oninput = function (e) {
   if (wtState.player) { try { wtState.player.setVolume(Number(e.target.value)); } catch (e) {} }
 };
 
-// register listener after a tick
-setTimeout(function () {
-  if (typeof listen === "function") {
-    listen("safedrop-watch", async (e) => {
+// register listener normally (no delayed setTimeout wrapper)
+if (typeof listen === "function") {
+  (async () => {
+    try {
+      await listen("safedrop-watch", async (e) => {
       const t = e.payload || {}; const p = t.payload || {};
       if (p.kind !== "yt-sync") return;
-      if (p.from === (typeof myNick === "function" ? myNick() : "")) return;
+      const srcIp = t.ip || p.ip || "";
+      if (srcIp && srcIp === myIp) return;
       if (wtState.suppress) return;
       if (p.action === "stop") {
         if (wtState.player) { try { wtState.player.stopVideo(); } catch (e) {} }
@@ -4479,10 +4518,11 @@ setTimeout(function () {
         wg("Сессия остановлена");
         return;
       }
+      wtState.lastSrcIp = t.ip || p.ip;
       __apply(p);
-    }).catch(() => {});
-  }
-}, 50);
+      } catch (err) { console.error("watch listener failed", err); }
+    })();
+}
 
 // export helper for ticks
 window.__wtSend = __wtSend;
