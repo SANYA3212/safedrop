@@ -4463,6 +4463,7 @@ function ensurePlayRoot() {
 $("#wt-min").onclick = function () {
   $("#watch-together").classList.toggle("wt-min");
 };
+$("#wt-close-me").onclick = function () {
   $("#watch-together").classList.add("hidden"); $("#vb-watch").classList.remove("hidden");
 };
 $("#wt-stop-all").onclick = function () {
@@ -4520,8 +4521,9 @@ if (typeof listen === "function") {
       }
       wtState.lastSrcIp = t.ip || p.ip;
       __apply(p);
-      } catch (err) { console.error("watch listener failed", err); }
-    })();
+      });
+    } catch (err) { console.error("watch listener failed", err); }
+  })();
 }
 
 // export helper for ticks
