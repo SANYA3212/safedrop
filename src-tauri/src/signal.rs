@@ -26,9 +26,9 @@ pub struct GroupRef {
 #[serde(tag = "kind")]
 pub(crate) enum Frame {
     #[serde(rename = "hello")]
-    Hello { nickname: String, avatar: String, device: String, #[serde(default)] file_confirm: bool, #[serde(default)] chat_ack: bool, #[serde(default)] group_sync: GroupSyncState },
+    Hello { nickname: String, avatar: String, device: String, #[serde(default)] file_confirm: bool, #[serde(default)] chat_ack: bool, #[serde(default)] watch: bool, #[serde(default)] group_sync: GroupSyncState },
     #[serde(rename = "hello-reply")]
-    HelloReply { nickname: String, avatar: String, device: String, #[serde(default)] file_confirm: bool, #[serde(default)] chat_ack: bool, #[serde(default)] group_sync: GroupSyncState },
+    HelloReply { nickname: String, avatar: String, device: String, #[serde(default)] file_confirm: bool, #[serde(default)] chat_ack: bool, #[serde(default)] watch: bool, #[serde(default)] group_sync: GroupSyncState },
     #[serde(rename = "group-sync")]
     GroupSync { #[serde(default)] state: GroupSyncState },
     #[serde(rename = "chat")]
@@ -90,6 +90,10 @@ pub(crate) enum Frame {
     ChatReact { from: String, nickname: String, id: String, emoji: String, #[serde(default)] remove: bool },
     #[serde(rename = "chat-typing")]
     ChatTyping { from: String, nickname: String, #[serde(default)] to_group: Option<String> },
+    #[serde(rename = "yt-sync")]
+    YtSync { from: String, #[serde(default)] ip: String, #[serde(default)] nickname: String, #[serde(default)] action: String, #[serde(default)] video: String, #[serde(default)] pos: f64, #[serde(default)] paused: bool, #[serde(default)] at: i64, #[serde(default)] to_group: Option<String> },
+    #[serde(other)]
+    Unknown,
 }
 
 /// Hash of a profile (nick+avatar) for cheap change detection.
@@ -354,7 +358,7 @@ pub(crate) async fn process_frame(
     let now = chrono::Local::now().format("%H:%M").to_string();
 
     match frame {
-        Frame::Hello { nickname, avatar, device, file_confirm, chat_ack, group_sync } => {
+        Frame::Hello { nickname, avatar, device, file_confirm, chat_ack, watch, group_sync } => {
             merge_group_sync(app, group_sync, Some(&ip)).await;
             let avatar = trim_avatar(&avatar);
             {
@@ -363,7 +367,7 @@ pub(crate) async fn process_frame(
                     ip: ip.clone(), name: device.clone(), nickname: String::new(),
                     avatar: String::new(), custom_avatar: String::new(),
                     trusted: false, online: true, ping_ms: None, last_seen: None,
-                    supports_file_confirm: file_confirm, supports_chat_ack: chat_ack,
+                    supports_file_confirm: file_confirm, supports_chat_ack: chat_ack, supports_watch: watch,
                     phash: String::new(), state: "idle".into(), detail: String::new(),
                     ips: vec![ip.clone()],
                 });
@@ -372,6 +376,7 @@ pub(crate) async fn process_frame(
                 e.phash = profile_hash(&nickname, &avatar);
                 e.supports_file_confirm = file_confirm;
                 e.supports_chat_ack = chat_ack;
+                e.supports_watch = watch;
                 e.online = true;
                 if !e.ips.contains(&ip) { e.ips.push(ip.clone()); }
                 e.last_seen = Some(chrono::Local::now().format("%H:%M:%S").to_string());
@@ -392,7 +397,7 @@ pub(crate) async fn process_frame(
                 )
             };
             let group_sync = state.group_sync.lock().await.clone();
-            let reply = serde_json::json!({"kind":"hello-reply","nickname":nn,"avatar":av,"device":dev,"file_confirm":true,"chat_ack":true,"group_sync":group_sync});
+            let reply = serde_json::json!({"kind":"hello-reply","nickname":nn,"avatar":av,"device":dev,"file_confirm":true,"chat_ack":true,"watch":true,"group_sync":group_sync});
             let mut out = serde_json::to_string(&reply).unwrap_or_default();
             out.push('\n');
             // write back on same stream
@@ -401,7 +406,7 @@ pub(crate) async fn process_frame(
             let ip2 = ip.clone();
             tokio::spawn(async move { flush_pending_for_peer(&app2, &ip2, true).await; });
         }
-        Frame::HelloReply { nickname, avatar, device, file_confirm, chat_ack, group_sync } => {
+        Frame::HelloReply { nickname, avatar, device, file_confirm, chat_ack, watch, group_sync } => {
             // only happens on client side reading; ignore on server
             let _ = (nickname, avatar, device, file_confirm, chat_ack);
             merge_group_sync(app, group_sync, Some(&ip)).await;
@@ -699,7 +704,7 @@ pub(crate) async fn process_frame(
                     ip: ip.clone(), name: device.clone(), nickname: String::new(),
                     avatar: String::new(), custom_avatar: String::new(),
                     trusted: false, online: true, ping_ms: None, last_seen: None,
-                    supports_file_confirm: false, supports_chat_ack: false,
+                    supports_file_confirm: false, supports_chat_ack: false, supports_watch: false,
                     phash: String::new(), state: "idle".into(), detail: String::new(),
                     ips: vec![ip.clone()],
                 });
@@ -833,6 +838,22 @@ pub(crate) async fn process_frame(
                 "ip": ip, "from": from, "nickname": nickname, "group": to_group,
             }));
         }
+
+        Frame::YtSync { from, nickname, action, video, pos, paused, at, .. } => {
+            let nm = if nickname.is_empty() { from.clone() } else { nickname.clone() };
+            let payload = serde_json::json!({
+                "kind":"yt-sync",
+                "from": nm,
+                "ip": ip,
+                "action": action,
+                "video": video,
+                "pos": pos,
+                "paused": paused,
+                "at": at,
+            });
+            let _ = app.emit("safedrop-watch", serde_json::json!({"ip": ip, "payload": payload}));
+        }
+        Frame::Unknown => { }
     }
     Ok(())
 }
@@ -1149,7 +1170,7 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
         )
     };
     let group_sync = state.group_sync.lock().await.clone();
-    let v = serde_json::json!({"kind":"hello","nickname":nn,"avatar":av,"device":dev,"file_confirm":true,"chat_ack":true,"group_sync":group_sync});
+    let v = serde_json::json!({"kind":"hello","nickname":nn,"avatar":av,"device":dev,"file_confirm":true,"chat_ack":true,"watch":true,"group_sync":group_sync});
     let reply = match send_frame(ip, port, v.clone(), true).await {
         Ok(Some(r)) => Some(r),
         _ if udp_on => crate::quic::send_frame_quic(ip, udp_port, v, true).await.ok().flatten(),
@@ -1167,6 +1188,7 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
                 let dev = reply.get("device").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 let file_confirm = reply.get("file_confirm").and_then(|x| x.as_bool()).unwrap_or(false);
                 let chat_ack = reply.get("chat_ack").and_then(|x| x.as_bool()).unwrap_or(false);
+                let watch = reply.get("watch").and_then(|x| x.as_bool()).unwrap_or(false);
                 {
                     let mut g = state.peers.lock().await;
                     if let Some(p) = g.get_mut(ip) {
@@ -1176,6 +1198,8 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
                         p.avatar = av2;
                         p.supports_file_confirm = file_confirm;
                         p.supports_chat_ack = chat_ack;
+                        p.supports_watch = watch;
+                        p.supports_watch = watch;
                         if p.name.is_empty() || p.name == p.ip {
                             p.name = if dev.is_empty() { nn } else { dev };
                         }

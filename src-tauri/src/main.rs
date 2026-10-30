@@ -135,7 +135,7 @@ async fn add_peer(
         name: if name.trim().is_empty() { ip.clone() } else { name.trim().to_string() },
         nickname: String::new(), avatar: String::new(), custom_avatar: String::new(),
         trusted: true, online: false, ping_ms: None, last_seen: None,
-        supports_file_confirm: false, supports_chat_ack: false,
+        supports_file_confirm: false, supports_chat_ack: false, supports_watch: false,
         phash: String::new(), state: "idle".into(), detail: String::new(),
         ips: vec![ip.clone()],
     };
@@ -292,7 +292,7 @@ async fn refresh_live_inner(app: &tauri::AppHandle, state: &tauri::State<'_, App
                     ip: ip.clone(), name: ip.clone(), nickname: String::new(),
                     avatar: String::new(), custom_avatar: String::new(),
                     trusted: false, online: true,
-                    supports_file_confirm: false, supports_chat_ack: false,
+                    supports_file_confirm: false, supports_chat_ack: false, supports_watch: false,
                     ping_ms: Some(*ping), last_seen: Some(now.clone()),
                     phash: String::new(), state: "idle".into(), detail: String::new(),
                     ips: vec![ip.clone()],

@@ -722,10 +722,10 @@ function refreshRow(row, m, p, g, myLetter, myNick) {
     row.querySelector(".mhead time").textContent = msgTime(m);
     row.querySelector(".ava.sm > span").innerHTML = avaInner(av, letter);
     // текст мог измениться (правка сообщения) — перерисовываем только если реально другой
-    const p = row.querySelector("p");
-    if (p && p.dataset.raw !== (m.text || "")) {
-      p.dataset.raw = m.text || "";
-      p.innerHTML = renderMsgText(m.text);
+    const pEl = row.querySelector("p");
+    if (pEl && pEl.dataset.raw !== (m.text || "")) {
+      pEl.dataset.raw = m.text || "";
+      pEl.innerHTML = renderMsgText(m.text);
     }
     // метка «изменено»
     const head = row.querySelector(".mhead");
@@ -756,7 +756,9 @@ function refreshRow(row, m, p, g, myLetter, myNick) {
         };
       });
     }
-  } catch {}
+  } catch (e) {
+    console.error("refreshRow", e);
+  }
 }
 function renderChat() {
   const key = curKey();

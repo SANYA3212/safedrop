@@ -331,6 +331,8 @@ pub struct Peer {
     #[serde(default)]
     pub supports_chat_ack: bool,
     #[serde(default)]
+    pub supports_watch: bool,
+    #[serde(default)]
     pub online: bool,
     #[serde(default)]
     pub ping_ms: Option<u64>,
