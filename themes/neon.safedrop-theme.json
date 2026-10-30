@@ -1,0 +1,13 @@
+{
+  "name": "Neon",
+  "bg_mode": "gradient",
+  "bg_color": "#0b0020",
+  "bg_gradient": "linear-gradient(135deg,#2b0066,#00b3ff)",
+  "bg_image": "",
+  "blur": 8,
+  "opacity": 0.88,
+  "accent": "#00e5ff",
+  "radius": 18,
+  "font": "Segoe UI",
+  "custom_css": ""
+}

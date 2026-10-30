@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SafeDrop — макет звонка</title>
+<link rel="stylesheet" href="styles.css" />
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #090910; }
+  body { font-family: "Segoe UI", system-ui, sans-serif; color: #f2f3f5; }
+  .cm { position: relative; width: 100vw; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+  .cm-bg { position: absolute; inset: -40px; background:
+      radial-gradient(900px 520px at 50% 42%, rgba(124,58,237,.55), transparent 65%),
+      radial-gradient(700px 460px at 72% 18%, rgba(168,85,247,.28), transparent 70%),
+      linear-gradient(180deg, #1b1230 0%, #24133c 42%, #120d20 100%);
+      filter: saturate(1.15); }
+  .cm-bg::after { content: ""; position: absolute; inset: 0; background: url("logo.png") center 48% / 520px no-repeat; opacity: .12; filter: blur(42px); }
+  .cm-top { position: relative; z-index: 3; height: 44px; flex: 0 0 44px; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: rgba(5,6,10,.52); border-bottom: 1px solid rgba(255,255,255,.07); backdrop-filter: blur(18px); }
+  .cm-server { display: flex; align-items: center; gap: 9px; min-width: 190px; }
+  .cm-badge { width: 27px; height: 27px; border-radius: 50%; background: #23a559; display: grid; place-items: center; font-size: 13px; font-weight: 800; color: #fff; box-shadow: 0 0 0 3px rgba(35,165,89,.16); }
+  .cm-server b { font-size: 14px; letter-spacing: .4px; text-transform: uppercase; }
+  .cm-live { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 7px 0 4px; border-radius: 4px; background: rgba(255,255,255,.06); color: #dbdee1; font-size: 12px; font-weight: 700; }
+  .cm-live i { width: 22px; height: 15px; border-radius: 3px; background: linear-gradient(135deg,#5865f2,#00a8fc); display: grid; place-items: center; font-style: normal; font-size: 10px; }
+  .cm-top-mid { position: absolute; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 14px; }
+  .cm-top-mid .cm-live { margin-right: 6px; }
+  .cm-ico { width: 24px; height: 24px; display: grid; place-items: center; color: #b5bac1; opacity: .95; }
+  .cm-ico svg { width: 19px; height: 19px; fill: currentColor; }
+  .cm-search { margin-left: auto; width: 238px; height: 27px; border-radius: 7px; background: rgba(0,0,0,.42); border: 1px solid rgba(255,255,255,.05); display: flex; align-items: center; gap: 7px; padding: 0 9px; color: #949ba4; font-size: 12px; }
+  .cm-search input { all: unset; flex: 1; min-width: 0; color: #dbdee1; }
+  .cm-search svg { width: 15px; height: 15px; fill: currentColor; }
+  .cm-stage { position: relative; z-index: 2; flex: 1; display: grid; place-items: center; padding-bottom: 72px; }
+  .cm-avatar-wrap { position: relative; width: 148px; height: 148px; border-radius: 50%; padding: 4px; background: linear-gradient(145deg,#45d67c,#1f9c52); box-shadow: 0 0 0 4px rgba(35,165,89,.16), 0 22px 60px rgba(0,0,0,.45); }
+  .cm-avatar { width: 100%; height: 100%; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #eaf2ff, #b8c9e8 55%, #7f95bb); display: grid; place-items: center; overflow: hidden; border: 3px solid #16121f; }
+  .cm-avatar img { width: 78%; height: 78%; object-fit: contain; filter: drop-shadow(0 6px 10px rgba(0,0,0,.35)); }
+  .cm-controls { position: absolute; z-index: 4; left: 50%; bottom: 16px; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; }
+  .cm-btn { position: relative; height: 44px; min-width: 52px; padding: 0 10px; border: 0; border-radius: 9px; background: #1e1f22; color: #f2f3f5; display: inline-flex; align-items: center; justify-content: center; gap: 4px; cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,.28); }
+  .cm-btn:hover { background: #2b2d31; }
+  .cm-btn svg { width: 21px; height: 21px; fill: currentColor; }
+  .cm-btn .chev { width: 10px; height: 10px; fill: #b5bac1; }
+  .cm-btn.off { color: #ff8b8f; }
+  .cm-btn.hang { min-width: 62px; background: #da373c; }
+  .cm-btn.hang:hover { background: #ed4245; }
+  .cm-btn.hang svg { width: 23px; height: 23px; }
+  .cm-sep { width: 1px; height: 28px; background: rgba(255,255,255,.09); margin: 0 2px; }
+</style>
+</head>
+<body>
+<div class="cm">
+  <div class="cm-bg"></div>
+  <header class="cm-top">
+    <div class="cm-server"><span class="cm-badge">М</span><b>МУСОРКА</b></div>
+    <div class="cm-top-mid">
+      <span class="cm-live"><i>▣</i>ВКЛЮЧЕНО</span>
+      <span class="cm-ico" title="Закреплённые"><svg viewBox="0 0 24 24"><path d="M12 2l2.9 6.1 6.7.9-4.9 4.7 1.2 6.6L12 17.2 6.1 20.3l1.2-6.6L2.4 9l6.7-.9z"/></svg></span>
+      <span class="cm-ico" title="Участники"><svg viewBox="0 0 24 24"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm7 1a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM2 20a7 7 0 0 1 14 0v1H2zm15 1v-1a8.9 8.9 0 0 0-2.3-6A5 5 0 0 1 22 19v2z"/></svg></span>
+      <span class="cm-ico" title="Профиль"><svg viewBox="0 0 24 24"><circle cx="12" cy="7" r="4"/><path d="M4 21a8 8 0 0 1 16 0z"/></svg></span>
+    </div>
+    <div class="cm-search"><input placeholder="Искать «МУСОРКА»" /><svg viewBox="0 0 24 24"><path d="M10 2a8 8 0 1 0 4.9 14.3l5 5 1.4-1.4-5-5A8 8 0 0 0 10 2zm0 2a6 6 0 1 1 0 12 6 6 0 0 1 0-12z"/></svg></div>
+  </header>
+  <main class="cm-stage">
+    <div class="cm-avatar-wrap">
+      <div class="cm-avatar"><img src="logo.png" alt="SafeDrop" /></div>
+    </div>
+  </main>
+  <div class="cm-controls">
+    <button class="cm-btn" title="Микрофон"><svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1H3v1a9 9 0 0 0 8 8.9V22h2v-2.1a9 9 0 0 0 8-8.9v-1z"/></svg><svg class="chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg></button>
+    <button class="cm-btn" title="Наушники"><svg viewBox="0 0 24 24"><path d="M12 2a9 9 0 0 0-9 9v7a3 3 0 0 0 3 3h2v-8H5v-2a7 7 0 0 1 14 0v2h-3v8h2a3 3 0 0 0 3-3v-7a9 9 0 0 0-9-9z"/></svg><svg class="chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg></button>
+    <button class="cm-btn" title="Камера"><svg viewBox="0 0 24 24"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11z"/></svg></button>
+    <button class="cm-btn" title="Демонстрация экрана"><svg viewBox="0 0 24 24"><path d="M3 4h18a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1h-7v2h3v2H7v-2h3v-2H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm1 2v9h16V6z"/></svg></button>
+    <button class="cm-btn" title="Звуковая панель"><svg viewBox="0 0 24 24"><path d="M12 2l1.5 4.5L18 8l-4.5 1.5L12 14l-1.5-4.5L6 8l4.5-1.5z"/><path d="M19 13l1 3 3 1-3 1-1 3-1-3-3-1 3-1z"/><path d="M5 14l.8 2.2L8 17l-2.2.8L5 20l-.8-2.2L2 17l2.2-.8z"/></svg></button>
+    <button class="cm-btn" title="Ещё"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg></button>
+    <span class="cm-sep"></span>
+    <button class="cm-btn hang" title="Завершить звонок"><svg viewBox="0 0 24 24"><path d="M21 15v3.9a2 2 0 0 1-2.3 2A18 18 0 0 1 3.1 5.3 2 2 0 0 1 5.1 3H9a1 1 0 0 1 1 .9 10.7 10.7 0 0 0 1 3.8 1 1 0 0 1-.4 1.3l-.9.5a1 1 0 0 0-.3 1.5 14 14 0 0 0 3.7 3.7 1 1 0 0 0 1.5-.3l.5-.9a1 1 0 0 1 1.3-.4 10.7 10.7 0 0 0 3.8 1 1 1 0 0 1 .8 1z"/></svg></button>
+  </div>
+</div>
+<script type="module" src="tauri-shim.js"></script>
+</body>
+</html>

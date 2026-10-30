@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>SafeDrop YT test</title>
+<style>
+  body { background:#0d0f16; color:#e8ecf5; font: 15px/1.5 "Segoe UI",sans-serif; margin:0; padding:14px; }
+  h1 { font-size:18px; margin:0 0 6px; }
+  .meta { color:#8b93a7; font-size:12px; margin-bottom:10px; }
+  table { border-collapse:collapse; width:100%; }
+  td,th { border:1px solid #2a2f3d; padding:6px 8px; text-align:left; vertical-align:top; }
+  th { color:#9aa3b8; font-weight:600; font-size:12px; }
+  .ok { color:#3ddc84; font-weight:700; }
+  .err { color:#ff8085; font-weight:700; }
+  .wait { color:#f5c518; }
+  iframe { width:240px; height:135px; border:0; background:#000; }
+  #log { margin-top:10px; font-size:12px; color:#8b93a7; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Проверка встраивания YouTube в WebView2</h1>
+<div class="meta" id="meta">…</div>
+<table>
+  <thead><tr><th>#</th><th>Вариант</th><th>Плеер</th><th>Статус API</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div id="log"></div>
+<script>
+const V = [
+  { id: "std-origin", label: "youtube.com + origin", src: "https://www.youtube.com/embed/M7lc1UVf-VE?enablejsapi=1&origin=" + encodeURIComponent(location.origin) + "&widget_referrer=" + encodeURIComponent(location.origin) + "&mute=1" },
+  { id: "nocookie-origin", label: "youtube-nocookie + origin", src: "https://www.youtube-nocookie.com/embed/M7lc1UVf-VE?enablejsapi=1&origin=" + encodeURIComponent(location.origin) + "&widget_referrer=" + encodeURIComponent(location.origin) + "&mute=1" },
+  { id: "std-plain", label: "youtube.com без origin", src: "https://www.youtube.com/embed/M7lc1UVf-VE?enablejsapi=1&mute=1" },
+  { id: "nocookie-plain", label: "youtube-nocookie без origin", src: "https://www.youtube-nocookie.com/embed/M7lc1UVf-VE?enablejsapi=1&mute=1" }
+];
+const rows = document.getElementById("rows");
+const log = document.getElementById("log");
+document.getElementById("meta").textContent =
+  "location.origin = " + location.origin + " | referrer = " + (document.referrer || "(пусто)") + " | ua = " + navigator.userAgent;
+V.forEach((v, i) => {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td>${i + 1}</td><td>${v.label}</td><td id="p-${v.id}"></td><td id="s-${v.id}" class="wait">ждём…</td>`;
+  rows.appendChild(tr);
+});
+function note(v, text, cls) {
+  const el = document.getElementById("s-" + v.id);
+  el.textContent = text;
+  el.className = cls || "";
+  log.textContent += `[${new Date().toLocaleTimeString()}] ${v.label}: ${text}\n`;
+}
+let pending = V.slice();
+window.onYouTubeIframeAPIReady = function () {
+  log.textContent += `[${new Date().toLocaleTimeString()}] iframe_api ready, origin=${location.origin}\n`;
+  V.forEach((v) => {
+    const holder = document.createElement("div");
+    holder.id = "h-" + v.id;
+    document.getElementById("p-" + v.id).appendChild(holder);
+    try {
+      v.player = new YT.Player(holder, {
+        videoId: "M7lc1UVf-VE",
+        playerVars: { enablejsapi: 1, mute: 1, autoplay: 1, origin: location.origin },
+        events: {
+          onReady: (e) => {
+            note(v, "API ready → playVideo()");
+            try { e.target.mute(); e.target.playVideo(); } catch (err) { note(v, "play error: " + err, "err"); }
+          },
+          onStateChange: (e) => {
+            const names = { "-1": "unstarted", "0": "ended", "1": "playing", "2": "paused", "3": "buffering", "5": "cued" };
+            note(v, "state=" + (names[String(e.data)] || e.data) + " (" + e.data + ")");
+          },
+          onError: (e) => {
+            const meaning = { 2: "неверный id", 5: "HTML5 error", 100: "видео не найдено", 101: "встраивание запрещено", 150: "встраивание запрещено", 153: "нет referer/origin" };
+            note(v, "ОШИБКА " + e.data + " — " + (meaning[e.data] || "?"), "err");
+          }
+        }
+      });
+    } catch (err) {
+      note(v, "new YT.Player error: " + err, "err");
+    }
+  });
+  setTimeout(() => {
+    V.forEach((v) => {
+      if (!v.player || !v.player.getPlayerState) return;
+      try {
+        const st = v.player.getPlayerState();
+        if (st === undefined || st === null) return;
+        note(v, "итог: state=" + st + ", embed=" + (v.player.getVideoEmbedCode ? "ok" : "?"), st === 1 || st === 3 || st === 5 ? "ok" : "wait");
+      } catch (err) { note(v, "итог: нет доступа к player: " + err, "err"); }
+    });
+  }, 12000);
+};
+</script>
+<script src="https://www.youtube.com/iframe_api"></script>
+</body>
+</html>

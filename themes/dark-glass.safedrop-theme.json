@@ -1,0 +1,13 @@
+{
+  "name": "Dark Glass",
+  "bg_mode": "gradient",
+  "bg_color": "#141824",
+  "bg_gradient": "linear-gradient(135deg,#1a2138,#0d1020)",
+  "bg_image": "",
+  "blur": 14,
+  "opacity": 0.92,
+  "accent": "#5b8cff",
+  "radius": 14,
+  "font": "Segoe UI",
+  "custom_css": ""
+}
