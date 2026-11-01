@@ -1936,6 +1936,7 @@ function hideCallUI() {
     void closeScreensForPeer(endedPeer);
   }
   currentCall = null; clearInterval(callTimer); ringbackStop(); ringbackStop();
+  try { wtEndCall(); } catch (e) { console.error("watch end", e); }
   iceOutBuf = []; iceInBuf = [];
   $("#btn-hangup").classList.add("hidden");
   $("#call-panel").classList.add("hidden");
@@ -2172,6 +2173,15 @@ function renderCallStage() {
     d.onclick = () => openWatch(id);
     box.appendChild(d);
   }
+  const wtInfo = typeof wtSessionInfo === "function" ? wtSessionInfo() : null;
+  if (wtInfo) {
+    const d = document.createElement("div");
+    d.className = "vtile screen-tile wt-call-tile";
+    d.innerHTML = wtTileHTML(wtInfo);
+    d.querySelector(".watch-btn").onclick = (e) => { e.stopPropagation(); wtOpen(); };
+    d.onclick = () => wtOpen();
+    box.appendChild(d);
+  }
   renderCallScreen();
 }
 function switchSeg(name) {
@@ -2313,6 +2323,16 @@ function renderCallScreenStage() {
     tile.onclick = () => { if (!s.mine) openWatch(s.id, true); };
     sharesBox.appendChild(tile);
   }
+  const wtInfo = typeof wtSessionInfo === "function" ? wtSessionInfo() : null;
+  if (wtInfo && match(wtInfo.title)) {
+    const tile = document.createElement("div");
+    tile.className = "cs-share wt-tile";
+    tile.innerHTML = wtTileHTML(wtInfo);
+    tile.querySelector(".watch-btn").onclick = (e) => { e.stopPropagation(); wtOpen(); };
+    tile.onclick = () => wtOpen();
+    sharesBox.appendChild(tile);
+    box.classList.add("has-shares");
+  }
   const people = [];
   if (groupCall) {
     people.push({ key: "me", name: "Ты", ava: `<span class="ava lg"><span>${avaInner(profile.avatar, ((profile.nickname || settings?.device_name || "?")[0] || "?").toUpperCase())}</span></span>`, muted: micMuted });
@@ -2336,7 +2356,7 @@ function renderCallScreenStage() {
     peopleBox.appendChild(tile);
   }
   box.classList.toggle("single", !shares.length && people.length === 1);
-  if (!shares.length && !people.length) sharesBox.innerHTML = '<div class="muted">Никого не найдено</div>';
+  if (!shares.length && !people.length && !wtInfo) sharesBox.innerHTML = '<div class="muted">Никого не найдено</div>';
 }
 function renderCallScreen() {
   const scr = $("#call-screen"); if (!scr) return;
@@ -2345,7 +2365,12 @@ function renderCallScreen() {
   document.body.classList.toggle("call-screen", active);
   document.body.classList.toggle("call-compact", inVoice() && !callScreenOpen);
   syncCallScreenEsc(active);
-  if (!active) return;
+  if (!active) {
+    const sb = $("#cs-shares"), pb = $("#cs-people");
+    if (sb) sb.innerHTML = "";
+    if (pb) pb.innerHTML = "";
+    return;
+  }
   const info = callBadgeInfo();
   const badge = $("#cs-badge"), name = $("#cs-title"), search = $("#cs-search");
   if (badge) {
@@ -2486,6 +2511,7 @@ function endGroupCall(silent) {
     dropRemoteVoice(ip);
   }
   gpc = {}; ginBuf = {}; groupCall = null;
+  try { wtEndCall(); } catch (e) { console.error("watch end", e); }
   monDrop("me");
   if (!currentCall) {
     clearInterval(callTimer);
@@ -4314,221 +4340,867 @@ try {
 } catch {}
 
 // ---------- совместный просмотр YouTube ----------
-const wtState = { suppress: false, last: 0, timer: null, ready: false, id: null };
-window.__wtId = window.__wtId || null;
-
-function parseYT(url) {
-  const m = String(url || "").match(/(?:youtube\.com\/(?:watch\?[^ ]*v=|shorts\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{6,})/);
-  const t = String(url || "").match(/[?&#]t=(\d+)/);
-  return { id: m && m[1], start: t ? Number(t[1]) : 0 };
-}
-
-function yg(t) { const e = $("#yt-status"); if (e) e.textContent = t; }
-
-window.onYouTubeIframeAPIReady = function () {
-  if (wtState.ready) return;
-  wtState.ready = true; // guard re-entry
-  try {
-    wtState.player = new window.YT.Player("yt-player", {
-      host: "https://www.youtube-nocookie.com",
-      videoId: "M7lc1UVf-VE",
-      playerVars: { enablejsapi: 1, rel: 0, modestbranding: 1, playsinline: 1, origin: location.origin },
-      events: {
-        onReady: () => {
-          wtState.ready = true;
-          wg("Плеер готов.");
-          if (wtState.timer) clearInterval(wtState.timer);
-          wtState.timer = setInterval(() => {
-            if (!wtState.player || !wtState.player.getCurrentTime) return;
-            const cur = wtState.player.getCurrentTime(); const dur = wtState.player.getDuration() || 0;
-            const time = $("#wt-time"); if (time) time.textContent = __fmt(cur) + " / " + __fmt(dur);
-            const sk = $("#wt-seek"); if (sk) { sk.max = Math.round(dur || 300); sk.value = Math.round(cur); }
-          }, 1000);
-          wg("Плеер готов.");
-        },
-        onStateChange: (e) => {
-          if (wtState.suppress) return;
-          const st = e && e.data;
-          const paused = st !== 1;
-          __wtSend({ action: paused ? "pause" : "play", video: window.__wtId, pos: wtState.player.getCurrentTime(), paused });
-        },
-        onError: (e) => {
-          wg("Это видео нельзя воспроизвести во встроенном плеере (ошибка " + (e && e.data) + ")");
-        }
-      }
-    });
-  } catch (err) {
-    wg("Ошибка инициализации плеера: " + err);
-  }
+// Сессия живёт, пока идёт звонок. Плеер создаётся один раз и переиспользуется
+// для большого окна, мини-окна и повторного входа.
+const WT_POS_KEY = "sd.wt.mini";
+const WT_VOL_KEY = "sd.wt.vol";
+const wtState = {
+  player: null, apiStarted: false, apiPoll: null, playerReady: false,
+  videoId: null, title: "", by: "", vertical: false,
+  session: false, open: false, mini: false, joining: false,
+  applyingUntil: 0, justLoadedUntil: 0, joinedUntil: 0, contentDuration: 0,
+  seen: {}, lastAt: 0, seq: 0,
+  syncTimer: null, uiTimer: null, readyTimer: null, nowTimer: null,
+  seeking: false, vol: 70, muted: false,
+  pending: null, remotePos: 0, remotePaused: true,
+  viewers: {},
 };
-
-function __fmt(s) { const m = Math.floor(s/60); const r = Math.floor(s%60); return m + ":" + String(r).padStart(2, "0"); }
-function wg(t) { const e = $("#yt-status"); if (e) e.textContent = t; }
-
-function __wtTargets() {
-  if (typeof inVoice !== "function" || !inVoice()) return [];
-  if (currentCall) {
-    const p = peers.find((x) => x.ip === currentCall);
-    return (p && p.supports_watch === false) ? [] : [currentCall];
-  }
-  if (groupCall && Array.isArray(groupCall.members)) return groupCall.members.filter((m, i) => {
-    const q = peers.find((x) => x.ip === m);
-    return q ? (q.supports_watch !== false) : true;
-  });
-  // group call mesh peers
-  return Object.keys(typeof gpc !== "undefined" ? gpc : {}).filter((ip) => {
-    const q = peers.find((x) => x.ip === ip);
-    return q ? (q.supports_watch !== false) : true;
-  });
-}
-window.__wtTargets = __wtTargets;
+window.__wtId = window.__wtId || null;
+let wtUiSig = "";
 
 function myNick() { return profile.nickname || settings?.device_name || "Я"; }
+function wtQ(id) { return document.getElementById(id); }
+function wtOn(id, ev, fn) { const el = wtQ(id); if (el) el.addEventListener(ev, fn); return el; }
+function wtFmt(s) {
+  s = Math.max(0, Number(s) || 0);
+  const m = Math.floor(s / 60), r = Math.floor(s % 60);
+  return m + ":" + String(r).padStart(2, "0");
+}
+function wtNick(ip, fallback) {
+  try {
+    const p = typeof callPeerByIp === "function" ? callPeerByIp(ip) : null;
+    if (p) return dispName(p);
+  } catch {}
+  return fallback || ip || "Участник";
+}
 
-function __name() { return myNick(); }
+function parseYT(url) {
+  const raw = String(url || "");
+  const m = raw.match(/(?:youtube\.com\/(?:watch\?[^ ]*v=|shorts\/|embed\/|live\/)|youtu\.be\/)([A-Za-z0-9_-]{6,})/);
+  const t = raw.match(/[?&#]t=(\d+)/);
+  return { id: m && m[1], start: t ? Number(t[1]) : 0, vertical: /\/shorts\//.test(raw) };
+}
 
-function __wtSend(p) {
-  const targets = __wtTargets(); if (!targets.length) return;
-  const payload = Object.assign({ from: myNick(), at: Date.now(), kind: "yt-sync" }, p);
-  targets.forEach((ip) => {
-    invoke("sig_send", { peerIp: ip, payload: { kind: "yt-sync", ...payload } }).catch(() => {});
+function wtHasSession() { return !!wtState.session && !!wtState.videoId; }
+function wtIsWatching() { return !!(wtState.open || wtState.mini); }
+function wtSessionInfo() {
+  if (!wtHasSession()) return null;
+  return { id: wtState.videoId, title: wtState.title || "Видео", by: wtState.by || "", vertical: !!wtState.vertical };
+}
+
+function wtTargets() {
+  if (typeof inVoice !== "function" || !inVoice()) return [];
+  let list = [];
+  if (currentCall) list = [currentCall];
+  else if (groupCall && Array.isArray(groupCall.members)) list = groupCall.members.slice();
+  else if (typeof gpc !== "undefined") list = Object.keys(gpc);
+  const myIpV = typeof myIp === "function" ? myIp() : "";
+  list = [...new Set(list)].filter((ip) => ip && ip !== myIpV);
+  return list.filter((ip) => {
+    const p = (typeof peers !== "undefined" ? peers : []).find((x) => x.ip === ip);
+    return !p || p.supports_watch !== false;
   });
 }
 
-function wtNick(ip, fallback) {
-  const pp = peers.find((x) => x.ip === ip);
-  return (pp && (pp.nickname || pp.name)) || fallback || ip || "Участник";
+function wtSetSession(videoId, title, by, vertical) {
+  if (wtState.videoId !== videoId) wtState.contentDuration = 0;
+  wtState.videoId = videoId;
+  wtState.session = true;
+  wtState.title = title || "Видео";
+  wtState.by = by || wtState.by || myNick();
+  wtState.vertical = !!vertical;
+  window.__wtId = videoId;
+  wtQ("watch-together")?.classList.toggle("wt-vert", !!vertical);
+  wtRefreshUI();
 }
-function wtHasSession() { return !!window.__wtId; }
 
+function wtClearSession() {
+  wtState.session = false; wtState.videoId = null; wtState.title = ""; wtState.by = "";
+  wtState.vertical = false; wtState.pending = null;
+  wtState.remotePos = 0; wtState.remotePaused = true; wtState.viewers = {};
+  window.__wtId = null;
+  wtQ("watch-together")?.classList.remove("wt-vert");
+  wtRefreshUI();
+}
+
+function wtAdopt(p) {
+  if (!p.video) return;
+  wtSetSession(p.video, p.title || "Видео", p.by || p.from || wtState.by, !!p.vertical);
+  wtState.remotePos = Number(p.pos) || 0;
+  wtState.remotePaused = !!p.paused;
+}
+
+function wtSend(payload, directIp) {
+  if (typeof inVoice !== "function" || !inVoice()) return;
+  const targets = directIp ? [directIp] : wtTargets();
+  if (!targets.length) return;
+  const msg = Object.assign({
+    kind: "yt-sync",
+    from: myNick(),
+    at: Date.now(),
+    seq: ++wtState.seq,
+    video: wtState.videoId || "",
+    title: wtState.title || "",
+    by: wtState.by || "",
+    vertical: !!wtState.vertical,
+    watching: wtIsWatching(),
+  }, payload || {});
+  for (const ip of targets) invoke("sig_send", { peerIp: ip, payload: msg }).catch(() => {});
+}
+
+function wtSendState(directIp) {
+  if (!wtHasSession() || !wtState.playerReady || !wtState.player) return;
+  let pos = wtState.remotePos, paused = true, dur = 0;
+  try {
+    pos = wtState.player.getCurrentTime() || 0;
+    dur = wtState.player.getDuration() || 0;
+    paused = wtState.player.getPlayerState() !== 1;
+    const vd = wtState.player.getVideoData ? wtState.player.getVideoData() : null;
+    if (vd && vd.title && wtState.title === "Видео") wtState.title = vd.title;
+  } catch {}
+  // Реклама: не рассылаем позицию рекламного ролика как позицию видео.
+  if (!directIp && dur > 0 && dur < 30 && wtState.contentDuration > 60) return;
+  wtSend({ action: "state", pos, paused, watching: wtIsWatching(), dur }, directIp);
+}
+
+function wtMarkViewer(ip, watching) {
+  if (!ip || !watching) return;
+  wtState.viewers[ip] = Date.now();
+}
+function wtViewerCount() {
+  const now = Date.now();
+  let n = wtIsWatching() ? 1 : 0;
+  for (const [ip, ts] of Object.entries(wtState.viewers)) {
+    if (now - ts > 12000) { delete wtState.viewers[ip]; continue; }
+    if (ip !== (typeof myIp === "function" ? myIp() : "")) n++;
+  }
+  return n;
+}
+
+function wtStatus(text) {
+  const el = wtQ("wt-now");
+  if (el) el.textContent = text || "";
+  if (wtState.nowTimer) clearTimeout(wtState.nowTimer);
+  if (text) wtState.nowTimer = setTimeout(() => {
+    const e2 = wtQ("wt-now");
+    if (e2) e2.textContent = wtHasSession() ? "Идёт совместный просмотр" : "";
+  }, 8000);
+}
+function wtLoadText(text) { const el = wtQ("wt-load-text"); if (el) el.textContent = text || ""; }
+function wtShowLoader(on, text) {
+  const l = wtQ("wt-loader"); if (!l) return;
+  l.classList.toggle("hidden", !on);
+  if (text) wtLoadText(text);
+}
+function wtShowError(text, retry = true) {
+  wtShowLoader(false);
+  const box = wtQ("wt-error"), t = wtQ("wt-error-text"), b = wtQ("wt-error-retry");
+  if (t) t.textContent = text || "Ошибка плеера";
+  if (b) b.classList.toggle("hidden", !retry);
+  box?.classList.remove("hidden");
+}
+function wtHideError() { wtQ("wt-error")?.classList.add("hidden"); }
+function wtShowEmpty(on) { wtQ("wt-empty")?.classList.toggle("hidden", !on); }
+function wtHideMenu() { wtQ("wt-menu")?.classList.add("hidden"); }
+
+function wtSyncEntryButtons() {
+  const on = wtHasSession();
+  for (const id of ["vb-watch", "cs-yt"]) wtQ(id)?.classList.toggle("on", on);
+}
+function wtRefreshViewers() {
+  const el = wtQ("wt-viewers");
+  if (!el) return;
+  const n = wtViewerCount();
+  el.textContent = wtHasSession() && n > 0 ? "смотрят: " + n : "";
+}
+function wtRefreshUI() {
+  const info = wtSessionInfo();
+  const title = wtQ("wt-title");
+  if (title) title.textContent = info ? (info.title || "Видео") : "Смотреть вместе";
+  const by = wtQ("wt-by");
+  if (by) by.textContent = info && info.by ? "включил(а) " + info.by : "";
+  wtSyncEntryButtons();
+  wtRefreshViewers();
+  const sig = [info ? info.id : "", info ? info.title : "", info ? info.by : ""].join("|");
+  if (sig !== wtUiSig) {
+    wtUiSig = sig;
+    if (typeof inVoice === "function" && inVoice() && typeof renderCallStage === "function") renderCallStage();
+  }
+}
+
+function wtTileHTML(info) {
+  return `<img class="wt-thumb" src="https://i.ytimg.com/vi/${esc(info.id)}/mqdefault.jpg" alt="">` +
+    `<b>Смотреть вместе</b><small>${esc(info.title || "Видео")}</small>` +
+    (info.by ? `<small class="wt-tile-by">${esc(info.by)}</small>` : "") +
+    `<button class="watch-btn">Смотреть</button>`;
+}
+
+// ---------- плеер ----------
+function wtEnsureApi() {
+  if (wtState.apiStarted) return;
+  wtState.apiStarted = true;
+  if (!document.querySelector('script[src*="youtube.com/iframe_api"]')) {
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    tag.onerror = () => wtShowError("Не удалось загрузить YouTube. Проверьте подключение к интернету.", true);
+    document.head.appendChild(tag);
+  }
+  wtState.apiPoll = setInterval(() => {
+    if (window.YT && window.YT.Player) {
+      clearInterval(wtState.apiPoll); wtState.apiPoll = null;
+      wtCreatePlayer();
+    }
+  }, 250);
+}
+window.onYouTubeIframeAPIReady = function () { wtCreatePlayer(); };
+
+function wtCreatePlayer() {
+  if (wtState.player) { if (wtState.playerReady) wtPlayerReady(); return; }
+  if (!(window.YT && window.YT.Player)) return;
+  const root = wtQ("yt-player");
+  if (!root) return;
+  try {
+    let saved = Number(localStorage.getItem(WT_VOL_KEY));
+    wtState.vol = isFinite(saved) && saved >= 0 ? Math.min(100, Math.max(0, saved)) : 70;
+    wtState.player = new window.YT.Player("yt-player", {
+      host: "https://www.youtube-nocookie.com",
+      width: "100%", height: "100%",
+      playerVars: {
+        enablejsapi: 1, rel: 0, modestbranding: 1, playsinline: 1,
+        controls: 0, disablekb: 1, fs: 0, origin: location.origin,
+      },
+      events: { onReady: wtPlayerReady, onStateChange: wtOnPlayerState, onError: wtOnPlayerError },
+    });
+    if (wtState.readyTimer) clearTimeout(wtState.readyTimer);
+    wtState.readyTimer = setTimeout(() => {
+      if (!wtState.playerReady) wtShowError("Плеер YouTube не ответил за 10 секунд.", true);
+    }, 10000);
+  } catch (e) {
+    wtShowError("Ошибка инициализации плеера: " + (e && e.message ? e.message : e), true);
+  }
+}
+
+function wtPlayerReady() {
+  if (wtState.playerReady) return;
+  wtState.playerReady = true;
+  if (wtState.readyTimer) { clearTimeout(wtState.readyTimer); wtState.readyTimer = null; }
+  try { wtState.player.setVolume(wtState.vol || 70); } catch {}
+  const volEl = wtQ("wt-vol");
+  if (volEl) volEl.value = String(wtState.vol || 70);
+  wtShowLoader(false); wtHideError(); wtShowEmpty(false);
+  if (!wtState.uiTimer) wtState.uiTimer = setInterval(wtUpdateControls, 500);
+  wtApplyPending();
+  wtUpdateControls();
+  wtPokeControls();
+}
+
+function wtApplyPending() {
+  if (!wtState.playerReady || !wtState.player) return;
+  const p = wtState.pending;
+  wtState.pending = null;
+  if (p && p.id) {
+    try {
+      wtState.applyingUntil = Date.now() + 900;
+      wtState.justLoadedUntil = Date.now() + 1800;
+      wtState.player.loadVideoById(p.id, Number(p.pos) || 0);
+      if (p.paused) wtState.player.pauseVideo(); else wtState.player.playVideo();
+    } catch {}
+    return;
+  }
+  if (wtHasSession() && wtState.videoId && wtIsWatching()) {
+    try {
+      const vid = wtState.player.getVideoData ? wtState.player.getVideoData()?.video_id : "";
+      if (vid !== wtState.videoId) {
+        wtState.applyingUntil = Date.now() + 900;
+        wtState.justLoadedUntil = Date.now() + 1800;
+        wtState.player.loadVideoById(wtState.videoId, Number(wtState.remotePos) || 0);
+        if (wtState.remotePaused) wtState.player.pauseVideo(); else wtState.player.playVideo();
+      }
+    } catch {}
+  }
+}
+
+function wtOnPlayerState(e) {
+  const st = e && e.data;
+  if (st === 3) { if (wtIsWatching()) wtShowLoader(true, "Буферизация…"); }
+  else if (st === 1 || st === 2 || st === 5) wtShowLoader(false);
+  wtUpdateControls();
+  // Команды шлём только из наших кнопок: так реклама и служебные
+  // переключения YouTube не рассылаются участникам как действия пользователя.
+}
+
+function wtOnPlayerError(e) {
+  const code = e && e.data;
+  const map = {
+    2: "Неверная ссылка на видео.",
+    5: "Ошибка HTML5-плеера.",
+    100: "Видео недоступно или удалено.",
+    101: "Автор запретил встраивание этого видео.",
+    150: "Автор запретил встраивание этого видео.",
+    153: "Автор запретил встраивание этого видео.",
+  };
+  wtShowError((map[code] || "Не удалось воспроизвести видео (ошибка " + code + ").") + " У остальных участников сессия продолжается.", true);
+}
+
+function wtUpdateControls() {
+  const p = wtState.player;
+  if (!p || !wtState.playerReady) return;
+  let cur = 0, dur = 0, st = -1;
+  try {
+    cur = p.getCurrentTime() || 0; dur = p.getDuration() || 0; st = p.getPlayerState();
+    if (dur > 30 && dur > (wtState.contentDuration || 0)) wtState.contentDuration = dur;
+    if (dur > 30 && wtState.contentDuration === 0) wtState.contentDuration = dur;
+    const vd = p.getVideoData ? p.getVideoData() : null;
+    if (vd && vd.title && wtHasSession() && vd.title !== wtState.title) {
+      wtState.title = vd.title;
+      wtRefreshUI();
+    }
+  } catch {}
+  const seek = wtQ("wt-seek");
+  if (seek && !wtState.seeking && document.activeElement !== seek) {
+    seek.max = String(Math.max(1, Math.round(dur || 1)));
+    seek.value = String(Math.min(cur, dur || cur || 1));
+  }
+  const time = wtQ("wt-time");
+  if (time) time.textContent = wtFmt(cur) + " / " + wtFmt(dur);
+  const toggle = wtQ("wt-toggle");
+  if (toggle) toggle.innerHTML = st === 1
+    ? '<svg class="ic" viewBox="0 0 24 24"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>'
+    : '<svg class="ic" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
+  wtSyncMuteIcon();
+}
+
+function wtSyncMuteIcon() {
+  const b = wtQ("wt-mute");
+  if (!b) return;
+  let muted = false, vol = wtState.vol;
+  try { muted = !!wtState.player?.isMuted?.(); vol = wtState.player?.getVolume?.() ?? vol; } catch {}
+  b.innerHTML = (muted || vol === 0)
+    ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
+    : '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><path d="M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z"/></svg>';
+}
+
+function wtTogglePlay() {
+  const p = wtState.player;
+  if (!p || !wtState.playerReady) return;
+  let playing = false, pos = 0;
+  try { playing = p.getPlayerState() === 1; pos = p.getCurrentTime() || 0; } catch {}
+  try { if (playing) p.pauseVideo(); else p.playVideo(); } catch {}
+  if (wtHasSession()) {
+    wtSend({ action: playing ? "pause" : "play", pos, paused: playing });
+    wtStatus(myNick() + (playing ? ": поставил на паузу" : ": включил"));
+  }
+  setTimeout(wtUpdateControls, 120);
+}
+
+function wtSeekBy(delta) {
+  const p = wtState.player;
+  if (!p || !wtState.playerReady) return;
+  let cur = 0, dur = 0;
+  try { cur = p.getCurrentTime() || 0; dur = p.getDuration() || 0; } catch {}
+  const pos = Math.max(0, Math.min(dur || Infinity, cur + delta));
+  try { wtState.applyingUntil = Date.now() + 500; p.seekTo(pos, true); } catch {}
+  wtSend({ action: "seek", pos, paused: p.getPlayerState() !== 1 });
+  wtStatus(myNick() + ": перемотал на " + wtFmt(pos));
+  wtUpdateControls();
+}
+
+// ---------- применение удалённых команд ----------
+function wtAccept(p) {
+  const from = p.ip || p.from || "";
+  const seq = Number(p.seq || 0);
+  if (seq > 0) {
+    if (seq <= (wtState.seen[from] || 0)) return false;
+    wtState.seen[from] = seq;
+  }
+  const at = Number(p.at || 0);
+  if (at > 0 && wtState.lastAt && at < wtState.lastAt - 2500) return false;
+  if (at > wtState.lastAt) wtState.lastAt = at;
+  return true;
+}
+
+function wtApplyState(p) {
+  wtAdopt(p);
+  const expected = Number(p.pos || 0) + (p.paused ? 0 : Math.max(0, (Date.now() - Number(p.at || Date.now())) / 1000));
+  wtState.remotePos = expected;
+  wtState.remotePaused = !!p.paused;
+  if (!wtIsWatching() || !wtState.playerReady || !wtState.player) { wtRefreshUI(); return; }
+  try {
+    const vid = wtState.player.getVideoData ? wtState.player.getVideoData()?.video_id : "";
+    const isNewVideo = !!p.video && p.video !== vid;
+    const joining = Date.now() < (wtState.joinedUntil || 0);
+    if (isNewVideo || joining) {
+      wtState.applyingUntil = Date.now() + 1100;
+      wtState.justLoadedUntil = Date.now() + 1900;
+      if (isNewVideo) wtState.player.loadVideoById(p.video, expected);
+      if (p.paused) wtState.player.pauseVideo(); else wtState.player.playVideo();
+    } else {
+      // Периодическая коррекция: только позиция, без команд паузы/плея,
+      // и без прыжков на десятки секунд (так реклама одного участника
+      // не перематывает видео у остальных).
+      const cur = wtState.player.getCurrentTime() || 0;
+      const diff = Math.abs(expected - cur);
+      if (diff > 1.5 && diff < 15) {
+        wtState.applyingUntil = Date.now() + 700;
+        wtState.player.seekTo(expected, true);
+      }
+    }
+  } catch {}
+  wtShowLoader(false);
+  wtUpdateControls();
+  wtRefreshUI();
+}
+
+function wtApplyCommand(p) {
+  if (!p.video && p.action !== "stop") return;
+  if (p.video) wtAdopt(p);
+  if (!wtIsWatching() || !wtState.playerReady || !wtState.player) { wtRefreshUI(); return; }
+  const who = wtNick(p.ip || "", p.from);
+  const pos = Number(p.pos || 0);
+  try {
+    if (p.action === "load") {
+      wtState.applyingUntil = Date.now() + 1100;
+      wtState.justLoadedUntil = Date.now() + 1900;
+      wtState.player.loadVideoById(p.video, pos);
+      if (p.paused) wtState.player.pauseVideo(); else wtState.player.playVideo();
+      wtStatus(who + ": включил видео");
+      wtShowLoader(false);
+    } else if (p.action === "seek") {
+      wtState.applyingUntil = Date.now() + 700;
+      wtState.player.seekTo(pos, true);
+      wtStatus(who + ": перемотал на " + wtFmt(pos));
+    } else if (p.action === "play" || p.action === "pause") {
+      const cur = wtState.player.getCurrentTime() || 0;
+      if (Math.abs(pos - cur) > 1.5) {
+        wtState.applyingUntil = Date.now() + 700;
+        wtState.player.seekTo(pos, true);
+      }
+      wtState.applyingUntil = Date.now() + 700;
+      if (p.action === "play") wtState.player.playVideo(); else wtState.player.pauseVideo();
+      wtStatus(who + (p.action === "play" ? ": включил" : ": поставил на паузу"));
+    }
+  } catch {}
+  wtUpdateControls();
+  wtRefreshUI();
+}
+
+function wtRemoteStop() {
+  try { wtState.player?.stopVideo(); } catch {}
+  wtCloseMe(true);
+  wtClearSession();
+  wtStatus("Сессия просмотра остановлена");
+  toast("Смотреть вместе: сессия остановлена");
+}
+
+function wtStopAll() {
+  askConfirm("Остановить просмотр для всех?", "Плеер закроется у всех участников звонка.", "Остановить").then((ok) => {
+    if (!ok) return;
+    wtSend({ action: "stop" });
+    try { wtState.player?.stopVideo(); } catch {}
+    wtCloseMe(true);
+    wtClearSession();
+    toast("Смотреть вместе остановлено");
+  });
+}
+
+// ---------- открытие / сворачивание ----------
+function wtOpenChange() {
+  const row = wtQ("wt-change-row");
+  if (!row) return;
+  row.classList.remove("hidden");
+  const input = wtQ("wt-url");
+  if (input) {
+    if (!input.value && wtState.videoId) input.value = "https://youtu.be/" + wtState.videoId;
+    setTimeout(() => input.focus(), 30);
+  }
+}
+function wtCloseChange() { wtQ("wt-change-row")?.classList.add("hidden"); }
+
+function wtLoadVideo(url) {
+  const pr = parseYT(url);
+  if (!pr.id) {
+    wtStatus("Не ссылка на YouTube. Пример: youtu.be/… или youtube.com/watch?v=…");
+    toast("Не ссылка на YouTube", true);
+    return;
+  }
+  wtSetSession(pr.id, "Видео YouTube", myNick(), !!pr.vertical);
+  wtState.remotePos = pr.start || 0;
+  wtState.remotePaused = false;
+  wtHideError(); wtShowEmpty(false); wtShowLoader(true, "Загрузка видео…");
+  if (wtState.playerReady && wtState.player) {
+    try {
+      wtState.applyingUntil = Date.now() + 1100;
+      wtState.justLoadedUntil = Date.now() + 1900;
+      wtState.player.loadVideoById(pr.id, pr.start || 0);
+      wtState.player.playVideo();
+    } catch {}
+  } else {
+    wtState.pending = { id: pr.id, pos: pr.start || 0, paused: false };
+    wtEnsureApi();
+  }
+  wtSend({ action: "load", video: pr.id, pos: pr.start || 0, paused: false });
+  wtStatus(myNick() + ": включил видео");
+  wtCloseChange();
+  wtUpdateControls();
+}
+
+function wtSubmitChange() {
+  const input = wtQ("wt-url");
+  wtLoadVideo(input ? input.value.trim() : "");
+}
+
+function wtOpen() {
+  if (typeof inVoice === "function" && !inVoice()) return toast("Смотреть вместе доступно во время звонка", true);
+  const root = wtQ("watch-together");
+  if (!root) return;
+  root.classList.remove("hidden", "wt-min", "wt-fullscreen");
+  root.classList.toggle("wt-vert", !!wtState.vertical);
+  wtState.open = true; wtState.mini = false; wtState.joining = true;
+  wtState.joinedUntil = Date.now() + 6000;
+  wtSyncMiniButton();
+  wtHideMenu(); wtCloseChange();
+  if (wtState.playerReady) wtShowLoader(false); else wtShowLoader(true, "Загрузка плеера…");
+  wtShowEmpty(false); wtHideError();
+  wtStatus("");
+  wtRefreshUI();
+  wtEnsureApi();
+
+  if (wtHasSession()) {
+    if (wtState.playerReady && wtState.player) {
+      try {
+        const vid = wtState.player.getVideoData ? wtState.player.getVideoData()?.video_id : "";
+        if (vid !== wtState.videoId) {
+          wtState.applyingUntil = Date.now() + 1000;
+          wtState.justLoadedUntil = Date.now() + 1800;
+          wtState.player.loadVideoById(wtState.videoId, Number(wtState.remotePos) || 0);
+          if (wtState.remotePaused) wtState.player.pauseVideo(); else wtState.player.playVideo();
+        }
+      } catch {}
+      wtSend({ action: "state-request" });
+      wtState.joining = false;
+    } else {
+      wtState.pending = { id: wtState.videoId, pos: wtState.remotePos || 0, paused: wtState.remotePaused !== false };
+    }
+  } else {
+    wtState.joining = false;
+    wtSend({ action: "state-request" });
+  }
+
+  setTimeout(() => {
+    wtState.joining = false;
+    if (!wtState.open) return;
+    if (!wtHasSession()) { wtShowLoader(false); wtShowEmpty(true); }
+    else wtShowLoader(false);
+    wtUpdateControls();
+    wtPokeControls();
+  }, 1600);
+}
+
+function wtCloseMe(silent) {
+  const root = wtQ("watch-together");
+  root?.classList.add("hidden");
+  root?.classList.remove("wt-min", "wt-fullscreen");
+  root?.style.removeProperty("left"); root?.style.removeProperty("top");
+  root?.style.removeProperty("right"); root?.style.removeProperty("bottom");
+  root?.style.removeProperty("width");
+  wtState.open = false; wtState.mini = false;
+  try { wtState.player?.pauseVideo(); } catch {}
+  wtHideMenu(); wtCloseChange(); wtHideError(); wtShowEmpty(false);
+  wtShowLoader(true, "Загрузка плеера…");
+  if (!silent) wtStatus(wtHasSession() ? "Вы не смотрите. Вернуться можно по плитке в звонке." : "");
+  wtSyncMiniButton();
+  wtSyncEntryButtons();
+  wtRefreshUI();
+}
+
+function wtSyncMiniButton() {
+  const b = wtQ("wt-min");
+  if (!b) return;
+  b.innerHTML = wtState.mini
+    ? '<svg class="ic" viewBox="0 0 24 24"><path d="M5,5H11V7H7V11H5Z"/><path d="M13,17h4V13h2v6H13Z"/></svg>'
+    : '<svg class="ic" viewBox="0 0 24 24"><path d="M5 12h14"/></svg>';
+  b.title = wtState.mini ? "Развернуть" : "Свернуть в мини-окно";
+}
+
+function wtSetMini(on) {
+  const root = wtQ("watch-together");
+  if (!root) return;
+  if (on) {
+    root.classList.remove("hidden", "wt-fullscreen");
+    root.classList.add("wt-min");
+    wtState.mini = true; wtState.open = true;
+    wtRestoreMiniPos();
+    wtHideMenu(); wtCloseChange();
+  } else {
+    root.classList.remove("wt-min", "wt-fullscreen");
+    wtState.mini = false; wtState.open = true;
+    for (const k of ["left", "top", "right", "bottom", "width"]) root.style.removeProperty(k);
+    wtUpdateControls();
+    wtPokeControls();
+  }
+  wtSyncMiniButton();
+  wtRefreshUI();
+}
+
+function wtToggleMini() { wtSetMini(!wtState.mini); }
+
+function wtToggleFull() {
+  const root = wtQ("watch-together");
+  if (!root) return;
+  const on = !root.classList.contains("wt-fullscreen");
+  root.classList.toggle("wt-fullscreen", on);
+  if (on) { root.classList.remove("wt-min"); wtState.mini = false; wtState.open = true; }
+  wtUpdateControls();
+}
+
+function wtPokeControls() {
+  const st = wtQ("wt-stage");
+  if (!st) return;
+  st.classList.remove("idle");
+  if (wtState._idleTimer) clearTimeout(wtState._idleTimer);
+  wtState._idleTimer = setTimeout(() => {
+    if (wtState.mini) return;
+    let playing = false;
+    try { playing = wtState.player?.getPlayerState?.() === 1; } catch {}
+    if (playing) st.classList.add("idle");
+  }, 2500);
+}
+
+function wtRetryPlayer() {
+  wtHideError();
+  wtShowLoader(true, "Перезапуск плеера…");
+  if (wtState.player && wtState.playerReady) { wtApplyPending(); return; }
+  try { wtState.player?.destroy?.(); } catch {}
+  wtState.player = null; wtState.playerReady = false;
+  if (wtState.apiPoll) { clearInterval(wtState.apiPoll); wtState.apiPoll = null; }
+  wtState.apiStarted = false;
+  wtEnsureApi();
+}
+
+function wtEndCall() {
+  try { wtState.player?.stopVideo(); } catch {}
+  wtCloseMe(true);
+  wtClearSession();
+}
+
+// ---------- мини-окно: перетаскивание и размер ----------
+function wtBindDrag(el, handleSel, key, enabled) {
+  const handle = el?.querySelector(handleSel);
+  if (!handle || handle.dataset.wtDrag) return;
+  handle.dataset.wtDrag = "1";
+  let start = null;
+  handle.addEventListener("pointerdown", (e) => {
+    if (enabled && !enabled()) return;
+    if (e.button !== 0 || e.target.closest("button, input, a")) return;
+    const r = el.getBoundingClientRect();
+    start = { x: e.clientX, y: e.clientY, left: r.left, top: r.top };
+    try { handle.setPointerCapture(e.pointerId); } catch {}
+    e.preventDefault();
+  });
+  handle.addEventListener("pointermove", (e) => {
+    if (!start) return;
+    const r = el.getBoundingClientRect();
+    let left = start.left + (e.clientX - start.x);
+    let top = start.top + (e.clientY - start.y);
+    left = Math.max(4, Math.min(left, innerWidth - r.width - 4));
+    top = Math.max(4, Math.min(top, innerHeight - r.height - 4));
+    el.style.left = left + "px"; el.style.top = top + "px";
+    el.style.right = "auto"; el.style.bottom = "auto";
+  });
+  const stop = () => {
+    if (!start) return;
+    start = null;
+    try { localStorage.setItem(key, JSON.stringify({ left: el.style.left, top: el.style.top, width: el.style.width })); } catch {}
+  };
+  handle.addEventListener("pointerup", stop);
+  handle.addEventListener("pointercancel", stop);
+}
+
+function wtBindResize(el, handleSel, key, enabled, min = 240) {
+  const handle = el?.querySelector(handleSel);
+  if (!handle || handle.dataset.wtResize) return;
+  handle.dataset.wtResize = "1";
+  let start = null;
+  handle.addEventListener("pointerdown", (e) => {
+    if (enabled && !enabled()) return;
+    const r = el.getBoundingClientRect();
+    start = { x: e.clientX, w: r.width };
+    try { handle.setPointerCapture(e.pointerId); } catch {}
+    e.preventDefault(); e.stopPropagation();
+  });
+  handle.addEventListener("pointermove", (e) => {
+    if (!start) return;
+    const w = Math.max(min, Math.min(innerWidth - 20, start.w + (e.clientX - start.x)));
+    el.style.width = w + "px";
+  });
+  const stop = () => {
+    if (!start) return;
+    start = null;
+    try { localStorage.setItem(key, JSON.stringify({ left: el.style.left, top: el.style.top, width: el.style.width })); } catch {}
+  };
+  handle.addEventListener("pointerup", stop);
+  handle.addEventListener("pointercancel", stop);
+}
+
+function wtRestoreMiniPos() {
+  const root = wtQ("watch-together");
+  if (!root) return;
+  try {
+    const saved = JSON.parse(localStorage.getItem(WT_POS_KEY) || "null");
+    if (!saved) return;
+    const savedW = parseFloat(saved.width);
+    if (savedW > 0) root.style.width = Math.min(savedW, innerWidth - 20) + "px";
+    if (saved.left) root.style.left = saved.left;
+    if (saved.top) root.style.top = saved.top;
+    if (saved.left || saved.top) { root.style.right = "auto"; root.style.bottom = "auto"; }
+    requestAnimationFrame(() => {
+      const rr = root.getBoundingClientRect();
+      let l = parseFloat(root.style.left || "NaN");
+      let t = parseFloat(root.style.top || "NaN");
+      if (!isFinite(l)) l = rr.left;
+      if (!isFinite(t)) t = rr.top;
+      l = Math.max(4, Math.min(l, innerWidth - rr.width - 4));
+      t = Math.max(4, Math.min(t, innerHeight - rr.height - 4));
+      root.style.left = l + "px"; root.style.top = t + "px";
+    });
+  } catch {}
+}
+
+// ---------- синхронизация ----------
 function wtStartSync() {
   if (wtState.syncTimer) return;
   wtState.syncTimer = setInterval(() => {
-    if (!wtHasSession() || !wtState.player || !wtState.player.getCurrentTime) return;
-    __wtSend({ action: "state", video: window.__wtId || wtState.player.getVideoData?.().video_id || "M7lc1UVf-VE", pos: wtState.player.getCurrentTime(), paused: wtState.player.getPlayerState() !== 1, at: Date.now() });
+    if (!wtHasSession() || !wtIsWatching()) { wtRefreshViewers(); return; }
+    wtSendState();
+    wtRefreshViewers();
   }, 4000);
 }
-function __apply(p) {
-  const who = wtNick(wtState.lastSrcIp || p.fromIp, p.from);
-  if (p.action === "load") wg(who + ": включил видео " + (p.video || ""));
-  else if (p.action === "play") wg(who + ": продолжил");
-  else if (p.action === "pause") wg(who + ": поставил на паузу");
-  if (p.action === "state-request" && wtHasSession()) {
-    if (wtState.player) __wtSend({ action: "state", video: window.__wtId || wtState.player.getVideoData()?.video_id, pos: wtState.player.getCurrentTime(), paused: wtState.player.getPlayerState() !== 1, at: Date.now() });
-    return;
-  }
-  wtState.suppress = true;
-  const lastMsg = p.from + "|" + (p.action) + "|" + (p.video || "") + "|" + (p.at || "");
-  if (wtState.lastMsg === lastMsg) { wtState.suppress = false; return; }
-  wtState.lastMsg = lastMsg;
-  if (p.video && p.video !== (window.__wtId || "")) {
-    window.__wtId = p.video;
-    try { wtState.player.loadVideoById(p.video, Number(p.pos || 0)); } catch (e) {}
-  } else {
-    const cur = wtState.player.getCurrentTime();
-    if (Math.abs(Number(p.pos || 0) - cur) > 1.5) {
-      try { wtState.player.seekTo(Number(p.pos || 0), true); } catch (e) {}
-    }
-  }
-  if (p.paused) { try { wtState.player.pauseVideo(); } catch (e) {} }
-  else { try { wtState.player.playVideo(); } catch (e) {} }
-  const v = Number($("#wt-vol")?.value || 70);
-  try { wtState.player.setVolume(v); } catch (e) {}
-  setTimeout(() => { wtState.suppress = false; }, 300);
-}
 
-// инжект IFrame API если ещё не загружен
-if (!document.querySelector('script[src*="youtube.com/iframe_api"]')) {
-  const tag = document.createElement("script");
-  tag.src = "https://www.youtube.com/iframe_api";
-  document.head.appendChild(tag);
-}
-
-$("#vb-watch").onclick = function () {
-  const box = $("#watch-together"); if (box) { box.classList.remove("hidden"); wg("Инициализация..."); ensurePlayRoot(); __wtSend({ action: "state-request", video: window.__wtId || "", pos: 0, paused: true, at: Date.now() }); wtStartSync(); }
-  $("#vb-watch").classList.add("hidden");
-};
-$("#cs-yt").onclick = function () {
-  const box = $("#watch-together"); if (box) { box.classList.remove("hidden"); wg("Инициализация..."); ensurePlayRoot(); __wtSend({ action: "state-request", video: window.__wtId || "", pos: 0, paused: true, at: Date.now() }); wtStartSync(); }
-  $("#vb-watch").classList.add("hidden");
-  $("#cs-yt").classList.add("on");
-};
-function ensurePlayRoot() {
-  if (wtState.player) return;
-  if (window.YT && window.YT.Player) { window.onYouTubeIframeAPIReady(); return; }
-  // wait
-  setTimeout(ensurePlayRoot, 500);
-}
-
-$("#wt-min").onclick = function () {
-  $("#watch-together").classList.toggle("wt-min");
-};
-$("#wt-close-me").onclick = function () {
-  $("#watch-together").classList.add("hidden"); $("#vb-watch").classList.remove("hidden");
-};
-$("#wt-stop-all").onclick = function () {
-  window.__wtId = null;
-  if (wtState.player) { try { wtState.player.stopVideo(); } catch (e) {} }
-  $("#watch-together").classList.add("hidden"); $("#vb-watch").classList.remove("hidden");
-  __wtSend({ action: "stop", video: "", pos: 0, paused: true });
-  toast("Сессия просмотра остановлена");
-};
-$("#wt-load").onclick = function () {
-  const url = $("#wt-url").value.trim();
-  const pr = parseYT(url);
-  if (pr.id) {
-    window.__wtId = pr.id;
-    if (wtState.player) { try { wtState.player.loadVideoById(pr.id, pr.start || 0); } catch (e) {} }
-    wg("Загружено: " + pr.id);
-    __wtSend({ action: "load", video: pr.id, pos: pr.start || 0, paused: false });
-  } else {
-    wg("Не ссылка на видео. Введи youtube.com/watch?v=...");
-  }
-};
-$("#wt-play").onclick = function () {
-  if (!wtState.player) return;
-  try { wtState.player.playVideo(); } catch (e) {}
-  __wtSend({ action: "play", video: window.__wtId, pos: wtState.player.getCurrentTime(), paused: false });
-};
-$("#wt-pause").onclick = function () {
-  if (!wtState.player) return;
-  try { wtState.player.pauseVideo(); } catch (e) {}
-  __wtSend({ action: "pause", video: window.__wtId, pos: wtState.player.getCurrentTime(), paused: true });
-};
-$("#wt-seek").oninput = function (e) {
-  if (wtState.player) { try { wtState.player.seekTo(Number(e.target.value), true); } catch (e) {} }
-};
-$("#wt-vol").oninput = function (e) {
-  if (wtState.player) { try { wtState.player.setVolume(Number(e.target.value)); } catch (e) {} }
-};
-
-// register listener normally (no delayed setTimeout wrapper)
 if (typeof listen === "function") {
-  (async () => {
+  listen("safedrop-watch", (e) => {
     try {
-      await listen("safedrop-watch", async (e) => {
-      const t = e.payload || {}; const p = t.payload || {};
+      const t = e.payload || {}, p = t.payload || {};
       if (p.kind !== "yt-sync") return;
       const srcIp = t.ip || p.ip || "";
-      if (srcIp && srcIp === myIp) return;
-      if (wtState.suppress) return;
-      if (p.action === "stop") {
-        if (wtState.player) { try { wtState.player.stopVideo(); } catch (e) {} }
-        $("#watch-together")?.classList.add("hidden");
-        $("#vb-watch")?.classList.remove("hidden");
-        wg("Сессия остановлена");
+      const meIp = typeof myIp === "function" ? myIp() : "";
+      if (srcIp && meIp && srcIp === meIp) return;
+      if (srcIp) p.ip = srcIp;
+      if (p.action === "state-request") {
+        wtMarkViewer(srcIp, !!p.watching);
+        if (wtHasSession() && wtIsWatching() && !wtState.joining) wtSendState(srcIp);
         return;
       }
-      wtState.lastSrcIp = t.ip || p.ip;
-      __apply(p);
-      });
-    } catch (err) { console.error("watch listener failed", err); }
-  })();
+      if (p.action === "stop") {
+        if (wtAccept(p)) wtRemoteStop();
+        return;
+      }
+      if (!wtAccept(p)) return;
+      if (p.action === "state") {
+        // Состояние от участника, который сам не смотрит, не применяем:
+        // он мог закрыть окно и поставить видео на паузу только у себя.
+        if (p.watching === false) return;
+        wtMarkViewer(srcIp, !!p.watching);
+        wtApplyState(p);
+        return;
+      }
+      if (p.watching) wtMarkViewer(srcIp, true);
+      wtApplyCommand(p);
+    } catch (err) { console.error("watch listener", err); }
+  }).catch((err) => console.error("watch listen", err));
 }
 
-// export helper for ticks
-window.__wtSend = __wtSend;
-window.watchTargets = __wtTargets;
+// ---------- обработчики UI ----------
+wtOn("vb-watch", "click", () => wtOpen());
+wtOn("cs-yt", "click", () => wtOpen());
+wtOn("wt-min", "click", () => wtToggleMini());
+wtOn("wt-min2", "click", () => wtToggleMini());
+wtOn("wt-close", "click", () => wtCloseMe());
+wtOn("wt-close-me", "click", () => { wtHideMenu(); wtCloseMe(); });
+wtOn("wt-stop-all", "click", () => { wtHideMenu(); wtStopAll(); });
+wtOn("wt-more", "click", (e) => { e.stopPropagation(); wtQ("wt-menu")?.classList.toggle("hidden"); });
+wtOn("wt-change", "click", () => wtOpenChange());
+wtOn("wt-empty-pick", "click", () => wtOpenChange());
+wtOn("wt-change-cancel", "click", () => wtCloseChange());
+wtOn("wt-load", "click", () => wtSubmitChange());
+wtOn("wt-url", "keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); wtSubmitChange(); } });
+wtOn("wt-toggle", "click", () => wtTogglePlay());
+wtOn("wt-back10", "click", () => wtSeekBy(-10));
+wtOn("wt-fwd10", "click", () => wtSeekBy(10));
+wtOn("wt-fs", "click", () => wtToggleFull());
+wtOn("wt-retry", "click", () => wtRetryPlayer());
+wtOn("wt-error-retry", "click", () => wtRetryPlayer());
+wtOn("wt-mute", "click", () => {
+  const p = wtState.player;
+  if (!p) return;
+  try { if (p.isMuted()) p.unMute(); else p.mute(); } catch {}
+  wtSyncMuteIcon();
+});
+wtQ("watch-together")?.addEventListener("pointerdown", (e) => {
+  if (e.target !== e.currentTarget || wtState.mini) return;
+  if (wtHasSession()) wtSetMini(true); else wtCloseMe();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const root = wtQ("watch-together");
+  if (!root || root.classList.contains("hidden")) return;
+  if (!wtState.mini) {
+    e.preventDefault(); e.stopPropagation();
+    if (root.classList.contains("wt-fullscreen")) wtToggleFull();
+    else wtSetMini(true);
+  }
+}, true);
+wtQ("wt-stage")?.addEventListener("pointermove", () => wtPokeControls());
+wtQ("wt-stage")?.addEventListener("pointerdown", () => wtPokeControls());
+
+const wtSeekEl = wtQ("wt-seek");
+if (wtSeekEl) {
+  const beginSeek = () => { wtState.seeking = true; };
+  const endSeek = () => {
+    if (!wtState.seeking) return;
+    wtState.seeking = false;
+    const pos = Number(wtSeekEl.value) || 0;
+    try { wtState.applyingUntil = Date.now() + 600; wtState.player?.seekTo(pos, true); } catch {}
+    wtSend({ action: "seek", pos, paused: wtState.player?.getPlayerState?.() !== 1 });
+    wtStatus(myNick() + ": перемотал на " + wtFmt(pos));
+    wtUpdateControls();
+  };
+  wtSeekEl.addEventListener("pointerdown", beginSeek);
+  wtSeekEl.addEventListener("touchstart", beginSeek, { passive: true });
+  wtSeekEl.addEventListener("input", () => {
+    if (!wtState.seeking) return;
+    const t = wtQ("wt-time");
+    if (t) t.textContent = wtFmt(wtSeekEl.value) + " / " + wtFmt(wtState.player?.getDuration?.() || 0);
+  });
+  wtSeekEl.addEventListener("change", endSeek);
+  wtSeekEl.addEventListener("pointerup", endSeek);
+}
+
+const wtVolEl = wtQ("wt-vol");
+if (wtVolEl) {
+  try {
+    const saved = localStorage.getItem(WT_VOL_KEY);
+    if (saved != null) wtVolEl.value = String(Math.min(100, Math.max(0, Number(saved) || 70)));
+  } catch {}
+  wtState.vol = Number(wtVolEl.value) || 70;
+  wtVolEl.addEventListener("input", () => {
+    wtState.vol = Number(wtVolEl.value) || 0;
+    try { wtState.player?.setVolume(wtState.vol); } catch {}
+    try { localStorage.setItem(WT_VOL_KEY, String(wtState.vol)); } catch {}
+    wtSyncMuteIcon();
+  });
+}
+
+wtBindDrag(wtQ("watch-together"), "#wt-head", WT_POS_KEY, () => wtState.mini);
+wtBindResize(wtQ("watch-together"), "#wt-resize", WT_POS_KEY, () => wtState.mini, 260);
+wtBindDrag(wtQ("mini-watch"), ".mw-head", "sd.mini-watch", () => true);
+wtBindResize(wtQ("mini-watch"), "#mini-watch-resize", "sd.mini-watch", () => true, 220);
+
+wtSyncEntryButtons();
+wtSyncMiniButton();
+wtStartSync();
+window.wtSessionInfo = wtSessionInfo;
+window.__wtSend = wtSend;
+
 // catch all JS errors so the user sees them instead of a blank window
 window.addEventListener("error", (e) => { try { console.error("[SafeDrop] JS error:", e.message, e.filename, e.lineno); } catch {} });
 window.addEventListener("unhandledrejection", (e) => { try { console.error("[SafeDrop] unhandled:", e && e.reason); } catch {} });

@@ -392,34 +392,60 @@
   </div>
 </div>
 
-<div id="mini-watch" class="hidden"><div class="mw-head"><b id="mini-watch-label">Демонстрация</b><div class="mw-btns"><button id="mini-watch-restore" title="Развернуть"><svg class="ic" viewBox="0 0 24 24"><path d="M5,5H11V7H7V11H5Z"/><path d="M13,17h4V13h2v6H13Z"/></svg></button><button id="mini-watch-close" title="Закрыть"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button></div></div><video id="mini-watch-video" playsinline muted></video></div>
+<div id="mini-watch" class="hidden"><div class="mw-head"><b id="mini-watch-label">Демонстрация</b><div class="mw-btns"><button id="mini-watch-restore" title="Развернуть"><svg class="ic" viewBox="0 0 24 24"><path d="M5,5H11V7H7V11H5Z"/><path d="M13,17h4V13h2v6H13Z"/></svg></button><button id="mini-watch-close" title="Закрыть"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button></div></div><video id="mini-watch-video" playsinline muted></video><div id="mini-watch-resize" class="mw-resize" title="Изменить размер"></div></div>
 
-<!-- совместный просмотр YouTube -->
-<div id="watch-together" class="hidden overlay" style="z-index:95;"><div class="modal" style="width:min(820px,94vw); max-height:85vh; overflow-y:auto;">
-  <h2>Смотреть вместе</h2>
-  <div id="yt-status" style="margin:4px 0 6px;font-size:13px;color:#8b93a7;">Плеер не загружен.</div>
-  <div style="margin-bottom:8px;display:flex;gap:8px;">
-    <input id="wt-url" placeholder="https://youtu.be/... или youtube.com/watch?v=..." style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--text);font:inherit;" />
-    <button id="wt-load" class="primary" style="flex-shrink:0;">Загрузить</button>
+<!-- совместный просмотр YouTube: большое окно / мини-окно -->
+<div id="watch-together" class="hidden overlay stage-ov">
+  <div class="stage-full wt-shell">
+    <div id="wt-head" class="sfull-head wt-head">
+      <b id="wt-title">Смотреть вместе</b>
+      <span id="wt-by" class="wt-by"></span>
+      <span id="wt-viewers" class="wt-viewers"></span>
+      <button id="wt-change" class="wt-hbtn wt-hide-mini" title="Сменить видео"><svg class="ic" viewBox="0 0 24 24"><path d="M10.59 13.41a1 1 0 0 1 0-1.42l4.3-4.29a3 3 0 1 1 4.24 4.24l-2.12 2.13-1.42-1.42 2.13-2.12a1 1 0 0 0-1.42-1.42l-4.29 4.3a1 1 0 0 1-1.42 0z"/><path d="M13.41 10.59a1 1 0 0 1 0 1.42l-4.3 4.29a3 3 0 1 1-4.24-4.24l2.12-2.13 1.42 1.42-2.13 2.12a1 1 0 0 0 1.42 1.42l4.29-4.3a1 1 0 0 1 1.42 0z"/></svg></button>
+      <button id="wt-more" class="wt-hbtn wt-hide-mini" title="Ещё"><svg class="ic" viewBox="0 0 24 24"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg></button>
+      <button id="wt-min" class="wt-hbtn" title="Свернуть в мини-окно"><svg class="ic" viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
+      <button id="wt-close" class="wt-hbtn" title="Закрыть для меня"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41 12l4.29-4.29a1 1 0 0 0-1.41-1.41L12 10.59 7.71 6.29a1 1 0 0 0-1.41 1.41L10.59 12l-4.29 4.29a1 1 0 0 0 1.41 1.41L12 13.41l4.29 4.29a1 1 0 0 0 1.41-1.41z"/></svg></button>
+    </div>
+    <div id="wt-now" class="wt-now"></div>
+    <div id="wt-change-row" class="wt-change-row hidden">
+      <input id="wt-url" placeholder="youtu.be/… или youtube.com/watch?v=… или /shorts/…" />
+      <button id="wt-load" class="primary">Открыть</button>
+      <button id="wt-change-cancel">Отмена</button>
+    </div>
+    <div id="wt-menu" class="wt-menu hidden">
+      <button id="wt-close-me">Закрыть для меня</button>
+      <button id="wt-stop-all" class="danger">Остановить для всех</button>
+    </div>
+    <div id="wt-stage" class="wt-stage">
+      <div id="yt-player-box" class="wt-player-box"><div id="yt-player"></div></div>
+      <div id="wt-loader" class="wt-msg">
+        <div class="wt-spinner"></div>
+        <div id="wt-load-text">Загрузка плеера…</div>
+        <button id="wt-retry" class="hidden">Повторить</button>
+      </div>
+      <div id="wt-error" class="wt-msg hidden">
+        <div id="wt-error-text"></div>
+        <button id="wt-error-retry">Повторить</button>
+      </div>
+      <div id="wt-empty" class="wt-msg hidden">
+        <div>Никто ещё не включил видео. Вставьте ссылку — и оно откроется у всех в звонке.</div>
+        <button id="wt-empty-pick" class="primary">Вставить ссылку</button>
+      </div>
+      <div id="wt-controls" class="wt-controls">
+        <button id="wt-toggle" title="Плей / пауза"><svg class="ic" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></button>
+        <button id="wt-back10" title="Назад 10 секунд">−10</button>
+        <button id="wt-fwd10" title="Вперёд 10 секунд">+10</button>
+        <input id="wt-seek" class="wt-seek" type="range" min="0" max="1" step="0.1" value="0" />
+        <span id="wt-time" class="wt-time">0:00 / 0:00</span>
+        <button id="wt-mute" title="Звук"><svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><path d="M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z"/></svg></button>
+        <input id="wt-vol" class="wt-vol" type="range" min="0" max="100" value="70" title="Громкость" />
+        <button id="wt-fs" title="На весь экран"><svg class="ic" viewBox="0 0 24 24"><path d="M7 14H5v5h5v-2H7z"/><path d="M5 10h2V7h3V5H5z"/><path d="M17 17h-3v2h5v-5h-2z"/><path d="M14 5v2h3v3h2V5z"/></svg></button>
+        <button id="wt-min2" title="Свернуть в мини-окно"><svg class="ic" viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
+      </div>
+    </div>
+    <div id="wt-resize" class="wt-resize" title="Изменить размер"></div>
   </div>
-  <div id="yt-player-box" style="position:relative;background:#000;border-radius:10px;overflow:hidden;aspect-ratio:16/9;">
-    <div id="yt-player" style="width:100%;height:100%;"></div>
-  </div>
-  <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-    <button id="wt-play" class="primary" style="padding:6px 14px;">▶ Плей</button>
-    <button id="wt-pause" class="primary" style="padding:6px 14px;">⏸ Пауза</button>
-    <input id="wt-seek" type="range" min="0" max="1" step="1" value="0" style="flex:1;min-width:160px;" />
-    <span id="wt-time" style="font-size:12px;color:#8b93a7;min-width:56px;">0:00 / 0:00</span>
-    <span style="font-size:11px;color:#8b93a7;">Громкость</span>
-    <input id="wt-vol" type="range" min="0" max="100" value="70" style="width:90px;" />
-  </div>
-  <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end;">
-    <button id="wt-min" class="primary" style="padding:6px 14px;">Свернуть</button>
-    <button id="wt-close-me" class="danger" style="padding:6px 14px;">Закрыть для меня</button>
-    <button id="wt-stop-all" class="danger" style="padding:6px 14px;">Остановить для всех</button>
-  </div>
-  <div style="margin-top:6px;font-size:12px;color:#666;">Видео через официальный плеер YouTube; между участниками передаются только команды. Звук не попадает в микрофон и не проходит шумодав.</div>
-</div></div>
+</div>
 
 <div id="msg-menu" class="hidden"></div>
 

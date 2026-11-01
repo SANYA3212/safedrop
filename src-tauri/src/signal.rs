@@ -91,7 +91,7 @@ pub(crate) enum Frame {
     #[serde(rename = "chat-typing")]
     ChatTyping { from: String, nickname: String, #[serde(default)] to_group: Option<String> },
     #[serde(rename = "yt-sync")]
-    YtSync { from: String, #[serde(default)] ip: String, #[serde(default)] nickname: String, #[serde(default)] action: String, #[serde(default)] video: String, #[serde(default)] pos: f64, #[serde(default)] paused: bool, #[serde(default)] at: i64, #[serde(default)] to_group: Option<String> },
+    YtSync { from: String, #[serde(default)] ip: String, #[serde(default)] nickname: String, #[serde(default)] action: String, #[serde(default)] video: String, #[serde(default)] pos: f64, #[serde(default)] paused: bool, #[serde(default)] at: i64, #[serde(default)] seq: i64, #[serde(default)] title: String, #[serde(default)] by: String, #[serde(default)] watching: bool, #[serde(default)] vertical: bool, #[serde(default)] to_group: Option<String> },
     #[serde(other)]
     Unknown,
 }
@@ -839,7 +839,7 @@ pub(crate) async fn process_frame(
             }));
         }
 
-        Frame::YtSync { from, nickname, action, video, pos, paused, at, .. } => {
+        Frame::YtSync { from, nickname, action, video, pos, paused, at, seq, title, by, watching, vertical, .. } => {
             let nm = if nickname.is_empty() { from.clone() } else { nickname.clone() };
             let payload = serde_json::json!({
                 "kind":"yt-sync",
@@ -850,6 +850,11 @@ pub(crate) async fn process_frame(
                 "pos": pos,
                 "paused": paused,
                 "at": at,
+                "seq": seq,
+                "title": title,
+                "by": by,
+                "watching": watching,
+                "vertical": vertical,
             });
             let _ = app.emit("safedrop-watch", serde_json::json!({"ip": ip, "payload": payload}));
         }
@@ -1198,7 +1203,6 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
                         p.avatar = av2;
                         p.supports_file_confirm = file_confirm;
                         p.supports_chat_ack = chat_ack;
-                        p.supports_watch = watch;
                         p.supports_watch = watch;
                         if p.name.is_empty() || p.name == p.ip {
                             p.name = if dev.is_empty() { nn } else { dev };
