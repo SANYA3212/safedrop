@@ -246,7 +246,7 @@ async fn handle_quic_stream(
             .try_lock()
             .map(|s| s.loaddrop_dir.clone())
             .unwrap_or_default();
-        crate::transfer::receive_stream(app, offer, &mut reader, ip, drop_dir)
+        crate::transfer::receive_stream(app, offer, &mut reader, ip, drop_dir, None)
             .await
             .map_err(|e| e.to_string())
     };

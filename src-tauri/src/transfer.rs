@@ -1,10 +1,10 @@
 use crate::state::TransferInfo;
 use sha2::{Digest, Sha256};
-use std::{path::Path, time::Instant};
+use std::{path::{Path, PathBuf}, time::Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     fs::File,
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader},
 };
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -19,6 +19,77 @@ pub(crate) struct Offer {
     pub(crate) confirm: bool,
     #[serde(default)]
     pub(crate) version: String,
+    /// Докачка (с 0.3.26): получатель хранит недокачанную часть под этим
+    /// ключом файла и отвечает, с какого байта продолжить.
+    #[serde(default)]
+    pub(crate) resume: bool,
+    #[serde(default)]
+    pub(crate) fkey: String,
+}
+
+/// С какой версии получатель понимает докачку (и всегда отвечает на заголовок).
+const RESUME_SINCE: (u32, u32, u32) = (0, 3, 26);
+const RESUME_ATTEMPTS: u32 = 6;
+
+fn parse_ver(v: &str) -> Option<(u32, u32, u32)> {
+    let mut it = v.trim().split('.').map(|p| p.parse::<u32>().ok());
+    Some((it.next()??, it.next()??, it.next().flatten().unwrap_or(0)))
+}
+
+async fn peer_supports_resume(app: &AppHandle, peer_ip: &str) -> bool {
+    let state: tauri::State<'_, crate::state::AppState> = app.state();
+    let ver = state.peers.lock().await.get(peer_ip).map(|p| p.version.clone()).unwrap_or_default();
+    parse_ver(&ver).map(|v| v >= RESUME_SINCE).unwrap_or(false)
+}
+
+fn valid_fkey(k: &str) -> bool {
+    (16..=64).contains(&k.len()) && k.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Недокачанные части лежат рядом с папкой приёма (тот же диск — быстрый rename).
+fn partial_dir(drop_dir: &str) -> PathBuf {
+    Path::new(drop_dir).join(".safedrop-partial")
+}
+
+fn partial_path(drop_dir: &str, peer_ip: &str, fkey: &str) -> PathBuf {
+    let who: String = peer_ip.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    partial_dir(drop_dir).join(format!("{who}_{fkey}.part"))
+}
+
+/// Сколько уже скачано; часть больше файла (другой файл с тем же ключом) удаляется.
+async fn partial_len(path: &Path, total: u64) -> u64 {
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.len() <= total => m.len(),
+        Ok(_) => { let _ = tokio::fs::remove_file(path).await; 0 }
+        Err(_) => 0,
+    }
+}
+
+/// Старые недокачанные части (неделя без продолжения) удаляем.
+async fn clean_old_partials(drop_dir: &str) {
+    let Ok(mut rd) = tokio::fs::read_dir(partial_dir(drop_dir)).await else { return };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let old = e.metadata().await.ok().and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() > 7 * 24 * 3600)
+            .unwrap_or(false);
+        if old { let _ = tokio::fs::remove_file(e.path()).await; }
+    }
+}
+
+/// Ключ файла: один и тот же файл (путь, размер, время изменения) даёт тот же
+/// ключ при повторной отправке — по нему получатель находит недокачанную часть.
+fn file_key(prep: &UploadPrep) -> String {
+    let mtime = std::fs::metadata(&prep.real_path).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = Sha256::new();
+    h.update(prep.real_path.to_string_lossy().as_bytes());
+    h.update(prep.total.to_le_bytes());
+    h.update(mtime.to_le_bytes());
+    hex::encode(h.finalize())[..32].to_string()
 }
 
 fn should_auto_accept(auto_trusted: bool, trusted: bool, size: u64, limit_mb: u64) -> bool {
@@ -95,14 +166,27 @@ async fn handle_conn(
     let mut line = String::new();
     reader.read_line(&mut line).await?;
     let offer: Offer = serde_json::from_str(line.trim())?;
-    let accepted = authorize_offer(&app, &offer, &peer_ip).await;
-    if offer.confirm {
-        let reply = serde_json::json!({"kind":"file-offer-result","accepted":accepted});
+    let resume = if offer.resume && offer.kind != "update" && valid_fkey(&offer.fkey) {
+        clean_old_partials(&drop_dir).await;
+        let p = partial_path(&drop_dir, &peer_ip, &offer.fkey);
+        let have = partial_len(&p, offer.size).await;
+        Some((p, have))
+    } else {
+        None
+    };
+    // Продолжение уже принятого файла от того же отправителя второй раз не спрашиваем.
+    let accepted = match &resume {
+        Some((_, have)) if *have > 0 => true,
+        _ => authorize_offer(&app, &offer, &peer_ip).await,
+    };
+    if offer.confirm || resume.is_some() {
+        let offset = resume.as_ref().map(|(_, h)| *h).unwrap_or(0);
+        let reply = serde_json::json!({"kind":"file-offer-result","accepted":accepted,"offset":offset});
         write_half.write_all(format!("{}\n", reply).as_bytes()).await?;
         write_half.flush().await?;
     }
     if !accepted { return Ok(()); }
-    receive_stream(app, offer, &mut reader, peer_ip, drop_dir).await
+    receive_stream(app, offer, &mut reader, peer_ip, drop_dir, resume).await
 }
 
 /// Auto-accept only trusted peers under the configured size limit. Other
@@ -148,6 +232,7 @@ pub(crate) async fn receive_stream(
     reader: &mut (impl AsyncRead + Unpin),
     peer_ip: String,
     drop_dir: String,
+    resume: Option<(PathBuf, u64)>,
 ) -> anyhow::Result<()> {
     let total = offer.size;
     let safe_name = sanitize(&offer.name);
@@ -164,16 +249,46 @@ pub(crate) async fn receive_stream(
     let final_path = Path::new(&target_dir).join(&safe_name);
     // avoid overwrite: file (1).ext
     let final_path = unique_path(final_path);
-    let part_path = final_path.with_extension("safedrop-part");
+    let resumable = resume.is_some();
+    let (part_path, offset) = match resume {
+        Some((p, have)) => {
+            if let Some(dir) = p.parent() { let _ = tokio::fs::create_dir_all(dir).await; }
+            (p, have)
+        }
+        None => (final_path.with_extension("safedrop-part"), 0),
+    };
+    // при обрыве недокачанное оставляем для докачки, иначе — удаляем
+    let drop_part = |p: PathBuf| async move { if !resumable { let _ = tokio::fs::remove_file(p).await; } };
 
     let id = offer.id.clone();
     push_transfer(&app, TransferInfo {
-        id: id.clone(), filename: safe_name.clone(), size: total, done: 0,
+        id: id.clone(), filename: safe_name.clone(), size: total, done: offset,
         speed_bps: 0, direction: "down".into(), peer: peer_ip.clone(),
-        status: "active".into(), progress: 0.0, error: String::new(),
+        status: "active".into(), progress: if total > 0 { offset as f32 / total as f32 } else { 0.0 },
+        error: String::new(),
     }).await;
 
-    let mut out = match File::create(&part_path).await {
+    let mut hasher = Sha256::new();
+    let opened = if offset > 0 {
+        // хэш всего файла: сначала уже скачанная часть
+        match File::open(&part_path).await {
+            Ok(mut f) => {
+                let mut b = vec![0u8; CHUNK];
+                let mut left = offset;
+                while left > 0 {
+                    let n = f.read(&mut b[..(left.min(CHUNK as u64) as usize)]).await.unwrap_or(0);
+                    if n == 0 { break; }
+                    hasher.update(&b[..n]);
+                    left -= n as u64;
+                }
+            }
+            Err(_) => {}
+        }
+        tokio::fs::OpenOptions::new().append(true).open(&part_path).await
+    } else {
+        File::create(&part_path).await
+    };
+    let mut out = match opened {
         Ok(f) => f,
         Err(e) => {
             let msg = format!("can't write to disk: {e}");
@@ -181,8 +296,8 @@ pub(crate) async fn receive_stream(
             return Err(anyhow::anyhow!(msg));
         }
     };
-    let mut hasher = Sha256::new();
-    let mut done: u64 = 0;
+    let mut done: u64 = offset;
+    let mut user_cancel = false;
     let mut buf = vec![0u8; CHUNK];
     let start = Instant::now();
     let mut last_emit = Instant::now();
@@ -191,13 +306,20 @@ pub(crate) async fn receive_stream(
     // in "active" forever with a stuck progress bar.
     loop {
         if is_cancelled(&app, &id).await {
+            user_cancel = true;
             break;
         }
         let n = match reader.read(&mut buf).await {
             Ok(n) => n,
             Err(e) => {
-                let msg = format!("connection lost: {e}");
-                let _ = tokio::fs::remove_file(&part_path).await;
+                let msg = if resumable {
+                    format!("связь оборвалась ({e}) — недокачанное сохранено, передача продолжится")
+                } else {
+                    format!("connection lost: {e}")
+                };
+                let _ = out.flush().await;
+                drop(out);
+                drop_part(part_path.clone()).await;
                 set_transfer_error(&app, &id, &msg).await;
                 return Err(anyhow::anyhow!(msg));
             }
@@ -205,7 +327,7 @@ pub(crate) async fn receive_stream(
         if n == 0 { break; }
         if let Err(e) = out.write_all(&buf[..n]).await {
             let msg = format!("can't write to disk: {e}");
-            let _ = tokio::fs::remove_file(&part_path).await;
+            drop_part(part_path.clone()).await;
             set_transfer_error(&app, &id, &msg).await;
             return Err(anyhow::anyhow!(msg));
         }
@@ -213,7 +335,7 @@ pub(crate) async fn receive_stream(
         done += n as u64;
         if last_emit.elapsed().as_millis() > 200 || done == total {
             let el = start.elapsed().as_secs_f64().max(0.01);
-            let speed = (done as f64 / el) as u64;
+            let speed = ((done - offset) as f64 / el) as u64;
             update_transfer(&app, &id, done, speed, total).await;
             last_emit = Instant::now();
         }
@@ -221,11 +343,16 @@ pub(crate) async fn receive_stream(
     }
     if let Err(e) = out.flush().await {
         let msg = format!("can't flush file: {e}");
-        let _ = tokio::fs::remove_file(&part_path).await;
+        drop_part(part_path.clone()).await;
         set_transfer_error(&app, &id, &msg).await;
         return Err(anyhow::anyhow!(msg));
     }
     drop(out);
+    if done < total && resumable && !user_cancel {
+        // отправитель пропал без ошибки сокета — часть остаётся для докачки
+        set_transfer_error(&app, &id, "связь оборвалась — недокачанное сохранено, передача продолжится").await;
+        return Ok(());
+    }
     if done < total {
         // cancelled or broken connection: no half-baked files, clean the cache
         let _ = tokio::fs::remove_file(&part_path).await;
@@ -282,35 +409,90 @@ pub async fn send_file_to(
     version: String,
 ) -> Result<String, String> {
     let prep = prepare_upload(&file_path).await?;
+    let resume = kind == "file" && peer_supports_resume(&app, &peer_ip).await;
+    let fkey = if resume { file_key(&prep) } else { String::new() };
+    let mut attempt = 0u32;
+    let result = loop {
+        attempt += 1;
+        let r = send_attempt(&app, &peer_ip, port, &prep, &device_name, &kind, require_confirmation, &version, resume, &fkey, attempt > 1).await;
+        match r {
+            Ok(id) => break Ok(id),
+            Err(SendErr::Retry(msg)) if resume && attempt < RESUME_ATTEMPTS => {
+                let delay = [3u64, 5, 10, 20, 30][(attempt as usize - 1).min(4)];
+                set_transfer_error(&app, &prep.id, &format!("{msg} — повтор {attempt}/{} через {delay} с", RESUME_ATTEMPTS - 1)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                if is_cancelled(&app, &prep.id).await {
+                    set_transfer_status(&app, &prep.id, "cancelled").await;
+                    break Err("cancelled by user".into());
+                }
+            }
+            Err(SendErr::Retry(msg)) | Err(SendErr::Fatal(msg)) => break Err(msg),
+        }
+    };
+    if let Some(z) = &prep.tmp_zip { let _ = std::fs::remove_file(z); }
+    result
+}
+
+/// Ошибка попытки отправки: Retry — связь, имеет смысл повторить; Fatal — нет.
+pub(crate) enum SendErr {
+    Retry(String),
+    Fatal(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_attempt(
+    app: &AppHandle,
+    peer_ip: &str,
+    port: u16,
+    prep: &UploadPrep,
+    device_name: &str,
+    kind: &str,
+    require_confirmation: bool,
+    version: &str,
+    resume: bool,
+    fkey: &str,
+    retrying: bool,
+) -> Result<String, SendErr> {
+    // на первой попытке «не подключилось» — сразу ошибка; при повторе — ждём дальше
+    let conn_err = |m: String| if retrying { SendErr::Retry(m) } else { SendErr::Fatal(m) };
     let mut sock = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::net::TcpStream::connect(format!("{peer_ip}:{port}")),
     )
     .await
-    .map_err(|_| format!("тайм-аут подключения к {peer_ip}:{port}"))?
-    .map_err(|e| format!("connect {peer_ip}:{port}: {e}"))?;
+    .map_err(|_| conn_err(format!("тайм-аут подключения к {peer_ip}:{port}")))?
+    .map_err(|e| conn_err(format!("connect {peer_ip}:{port}: {e}")))?;
     let _ = sock.set_nodelay(true);
-    let offer = serde_json::json!({"name": prep.fname, "size": prep.total, "id": prep.id, "from": device_name, "kind": kind, "confirm": require_confirmation, "version": version});
-    let mut header = serde_json::to_string(&offer).map_err(|e| e.to_string())?;
+    let mut offer = serde_json::json!({"name": prep.fname, "size": prep.total, "id": prep.id, "from": device_name, "kind": kind, "confirm": require_confirmation, "version": version});
+    if resume {
+        offer["resume"] = serde_json::json!(true);
+        offer["fkey"] = serde_json::json!(fkey);
+    }
+    let mut header = serde_json::to_string(&offer).map_err(|e| SendErr::Fatal(e.to_string()))?;
     header.push('\n');
     tokio::time::timeout(std::time::Duration::from_secs(10), sock.write_all(header.as_bytes()))
-        .await.map_err(|_| "тайм-аут отправки заголовка файла".to_string())?
-        .map_err(|e| e.to_string())?;
-    if require_confirmation {
+        .await.map_err(|_| conn_err("тайм-аут отправки заголовка файла".to_string()))?
+        .map_err(|e| conn_err(e.to_string()))?;
+    let mut offset = 0u64;
+    if require_confirmation || resume {
         let result = {
             let mut reader = BufReader::new(&mut sock);
             let mut line = String::new();
             tokio::time::timeout(std::time::Duration::from_secs(130), reader.read_line(&mut line))
                 .await
-                .map_err(|_| "Тайм-аут ожидания подтверждения приёма файла".to_string())?
-                .map_err(|e| format!("Не удалось получить ответ получателя: {e}"))?;
-            serde_json::from_str::<serde_json::Value>(line.trim()).map_err(|e| format!("Некорректный ответ получателя: {e}"))?
+                .map_err(|_| SendErr::Fatal("Тайм-аут ожидания подтверждения приёма файла".to_string()))?
+                .map_err(|e| conn_err(format!("Не удалось получить ответ получателя: {e}")))?;
+            serde_json::from_str::<serde_json::Value>(line.trim()).map_err(|e| SendErr::Fatal(format!("Некорректный ответ получателя: {e}")))?
         };
         if result.get("accepted").and_then(|v| v.as_bool()) != Some(true) {
-            return Err("Получатель отклонил приём файла".into());
+            return Err(SendErr::Fatal("Получатель отклонил приём файла".into()));
+        }
+        if resume {
+            offset = result.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            if offset > prep.total { offset = 0; }
         }
     }
-    pump_upload(&app, prep, &peer_ip, &mut sock).await
+    pump_upload(app, prep, offset, peer_ip, &mut sock).await
 }
 
 pub(crate) struct UploadPrep {
@@ -351,28 +533,37 @@ pub(crate) async fn prepare_upload(file_path: &str) -> Result<UploadPrep, String
 /// `writer` must already carry the Offer header line.
 pub(crate) async fn pump_upload(
     app: &AppHandle,
-    prep: UploadPrep,
+    prep: &UploadPrep,
+    offset: u64,
     peer_ip: &str,
     writer: &mut (impl AsyncWrite + Unpin),
-) -> Result<String, String> {
-    let UploadPrep { real_path, total, fname, id, tmp_zip } = prep;
+) -> Result<String, SendErr> {
+    let UploadPrep { real_path, total, fname, id, .. } = prep;
+    let (total, id) = (*total, id.clone());
     push_transfer(app, TransferInfo {
-        id: id.clone(), filename: fname.clone(), size: total, done: 0,
+        id: id.clone(), filename: fname.clone(), size: total, done: offset,
         speed_bps: 0, direction: "up".into(), peer: peer_ip.to_string(),
-        status: "active".into(), progress: 0.0, error: String::new(),
+        status: "active".into(), progress: if total > 0 { offset as f32 / total as f32 } else { 0.0 },
+        error: String::new(),
     }).await;
 
-    let mut f = match File::open(&real_path).await {
+    let mut f = match File::open(real_path).await {
         Ok(f) => f,
         Err(e) => {
             let msg = format!("can't read file: {e}");
             set_transfer_error(app, &id, &msg).await;
-            if let Some(z) = tmp_zip { let _ = std::fs::remove_file(z); }
-            return Err(msg.into());
+            return Err(SendErr::Fatal(msg));
         }
     };
+    if offset > 0 {
+        if let Err(e) = f.seek(std::io::SeekFrom::Start(offset)).await {
+            let msg = format!("can't read file: {e}");
+            set_transfer_error(app, &id, &msg).await;
+            return Err(SendErr::Fatal(msg));
+        }
+    }
     let mut buf = vec![0u8; CHUNK];
-    let mut done: u64 = 0;
+    let mut done: u64 = offset;
     let start = Instant::now();
     let mut last_emit = Instant::now();
     loop {
@@ -381,16 +572,14 @@ pub(crate) async fn pump_upload(
             let _ = app.emit("safedrop-cancelled", serde_json::json!({
                 "filename": fname, "peer": peer_ip, "direction": "up",
             }));
-            if let Some(z) = tmp_zip { let _ = std::fs::remove_file(z); }
-            return Err("cancelled by user".into());
+            return Err(SendErr::Fatal("cancelled by user".into()));
         }
         let n = match f.read(&mut buf).await {
             Ok(n) => n,
             Err(e) => {
                 let msg = format!("can't read file: {e}");
                 set_transfer_error(app, &id, &msg).await;
-                if let Some(z) = tmp_zip { let _ = std::fs::remove_file(z); }
-                return Err(msg.into());
+                return Err(SendErr::Fatal(msg));
             }
         };
         if n == 0 { break; }
@@ -401,24 +590,21 @@ pub(crate) async fn pump_upload(
         } {
             let msg = format!("send failed: {e}");
             set_transfer_error(app, &id, &msg).await;
-            if let Some(z) = tmp_zip { let _ = std::fs::remove_file(z); }
-            return Err(msg.into());
+            return Err(SendErr::Retry(msg));
         }
         done += n as u64;
         if last_emit.elapsed().as_millis() > 200 || done == total {
             let el = start.elapsed().as_secs_f64().max(0.01);
-            update_transfer(app, &id, done, (done as f64 / el) as u64, total).await;
+            update_transfer(app, &id, done, ((done - offset) as f64 / el) as u64, total).await;
             last_emit = Instant::now();
         }
     }
     if let Err(e) = writer.flush().await {
         let msg = format!("send failed: {e}");
         set_transfer_error(app, &id, &msg).await;
-        if let Some(z) = tmp_zip { let _ = std::fs::remove_file(z); }
-        return Err(msg.into());
+        return Err(SendErr::Retry(msg));
     }
     finish_transfer(app, &id).await;
-    if let Some(z) = tmp_zip { let _ = std::fs::remove_file(z); }
     Ok(id)
 }
 
@@ -461,8 +647,12 @@ pub(crate) async fn push_transfer(app: &AppHandle, t: TransferInfo) {
     let state: tauri::State<'_, crate::state::AppState> = app.state();
     {
         let mut g = state.transfers.lock().await;
-        g.push(t.clone());
-        if g.len() > 200 { g.remove(0); }
+        if let Some(old) = g.iter_mut().find(|x| x.id == t.id) {
+            *old = t.clone(); // повтор той же передачи — та же строка
+        } else {
+            g.push(t.clone());
+            if g.len() > 200 { g.remove(0); }
+        }
     }
     let _ = app.emit("safedrop-transfers", snapshot(app).await);
 }
@@ -527,6 +717,36 @@ async fn snapshot(app: &AppHandle) -> Vec<TransferInfo> {
 mod hex {
     pub fn encode(d: impl AsRef<[u8]>) -> String {
         d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::{parse_ver, partial_path, valid_fkey, RESUME_SINCE};
+
+    #[test]
+    fn versions_gate_resume() {
+        assert!(parse_ver("0.3.26").unwrap() >= RESUME_SINCE);
+        assert!(parse_ver("0.4").unwrap() >= RESUME_SINCE);
+        assert!(parse_ver("0.3.25").unwrap() < RESUME_SINCE);
+        assert!(parse_ver("").is_none());
+        assert!(parse_ver("abc").is_none());
+    }
+
+    #[test]
+    fn fkey_must_be_hex_and_sized() {
+        assert!(valid_fkey("0123456789abcdef0123456789abcdef"));
+        assert!(!valid_fkey("../../evil"));
+        assert!(!valid_fkey("short"));
+        assert!(!valid_fkey(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn partial_path_stays_inside_partial_dir() {
+        let p = partial_path("C:/LoadDrop","26.1.2.3", "0123456789abcdef0123456789abcdef");
+        let s = p.to_string_lossy();
+        assert!(s.contains(".safedrop-partial"));
+        assert!(s.ends_with("26-1-2-3_0123456789abcdef0123456789abcdef.part"));
     }
 }
 
