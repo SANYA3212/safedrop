@@ -150,7 +150,8 @@ pub async fn run_signal_server(app: AppHandle, port: u16) {
     }
 }
 
-async fn handle_frame(app: AppHandle, mut sock: TcpStream, ip: String) -> Result<(), String> {
+async fn handle_frame(app: AppHandle, sock: TcpStream, ip: String) -> Result<(), String> {
+    let (mut sock, _encrypted) = crate::tls::accept(sock).await.map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(&mut sock);
     let mut buf = Vec::new();
     // one JSON line per connection (avatar up to ~300KB fits)
@@ -163,7 +164,11 @@ async fn handle_frame(app: AppHandle, mut sock: TcpStream, ip: String) -> Result
     }
     let frame: Frame = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
     drop(reader);
-    process_frame(&app, frame, ip, &mut sock).await
+    let r = process_frame(&app, frame, ip, &mut sock).await;
+    // TLS держит ответ в буфере до flush; shutdown корректно закрывает сессию
+    let _ = sock.flush().await;
+    let _ = sock.shutdown().await;
+    r
 }
 
 async fn persist_group_sync(state: &AppState) {
@@ -378,6 +383,7 @@ pub(crate) async fn process_frame(
                 e.supports_chat_ack = chat_ack;
                 e.supports_watch = watch;
                 e.version = version.clone();
+                crate::tls::note_peer_version(&ip, &version);
                 e.online = true;
                 if !e.ips.contains(&ip) { e.ips.push(ip.clone()); }
                 e.last_seen = Some(chrono::Local::now().format("%H:%M:%S").to_string());
@@ -403,6 +409,7 @@ pub(crate) async fn process_frame(
             out.push('\n');
             // write back on same stream
             let _ = writer.write_all(out.as_bytes()).await;
+            let _ = writer.flush().await;
             let app2 = app.clone();
             let ip2 = ip.clone();
             tokio::spawn(async move { flush_pending_for_peer(&app2, &ip2, true).await; });
@@ -1002,18 +1009,13 @@ fn notify_impl(title: &str, body: &str, icon: Option<String>) {
 /// Send one frame to peer. If wait_reply, read hello-reply (up to 5s),
 /// otherwise flush and return immediately (chat/call/ice must not wait).
 pub async fn send_frame(ip: &str, port: u16, value: serde_json::Value, wait_reply: bool) -> Result<Option<serde_json::Value>, String> {
-    let mut s = tokio::time::timeout(
-        std::time::Duration::from_secs(13),
-        TcpStream::connect(format!("{ip}:{port}")),
-    )
-    .await
-    .map_err(|_| "timeout".to_string())?
-    .map_err(|e| e.to_string())?;
+    let mut s = crate::tls::connect(ip, port, std::time::Duration::from_secs(13)).await?;
     let mut out = serde_json::to_string(&value).map_err(|e| e.to_string())?;
     out.push('\n');
     s.write_all(out.as_bytes()).await.map_err(|e| e.to_string())?;
     s.flush().await.map_err(|e| e.to_string())?;
     if !wait_reply {
+        let _ = s.shutdown().await;
         return Ok(None);
     }
     let mut reader = BufReader::new(&mut s);
@@ -1194,6 +1196,7 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
                         p.supports_chat_ack = chat_ack;
                         p.supports_watch = watch;
                         p.version = version.clone();
+                        crate::tls::note_peer_version(ip, &version);
                         if p.name.is_empty() || p.name == p.ip {
                             p.name = if dev.is_empty() { nn } else { dev };
                         }

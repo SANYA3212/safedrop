@@ -133,7 +133,7 @@ pub async fn run_server(app: AppHandle, port: u16) {
     };
     println!("SafeDrop listening on {addr}");
     loop {
-        let (mut sock, peer_addr) = match listener.accept().await {
+        let (sock, peer_addr) = match listener.accept().await {
             Ok(x) => x,
             Err(_) => continue,
         };
@@ -147,7 +147,11 @@ pub async fn run_server(app: AppHandle, port: u16) {
             .unwrap_or_default();
         tokio::spawn(async move {
             let _ = sock.set_nodelay(true);
-            if let Err(e) = handle_conn(app2, &mut sock, peer_addr.to_string(), drop_dir).await {
+            let sock = match crate::tls::accept(sock).await {
+                Ok((s, _)) => s,
+                Err(e) => { eprintln!("conn error: {e}"); return; }
+            };
+            if let Err(e) = handle_conn(app2, sock, peer_addr.to_string(), drop_dir).await {
                 eprintln!("conn error: {e}");
             }
         });
@@ -156,12 +160,12 @@ pub async fn run_server(app: AppHandle, port: u16) {
 
 async fn handle_conn(
     app: AppHandle,
-    sock: &mut tokio::net::TcpStream,
+    sock: crate::tls::Stream,
     peer_addr: String,
     drop_dir: String,
 ) -> anyhow::Result<()> {
     let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr).to_string();
-    let (read_half, mut write_half) = tokio::io::split(&mut *sock);
+    let (read_half, mut write_half) = tokio::io::split(sock);
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
@@ -455,14 +459,9 @@ async fn send_attempt(
 ) -> Result<String, SendErr> {
     // на первой попытке «не подключилось» — сразу ошибка; при повторе — ждём дальше
     let conn_err = |m: String| if retrying { SendErr::Retry(m) } else { SendErr::Fatal(m) };
-    let mut sock = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::net::TcpStream::connect(format!("{peer_ip}:{port}")),
-    )
-    .await
-    .map_err(|_| conn_err(format!("тайм-аут подключения к {peer_ip}:{port}")))?
-    .map_err(|e| conn_err(format!("connect {peer_ip}:{port}: {e}")))?;
-    let _ = sock.set_nodelay(true);
+    let mut sock = crate::tls::connect(peer_ip, port, std::time::Duration::from_secs(10))
+        .await
+        .map_err(conn_err)?;
     let mut offer = serde_json::json!({"name": prep.fname, "size": prep.total, "id": prep.id, "from": device_name, "kind": kind, "confirm": require_confirmation, "version": version});
     if resume {
         offer["resume"] = serde_json::json!(true);
@@ -492,7 +491,10 @@ async fn send_attempt(
             if offset > prep.total { offset = 0; }
         }
     }
-    pump_upload(app, prep, offset, peer_ip, &mut sock).await
+    let id = pump_upload(app, prep, offset, peer_ip, &mut sock).await?;
+    // корректное закрытие (для TLS — close_notify): получатель видит конец потока
+    let _ = sock.shutdown().await;
+    Ok(id)
 }
 
 pub(crate) struct UploadPrep {

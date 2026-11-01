@@ -6,6 +6,7 @@ mod quic;
 mod settings;
 mod signal;
 mod state;
+mod tls;
 mod transfer;
 mod ytbrowse;
 
@@ -1902,9 +1903,18 @@ fn focus_main(app: &tauri::AppHandle) {
 fn main() {
     let dir = settings::app_dir();
     let _ = std::fs::create_dir_all(&dir);
+    tls::init(&dir);
     let st = AppState::new(dir);
     settings::load_settings(&st);
     settings::load_peers(&st);
+    // с кем шифровать соединения — по версиям, известным с прошлого запуска
+    if let Ok(peers) = st.peers.try_lock() {
+        for p in peers.values() {
+            for ip in std::iter::once(&p.ip).chain(p.ips.iter()) {
+                tls::note_peer_version(ip, &p.version);
+            }
+        }
+    }
     // chats + groups loaded sync here
     if let Ok(data) = std::fs::read_to_string(st.group_sync_path()) {
         if let Ok(sync) = serde_json::from_str::<state::GroupSyncState>(&data) {

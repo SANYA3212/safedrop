@@ -19,7 +19,7 @@ fn cert_paths(app_dir: &std::path::Path) -> (PathBuf, PathBuf) {
 }
 
 /// Load our self-signed QUIC cert, generating it once on first use.
-fn load_or_gen_cert(app_dir: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>), String> {
+pub(crate) fn load_or_gen_cert(app_dir: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>), String> {
     let (cert_path, key_path) = cert_paths(app_dir);
     if let (Ok(c), Ok(k)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
         if !c.is_empty() && !k.is_empty() {
@@ -36,7 +36,7 @@ fn load_or_gen_cert(app_dir: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>), Str
     Ok((cert_der, key_der))
 }
 
-fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
@@ -57,7 +57,7 @@ fn server_crypto(app_dir: &std::path::Path) -> Result<quinn::crypto::rustls::Qui
 /// Accept-anything verifier: our network is private (Radmin/LAN),
 /// peers are identified by Radmin IP, not by certificate.
 #[derive(Debug)]
-struct SkipVerify;
+pub(crate) struct SkipVerify;
 
 impl rustls::client::danger::ServerCertVerifier for SkipVerify {
     fn verify_server_cert(
