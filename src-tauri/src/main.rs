@@ -2135,7 +2135,7 @@ fn main() {
             pick_files, pick_image, pick_folder, pick_audio, read_image_dataurl,
             clear_peers, scan_debug, factory_reset, open_firewall, set_ctx_menu, refresh_ctx_menu, get_pending_send,
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
-            win_min, win_max_toggle, win_hide, win_quit, win_drag, get_build_info,
+            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SafeDrop");

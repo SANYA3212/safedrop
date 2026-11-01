@@ -4349,7 +4349,9 @@ const wtState = {
   videoId: null, title: "", by: "", vertical: false,
   session: false, open: false, mini: false, joining: false,
   applyingUntil: 0, justLoadedUntil: 0, joinedUntil: 0, contentDuration: 0,
-  seen: {}, lastAt: 0, seq: 0,
+  // seq от времени запуска: после перезапуска приложения номера не начинаются
+  // заново с нуля и не отбрасываются как старые у остальных участников.
+  seen: {}, lastAt: {}, seq: Date.now(),
   syncTimer: null, uiTimer: null, readyTimer: null, nowTimer: null,
   seeking: false, vol: 70, muted: false,
   pending: null, remotePos: 0, remotePaused: true,
@@ -4394,8 +4396,7 @@ function wtTargets() {
   if (currentCall) list = [currentCall];
   else if (groupCall && Array.isArray(groupCall.members)) list = groupCall.members.slice();
   else if (typeof gpc !== "undefined") list = Object.keys(gpc);
-  const myIpV = typeof myIp === "function" ? myIp() : "";
-  list = [...new Set(list)].filter((ip) => ip && ip !== myIpV);
+  list = [...new Set(list)].filter((ip) => ip && ip !== myIp);
   return list.filter((ip) => {
     const p = (typeof peers !== "undefined" ? peers : []).find((x) => x.ip === ip);
     return !p || p.supports_watch !== false;
@@ -4411,6 +4412,8 @@ function wtSetSession(videoId, title, by, vertical) {
   wtState.vertical = !!vertical;
   window.__wtId = videoId;
   wtQ("watch-together")?.classList.toggle("wt-vert", !!vertical);
+  // размытая обложка по бокам вертикального видео (id только [A-Za-z0-9_-])
+  wtQ("wt-stage")?.style.setProperty("--wt-bg", `url("https://i.ytimg.com/vi/${videoId}/hqdefault.jpg")`);
   wtRefreshUI();
 }
 
@@ -4420,6 +4423,7 @@ function wtClearSession() {
   wtState.remotePos = 0; wtState.remotePaused = true; wtState.viewers = {};
   window.__wtId = null;
   wtQ("watch-together")?.classList.remove("wt-vert");
+  wtQ("wt-stage")?.style.removeProperty("--wt-bg");
   wtRefreshUI();
 }
 
@@ -4464,18 +4468,18 @@ function wtSendState(directIp) {
 }
 
 function wtMarkViewer(ip, watching) {
-  if (!ip || !watching) return;
+  if (!ip || !watching || ip === myIp) return;
   wtState.viewers[ip] = Date.now();
 }
-function wtViewerCount() {
+// IP смотрящих участников (без себя), устаревшие отметки выкидываются.
+function wtViewerIps() {
   const now = Date.now();
-  let n = wtIsWatching() ? 1 : 0;
   for (const [ip, ts] of Object.entries(wtState.viewers)) {
-    if (now - ts > 12000) { delete wtState.viewers[ip]; continue; }
-    if (ip !== (typeof myIp === "function" ? myIp() : "")) n++;
+    if (now - ts > 12000 || ip === myIp) delete wtState.viewers[ip];
   }
-  return n;
+  return Object.keys(wtState.viewers);
 }
+function wtViewerCount() { return (wtIsWatching() ? 1 : 0) + wtViewerIps().length; }
 
 function wtStatus(text) {
   const el = wtQ("wt-now");
@@ -4507,11 +4511,25 @@ function wtSyncEntryButtons() {
   const on = wtHasSession();
   for (const id of ["vb-watch", "cs-yt"]) wtQ(id)?.classList.toggle("on", on);
 }
+let wtViewersSig = "";
 function wtRefreshViewers() {
   const el = wtQ("wt-viewers");
   if (!el) return;
-  const n = wtViewerCount();
-  el.textContent = wtHasSession() && n > 0 ? "смотрят: " + n : "";
+  const ips = wtViewerIps();
+  const me = wtIsWatching();
+  const n = ips.length + (me ? 1 : 0);
+  const sig = wtHasSession() && n > 0 ? (me ? "me," : "") + ips.join(",") : "";
+  if (sig === wtViewersSig) return;
+  wtViewersSig = sig;
+  if (!sig) { el.innerHTML = ""; return; }
+  const faces = [];
+  if (me) faces.push(`<span class="ava" title="Ты"><span>${avaInner(profile.avatar, (myNick()[0] || "?").toUpperCase())}</span></span>`);
+  for (const ip of ips.slice(0, me ? 3 : 4)) {
+    const p = callPeerByIp(ip);
+    const nm = p ? dispName(p) : ip;
+    faces.push(`<span class="ava" title="${esc(nm)}"><span>${avaInner(p ? dispAva(p) : "", (nm[0] || "?").toUpperCase())}</span></span>`);
+  }
+  el.innerHTML = `<span class="wt-faces">${faces.join("")}</span><span>смотрят: ${n}</span>`;
 }
 function wtRefreshUI() {
   const info = wtSessionInfo();
@@ -4624,6 +4642,8 @@ function wtOnPlayerState(e) {
   const st = e && e.data;
   if (st === 3) { if (wtIsWatching()) wtShowLoader(true, "Буферизация…"); }
   else if (st === 1 || st === 2 || st === 5) wtShowLoader(false);
+  // видео пошло без движения мыши (команда участника, загрузка) — панель тоже прячется
+  if (st === 1) wtPokeControls();
   wtUpdateControls();
   // Команды шлём только из наших кнопок: так реклама и служебные
   // переключения YouTube не рассылаются участникам как действия пользователя.
@@ -4713,15 +4733,20 @@ function wtAccept(p) {
     if (seq <= (wtState.seen[from] || 0)) return false;
     wtState.seen[from] = seq;
   }
-  const at = Number(p.at || 0);
-  if (at > 0 && wtState.lastAt && at < wtState.lastAt - 2500) return false;
-  if (at > wtState.lastAt) wtState.lastAt = at;
+  // Время сравниваем только с пакетами того же отправителя: часы на разных
+  // ПК расходятся, общий порог отбрасывал бы всё от участника с отстающими часами.
+  const at = Number(p.at || 0), last = wtState.lastAt[from] || 0;
+  if (at > 0 && last && at < last - 2500) return false;
+  if (at > last) wtState.lastAt[from] = at;
   return true;
 }
 
 function wtApplyState(p) {
   wtAdopt(p);
-  const expected = Number(p.pos || 0) + (p.paused ? 0 : Math.max(0, (Date.now() - Number(p.at || Date.now())) / 1000));
+  // Поправка на время в пути. Считается по чужим часам, поэтому не больше 1 с:
+  // иначе расхождение часов на несколько секунд давало бы вечную перемотку.
+  const lag = p.paused ? 0 : Math.min(1, Math.max(0, (Date.now() - Number(p.at || Date.now())) / 1000));
+  const expected = Number(p.pos || 0) + lag;
   wtState.remotePos = expected;
   wtState.remotePaused = !!p.paused;
   if (!wtIsWatching() || !wtState.playerReady || !wtState.player) { wtRefreshUI(); return; }
@@ -4981,6 +5006,7 @@ function wtEndCall() {
   try { wtState.player?.stopVideo(); } catch {}
   wtCloseMe(true);
   wtClearSession();
+  wtState.seen = {}; wtState.lastAt = {};
 }
 
 // ---------- мини-окно: перетаскивание и размер ----------
@@ -5082,8 +5108,7 @@ if (typeof listen === "function") {
       const t = e.payload || {}, p = t.payload || {};
       if (p.kind !== "yt-sync") return;
       const srcIp = t.ip || p.ip || "";
-      const meIp = typeof myIp === "function" ? myIp() : "";
-      if (srcIp && meIp && srcIp === meIp) return;
+      if (srcIp && myIp && srcIp === myIp) return;
       if (srcIp) p.ip = srcIp;
       if (p.action === "state-request") {
         wtMarkViewer(srcIp, !!p.watching);
@@ -5152,6 +5177,24 @@ document.addEventListener("keydown", (e) => {
 wtQ("wt-stage")?.addEventListener("pointermove", () => wtPokeControls());
 wtQ("wt-stage")?.addEventListener("pointerdown", () => wtPokeControls());
 
+// Щит поверх iframe: без него клик по видео ставил паузу только у себя
+// (YouTube не сообщает об этом нашим кнопкам), а движение мыши над видео
+// уходило в iframe и панель управления не появлялась.
+// Большое окно: клик — плей/пауза, двойной клик — весь экран.
+// Мини-окно: перетаскивание, двойной клик — развернуть.
+const wtShield = wtQ("wt-shield");
+if (wtShield) {
+  let clickTimer = null;
+  wtShield.addEventListener("click", () => {
+    if (wtState.mini || clickTimer) return;
+    clickTimer = setTimeout(() => { clickTimer = null; wtTogglePlay(); }, 230);
+  });
+  wtShield.addEventListener("dblclick", () => {
+    if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
+    if (wtState.mini) wtSetMini(false); else wtToggleFull();
+  });
+}
+
 const wtSeekEl = wtQ("wt-seek");
 if (wtSeekEl) {
   const beginSeek = () => { wtState.seeking = true; };
@@ -5191,6 +5234,7 @@ if (wtVolEl) {
 }
 
 wtBindDrag(wtQ("watch-together"), "#wt-head", WT_POS_KEY, () => wtState.mini);
+wtBindDrag(wtQ("watch-together"), "#wt-shield", WT_POS_KEY, () => wtState.mini);
 wtBindResize(wtQ("watch-together"), "#wt-resize", WT_POS_KEY, () => wtState.mini, 260);
 wtBindDrag(wtQ("mini-watch"), ".mw-head", "sd.mini-watch", () => true);
 wtBindResize(wtQ("mini-watch"), "#mini-watch-resize", "sd.mini-watch", () => true, 220);

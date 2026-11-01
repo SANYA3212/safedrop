@@ -552,7 +552,11 @@ details.set-sec > .card:first-of-type { border-top: 0; }
 .wt-head { padding: 10px 14px; border-bottom: 1px solid var(--line); gap: 8px; min-height: 46px; }
 .wt-head b { flex: 0 1 auto; max-width: 48%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wt-by { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.wt-viewers { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.wt-viewers { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
+.wt-faces { display: inline-flex; }
+.wt-faces .ava { width: 24px; height: 24px; padding: 1px; margin-left: -6px; box-shadow: 0 0 0 2px var(--panel2); }
+.wt-faces .ava:first-child { margin-left: 0; }
+.wt-faces .ava > * { font-size: 11px; }
 .wt-hbtn { background: transparent; border: 0; color: var(--text); padding: 6px 8px; border-radius: 8px; cursor: pointer; display: inline-flex; align-items: center; }
 .wt-hbtn:hover { background: var(--hover); }
 .wt-hbtn .ic { width: 18px; height: 18px; }
@@ -577,6 +581,12 @@ details.set-sec > .card:first-of-type { border-top: 0; }
   background: radial-gradient(1200px 600px at 50% 45%, rgba(124,58,237,.18), rgba(5,7,12,.98) 70%);
 }
 .wt-stage.idle { cursor: none; }
+/* размытая обложка по бокам вертикального видео */
+.wt-stage::before { content: ""; position: absolute; inset: -60px; background: var(--wt-bg, none) center / cover no-repeat; filter: blur(46px) brightness(.5) saturate(1.2); opacity: 0; transition: opacity .3s; pointer-events: none; }
+#watch-together.wt-vert .wt-stage::before { opacity: 1; }
+/* щит над iframe: клики и мышь идут в наши обработчики, а не в YouTube */
+.wt-shield { position: absolute; inset: 0; z-index: 2; cursor: pointer; }
+#watch-together.wt-min .wt-shield { cursor: move; }
 .wt-player-box { position: relative; width: min(100%, calc((86vh - 150px) * 1.7778)); aspect-ratio: 16 / 9; background: #000; }
 #watch-together.wt-fullscreen .wt-player-box { width: min(100%, calc((100vh - 150px) * 1.7778)); }
 .wt-player-box > div, .wt-player-box iframe { position: absolute; inset: 0; width: 100% !important; height: 100% !important; border: 0; }
