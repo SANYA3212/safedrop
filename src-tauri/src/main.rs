@@ -7,6 +7,7 @@ mod settings;
 mod signal;
 mod state;
 mod transfer;
+mod ytbrowse;
 
 use state::{AppState, ChatMsg, Group, Peer, PendingSend, Profile, Settings, TransferInfo};
 use std::sync::Arc;
@@ -2136,6 +2137,7 @@ fn main() {
             clear_peers, scan_debug, factory_reset, open_firewall, set_ctx_menu, refresh_ctx_menu, get_pending_send,
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
             win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info,
+            ytbrowse::ytb_open, ytbrowse::ytb_go, ytbrowse::ytb_nav, ytbrowse::ytb_watch, ytbrowse::ytb_notify, ytbrowse::ytb_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SafeDrop");

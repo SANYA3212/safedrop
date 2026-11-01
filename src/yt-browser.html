@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>YouTube — SafeDrop</title>
+<style>
+  :root { --bg: #141824; --accent: #5b8cff; --accent2: #9b59ff; --text: #eef1f8; --muted: #9aa3b8; --btn: rgba(255,255,255,.08); --line: rgba(255,255,255,.09); }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font: 13px "Segoe UI", system-ui, sans-serif; user-select: none; }
+  .bar { height: 100%; display: flex; align-items: center; gap: 6px; padding: 0 10px; border-bottom: 1px solid var(--line); }
+  .ib { flex: none; width: 32px; height: 32px; border: 0; border-radius: 8px; background: transparent; color: var(--text); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+  .ib:hover { background: var(--btn); }
+  .ib svg { width: 18px; height: 18px; fill: currentColor; }
+  .addr { flex: 1; min-width: 120px; display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px; background: rgba(0,0,0,.35); }
+  .addr:focus-within { border-color: var(--accent); }
+  .addr svg { flex: none; width: 15px; height: 15px; fill: var(--muted); }
+  .addr input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; user-select: text; }
+  .title { flex: 0 1 260px; min-width: 0; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .watch { flex: none; height: 32px; padding: 0 14px; border: 0; border-radius: 10px; cursor: pointer; color: #fff; font: 600 13px "Segoe UI", system-ui, sans-serif; display: inline-flex; align-items: center; gap: 7px; background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+  .watch svg { width: 16px; height: 16px; fill: currentColor; }
+  .watch:disabled { cursor: default; background: var(--btn); color: var(--muted); }
+  .notice { position: fixed; right: 10px; top: 6px; max-width: 60%; padding: 6px 12px; border-radius: 10px; background: #2a2140; border: 1px solid var(--accent2); font-size: 12px; opacity: 0; transform: translateY(-6px); transition: .2s; pointer-events: none; }
+  .notice.show { opacity: 1; transform: none; }
+  .notice.ok { background: #1d2d22; border-color: #3fbf6f; }
+  @media (max-width: 820px) { .title { display: none; } }
+</style>
+</head>
+<body>
+<div class="bar">
+  <button class="ib" id="b-back" title="Назад"><svg viewBox="0 0 24 24"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z"/></svg></button>
+  <button class="ib" id="b-fwd" title="Вперёд"><svg viewBox="0 0 24 24"><path d="M8.6 16.6 10 18l6-6-6-6-1.4 1.4 4.6 4.6z"/></svg></button>
+  <button class="ib" id="b-reload" title="Обновить"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4z"/></svg></button>
+  <button class="ib" id="b-home" title="Главная YouTube"><svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg></button>
+  <label class="addr">
+    <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>
+    <input id="addr" placeholder="Поиск на YouTube или ссылка на видео" spellcheck="false" />
+  </label>
+  <span class="title" id="title"></span>
+  <button class="watch" id="b-watch" disabled title="Откройте видео, чтобы смотреть его вместе">
+    <svg viewBox="0 0 24 24"><path d="M16 11a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm-8 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5C15 14.17 10.33 13 8 13zm8 0c-.29 0-.62.02-.97.05A4.22 4.22 0 0 1 17 16.5V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
+    Смотреть вместе
+  </button>
+</div>
+<div class="notice" id="notice"></div>
+<script>
+  const T = window.__TAURI__;
+  const invoke = (cmd, args) => (T && T.core ? T.core.invoke(cmd, args || {}) : Promise.reject("нет Tauri (demo)"));
+  const $ = (id) => document.getElementById(id);
+  const addr = $("addr"), watchBtn = $("b-watch"), titleEl = $("title");
+  let editing = false, noticeTimer = null;
+
+  // та же проверка, что parseYT в app.js: страница конкретного видео
+  function isVideo(url) {
+    return /(?:youtube\.com\/(?:watch\?[^ ]*v=|shorts\/|live\/)|youtu\.be\/)[A-Za-z0-9_-]{6,}/.test(String(url || ""));
+  }
+  function notice(text, ok) {
+    const n = $("notice");
+    n.textContent = text;
+    n.classList.toggle("ok", !!ok);
+    n.classList.add("show");
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => n.classList.remove("show"), 3500);
+  }
+  function applyState(s) {
+    const url = (s && s.url) || "";
+    if (!editing) addr.value = url;
+    titleEl.textContent = (s && s.title) || "";
+    titleEl.title = titleEl.textContent;
+    const v = isVideo(url);
+    watchBtn.disabled = !v;
+    watchBtn.title = v ? "Открыть это видео у всех в звонке" : "Откройте видео, чтобы смотреть его вместе";
+  }
+
+  const nav = (action) => invoke("ytb_nav", { action }).catch((e) => notice(String(e)));
+  $("b-back").onclick = () => nav("back");
+  $("b-fwd").onclick = () => nav("forward");
+  $("b-reload").onclick = () => nav("reload");
+  $("b-home").onclick = () => nav("home");
+  addr.addEventListener("focus", () => { editing = true; addr.select(); });
+  addr.addEventListener("blur", () => { editing = false; });
+  addr.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && addr.value.trim()) {
+      invoke("ytb_go", { input: addr.value.trim() }).catch((err) => notice(String(err)));
+      addr.blur();
+    } else if (e.key === "Escape") {
+      addr.blur();
+    }
+  });
+  watchBtn.onclick = () => {
+    watchBtn.disabled = true;
+    invoke("ytb_watch").catch((e) => { notice(String(e)); watchBtn.disabled = false; });
+  };
+  document.addEventListener("keydown", (e) => {
+    if (e.altKey && e.key === "ArrowLeft") nav("back");
+    if (e.altKey && e.key === "ArrowRight") nav("forward");
+    if (e.key === "F5") { e.preventDefault(); nav("reload"); }
+  });
+
+  if (T && T.event) {
+    T.event.listen("ytb-url", (e) => applyState(e.payload));
+    T.event.listen("ytb-notice", (e) => {
+      const p = e.payload || {};
+      notice(p.text || "", p.ok);
+      if (!p.ok && isVideo(addr.value)) watchBtn.disabled = false;
+    });
+    invoke("ytb_state").then(applyState).catch(() => {});
+  } else {
+    notice("Demo: панель работает только внутри приложения");
+  }
+</script>
+</body>
+</html>

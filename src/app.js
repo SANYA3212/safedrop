@@ -4841,14 +4841,14 @@ function wtOpenChange() {
 }
 function wtCloseChange() { wtQ("wt-change-row")?.classList.add("hidden"); }
 
-function wtLoadVideo(url) {
+function wtLoadVideo(url, title) {
   const pr = parseYT(url);
   if (!pr.id) {
     wtStatus("Не ссылка на YouTube. Пример: youtu.be/… или youtube.com/watch?v=…");
     toast("Не ссылка на YouTube", true);
-    return;
+    return false;
   }
-  wtSetSession(pr.id, "Видео YouTube", myNick(), !!pr.vertical);
+  wtSetSession(pr.id, title || "Видео YouTube", myNick(), !!pr.vertical);
   wtState.remotePos = pr.start || 0;
   wtState.remotePaused = false;
   wtHideError(); wtShowEmpty(false); wtShowLoader(true, "Загрузка видео…");
@@ -4867,6 +4867,25 @@ function wtLoadVideo(url) {
   wtStatus(myNick() + ": включил видео");
   wtCloseChange();
   wtUpdateControls();
+  return true;
+}
+
+// Окно «YouTube» (полноценный сайт): поиск, рекомендации, плейлисты.
+// Кнопка «Смотреть вместе» в его панели присылает сюда ytb-watch.
+function wtOpenBrowser() {
+  if (isDemo) return toast("Окно YouTube работает только в приложении", true);
+  invoke("ytb_open", { url: null }).catch((e) => toast("YouTube: " + e, true));
+}
+function wtFromBrowser(p) {
+  const reply = (text, ok) => invoke("ytb_notify", { text, ok }).catch(() => {});
+  if (typeof inVoice === "function" && !inVoice()) {
+    toast("Смотреть вместе: сначала начните звонок", true);
+    return reply("Сначала начните звонок — тогда видео откроется у всех", false);
+  }
+  if (!wtState.open) wtOpen();
+  else if (wtState.mini) wtSetMini(false);
+  if (wtLoadVideo(p.url, p.title)) reply("Открыто у всех в звонке", true);
+  else reply("Это не страница видео", false);
 }
 
 function wtSubmitChange() {
@@ -5132,6 +5151,9 @@ if (typeof listen === "function") {
       wtApplyCommand(p);
     } catch (err) { console.error("watch listener", err); }
   }).catch((err) => console.error("watch listen", err));
+  listen("ytb-watch", (e) => {
+    try { wtFromBrowser(e.payload || {}); } catch (err) { console.error("ytb-watch", err); }
+  }).catch((err) => console.error("ytb listen", err));
 }
 
 // ---------- обработчики UI ----------
@@ -5145,6 +5167,8 @@ wtOn("wt-stop-all", "click", () => { wtHideMenu(); wtStopAll(); });
 wtOn("wt-more", "click", (e) => { e.stopPropagation(); wtQ("wt-menu")?.classList.toggle("hidden"); });
 wtOn("wt-change", "click", () => wtOpenChange());
 wtOn("wt-empty-pick", "click", () => wtOpenChange());
+wtOn("wt-browse", "click", () => wtOpenBrowser());
+wtOn("wt-empty-browse", "click", () => wtOpenBrowser());
 wtOn("wt-change-cancel", "click", () => wtCloseChange());
 wtOn("wt-load", "click", () => wtSubmitChange());
 wtOn("wt-url", "keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); wtSubmitChange(); } });
