@@ -25,7 +25,6 @@ const WIN: &str = "ytb";
 const BAR: &str = "ytb-bar";
 const VIEW: &str = "ytb-view";
 const BAR_H: f64 = 48.0;
-const HOME: &str = "https://www.youtube.com/";
 /// Сколько после перехода по команде участника считать изменения адреса
 /// (редиректы сайта) чужими и не отправлять обратно.
 const REMOTE_QUIET: Duration = Duration::from_millis(2500);
@@ -41,16 +40,43 @@ fn web_url(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
 }
 
-fn view_host_is_youtube(app: &AppHandle) -> bool {
-    app.get_webview(VIEW)
-        .and_then(|v| v.url().ok())
-        .and_then(|u| u.host_str().map(|h| h.ends_with("youtube.com")))
-        .unwrap_or(false)
+/// Стартовая страница: плитки сайтов. Отдаётся как data: URL — у неё нет
+/// доступа к приложению (как и у любого сайта в этом окне).
+const START_HTML: &str = r#"<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Начальная страница</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:26px;background:radial-gradient(1200px 700px at 50% 30%,#2a2150,#0f1220 70%);color:#eef1f8;font:15px "Segoe UI",system-ui,sans-serif}
+h1{margin:0;font-size:22px;font-weight:600}
+p{margin:0;color:#9aa3b8;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(4,150px);gap:14px}
+a{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;height:110px;border-radius:16px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.09);color:#eef1f8;text-decoration:none;transition:.15s}
+a:hover{background:rgba(255,255,255,.12);transform:translateY(-2px)}
+b{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;color:#fff}
+@media(max-width:700px){.grid{grid-template-columns:repeat(2,150px)}}
+</style></head><body>
+<h1>Куда пойдём?</h1>
+<div class="grid">
+<a href="https://www.youtube.com/"><b style="background:#ff0033">▶</b>YouTube</a>
+<a href="https://www.google.com/"><b style="background:#4285f4">G</b>Google</a>
+<a href="https://www.reddit.com/"><b style="background:#ff4500">r/</b>Reddit</a>
+<a href="https://www.twitch.tv/"><b style="background:#9146ff">T</b>Twitch</a>
+<a href="https://vkvideo.ru/"><b style="background:#0077ff">VK</b>VK Видео</a>
+<a href="https://rutube.ru/"><b style="background:#100943">R</b>Rutube</a>
+<a href="https://www.kinopoisk.ru/"><b style="background:#ff6600">K</b>Кинопоиск</a>
+<a href="https://ru.wikipedia.org/"><b style="background:#636466">W</b>Википедия</a>
+</div>
+<p>Любой сайт — введите адрес или запрос в строку сверху. «Листать вместе» — друг увидит, что вы открываете.</p>
+</body></html>"#;
+
+fn start_url() -> Url {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(START_HTML.as_bytes());
+    Url::parse(&format!("data:text/html;charset=utf-8;base64,{b64}")).expect("data url")
 }
 
-/// Строка из поля ввода: адрес — открываем, иначе ищем
-/// (на YouTube — поиском YouTube, в остальных случаях — Google).
-fn input_to_url(input: &str, youtube_search: bool) -> Url {
+/// Строка из поля ввода: адрес — открываем, иначе ищем в Google.
+/// (Раньше на YouTube искали поиском YouTube — «reddit» без .com так и не
+/// открывал Reddit, поэтому поиск теперь всегда один.)
+fn input_to_url(input: &str) -> Url {
     let s = input.trim();
     if let Ok(u) = Url::parse(s) {
         if web_url(&u) {
@@ -63,13 +89,8 @@ fn input_to_url(input: &str, youtube_search: bool) -> Url {
             return u;
         }
     }
-    let (base, key) = if youtube_search {
-        ("https://www.youtube.com/results", "search_query")
-    } else {
-        ("https://www.google.com/search", "q")
-    };
-    let mut u = Url::parse(base).expect("static url");
-    u.query_pairs_mut().append_pair(key, s);
+    let mut u = Url::parse("https://www.google.com/search").expect("static url");
+    u.query_pairs_mut().append_pair("q", s);
     u
 }
 
@@ -227,7 +248,7 @@ pub async fn ytb_open(app: AppHandle, url: Option<String>, remote: Option<bool>)
     let target = url
         .as_deref()
         .filter(|s| !s.trim().is_empty())
-        .map(|s| input_to_url(s, false))
+        .map(input_to_url)
         .filter(web_url);
     if remote.unwrap_or(false) {
         if let Some(u) = &target {
@@ -243,15 +264,14 @@ pub async fn ytb_open(app: AppHandle, url: Option<String>, remote: Option<bool>)
         let _ = win.set_focus();
         return Ok(());
     }
-    build_window(&app, target.unwrap_or_else(|| Url::parse(HOME).expect("static url")))
+    build_window(&app, target.unwrap_or_else(start_url))
 }
 
 /// Переход по строке из панели: адрес или поисковый запрос.
 #[tauri::command]
 pub async fn ytb_go(app: AppHandle, input: String) -> Result<(), String> {
-    let yt = view_host_is_youtube(&app);
     let view = app.get_webview(VIEW).ok_or("окно браузера закрыто")?;
-    view.navigate(input_to_url(&input, yt)).map_err(|e| e.to_string())
+    view.navigate(input_to_url(&input)).map_err(|e| e.to_string())
 }
 
 /// Кнопки панели. В страницу уходят только фиксированные строки
@@ -263,7 +283,7 @@ pub async fn ytb_nav(app: AppHandle, action: String) -> Result<(), String> {
         "back" => view.eval("history.back()"),
         "forward" => view.eval("history.forward()"),
         "reload" => view.reload(),
-        "home" => view.navigate(Url::parse(HOME).expect("static url")),
+        "home" => view.navigate(start_url()),
         _ => return Err("unknown action".into()),
     }
     .map_err(|e| e.to_string())

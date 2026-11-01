@@ -35,10 +35,10 @@
   <button class="ib" id="b-back" title="Назад"><svg viewBox="0 0 24 24"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z"/></svg></button>
   <button class="ib" id="b-fwd" title="Вперёд"><svg viewBox="0 0 24 24"><path d="M8.6 16.6 10 18l6-6-6-6-1.4 1.4 4.6 4.6z"/></svg></button>
   <button class="ib" id="b-reload" title="Обновить"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4z"/></svg></button>
-  <button class="ib" id="b-home" title="Главная (YouTube)"><svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg></button>
+  <button class="ib" id="b-home" title="Начальная страница: YouTube, Reddit, Twitch и другие"><svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg></button>
   <label class="addr">
     <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>
-    <input id="addr" placeholder="Поиск или адрес сайта" spellcheck="false" />
+    <input id="addr" placeholder="Адрес сайта (reddit.com) или поиск в Google" spellcheck="false" />
   </label>
   <span class="title" id="title"></span>
   <button class="share" id="b-share" title="Друзья в звонке видят, что вы открываете, и могут листать вместе с вами">
@@ -78,8 +78,9 @@
   }
   function applyState(s) {
     const url = (s && s.url) || "";
-    if (!editing) addr.value = url;
-    titleEl.textContent = (s && s.title) || "";
+    const start = url.startsWith("data:");
+    if (!editing) addr.value = start ? "" : url;
+    titleEl.textContent = start ? "Начальная страница" : (s && s.title) || "";
     titleEl.title = titleEl.textContent;
     // синхронный плеер звонка умеет только YouTube: кнопка — на странице видео
     const v = isVideo(url);
