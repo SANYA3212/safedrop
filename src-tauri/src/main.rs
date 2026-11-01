@@ -1951,6 +1951,11 @@ fn main() {
     tauri::Builder::default()
         .manage(managed)
         .on_window_event(|window, event| {
+            // Только главное окно: крестик окна YouTube закрывает лишь его,
+            // а не всё приложение.
+            if window.label() != "main" {
+                return;
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.app_handle().emit("safedrop-quit-requested", ());
