@@ -31,7 +31,7 @@ export async function invoke(cmd, args = {}) {
     case "set_peer_avatar": return;
     case "get_my_ips": return ["26.0.0.1 (демо)"];
     case "get_my_adapters": return [{ name: "Radmin VPN (демо)", ip: "26.0.0.1", prefix: 24, up: true }, { name: "Ethernet (демо)", ip: "192.168.1.10", prefix: 24, up: true }];
-    case "get_peers": return [];
+    case "get_peers": return demoPeers();
     case "add_peer": return { ip: args.ip, name: args.name || args.ip };
     case "rename_peer": case "remove_peer": return;
     case "toggle_trust": return true;
@@ -42,7 +42,7 @@ export async function invoke(cmd, args = {}) {
     case "open_loaddrop": return;
     case "move_loaddrop": return;
     case "get_loaddrop": return "C:\\LoadDrop (демо)";
-    case "get_chat": return [];
+    case "get_chat": return demoChat(args.peerIp);
     case "send_chat": throw "демо-режим: запусти приложение";
     case "chat_edit": case "chat_react": case "chat_typing": return;
     case "get_groups": return [];
@@ -79,3 +79,37 @@ const demo = {
   },
 };
 function persist() { localStorage.setItem("sd-settings", JSON.stringify(demo.settings)); }
+
+// демо-контакты и переписка: чтобы вёрстку (и скриншоты для README) было видно
+// не на пустом окне. Только браузерный демо-режим, в приложении не используется.
+function demoPeer(ip, name, nickname, online, state = "idle", ping = 18) {
+  return {
+    ip, name, nickname, avatar: "", custom_avatar: "", trusted: true,
+    supports_file_confirm: true, supports_chat_ack: true, supports_watch: true, version: "0.3.25",
+    online, ping_ms: online ? ping : null, last_seen: online ? "сейчас" : "вчера",
+    phash: "", state, detail: "", ips: [ip],
+  };
+}
+function demoPeers() {
+  return [
+    demoPeer("26.0.0.2", "Лёша", "Alex", true, "idle", 12),
+    demoPeer("26.0.0.3", "Маша", "Masha", true, "incall", 24),
+    demoPeer("26.0.0.4", "Рабочий ПК", "", false),
+  ];
+}
+function demoChat(ip) {
+  if (ip !== "26.0.0.2") return [];
+  const now = Date.now();
+  const m = (id, mine, text, minAgo) => ({
+    id, peer: ip, from_me: mine, from_nick: mine ? "Я" : "Alex", text,
+    ts: new Date(now - minAgo * 60000).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
+    sent_at: now - minAgo * 60000, image: "", images: [], audio: "",
+    status: mine ? "delivered" : "", delivered_to: [], reply_to: "", edited_at: 0, reactions: [],
+  });
+  return [
+    m("d1", false, "Привет! Скинешь запись вчерашней катки?", 14),
+    m("d2", true, "Да, лови — 2,3 ГБ, через SafeDrop быстрее, чем через облако", 13),
+    m("d3", false, "Дошло за минуту 🔥 Вечером созвон и посмотрим что-нибудь вместе?", 9),
+    m("d4", true, "Давай, включу «Смотреть вместе» с YouTube", 8),
+  ];
+}
