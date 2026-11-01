@@ -1,0 +1,21 @@
+{
+  "name": "SANYA",
+  "bg_mode": "image",
+  "bg_color": "#333333",
+  "bg_gradient": "linear-gradient(135deg,#c6c9d2,#6e7287)",
+  "bg_image": "",
+  "blur": 0,
+  "opacity": 0.5,
+  "accent": "#82abbf",
+  "radius": 18,
+  "font": "Segoe UI",
+  "custom_css": "",
+  "text_color": "#ffffff",
+  "muted_color": "#c6c3c3",
+  "btn_color": "#000000",
+  "btn_text": "#ffffff",
+  "link_color": "#37ff00",
+  "button_gradient_from": "#62468b",
+  "button_gradient_to": "#693870",
+  "button_gradient_angle": 206
+}
