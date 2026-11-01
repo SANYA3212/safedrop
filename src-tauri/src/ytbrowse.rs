@@ -373,6 +373,24 @@ pub async fn ytb_remote_nav(app: AppHandle, url: String, by: String) -> Result<b
     Ok(true)
 }
 
+/// Приглушение видео и звука на странице браузера, пока в звонке говорят.
+/// `k` — доля обычной громкости (1 = вернуть как было). Исходная громкость
+/// каждого элемента запоминается в data-атрибуте и восстанавливается.
+#[tauri::command]
+pub async fn ytb_duck(app: AppHandle, k: f64) -> Result<(), String> {
+    let Some(view) = app.get_webview(VIEW) else { return Ok(()) };
+    if !k.is_finite() {
+        return Err("bad level".into());
+    }
+    let k = k.clamp(0.0, 1.0);
+    let js = if k >= 0.999 {
+        "document.querySelectorAll('video,audio').forEach(function(m){if(m.dataset.sdv!==undefined){m.volume=parseFloat(m.dataset.sdv);delete m.dataset.sdv}})".to_string()
+    } else {
+        format!("document.querySelectorAll('video,audio').forEach(function(m){{if(m.dataset.sdv===undefined)m.dataset.sdv=m.volume;m.volume=Math.max(0,Math.min(1,parseFloat(m.dataset.sdv)*{k}))}})")
+    };
+    view.eval(js).map_err(|e| e.to_string())
+}
+
 /// Ответ главного окна для панели (например, «сначала начните звонок»).
 #[tauri::command]
 pub async fn ytb_notify(app: AppHandle, text: String, ok: bool) -> Result<(), String> {

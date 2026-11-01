@@ -253,6 +253,9 @@ async function loadAll() {
   $("#set-ctxmenu").checked = !!settings.ctx_menu;
   const st = $("#set-show-typing");
   if (st) st.checked = settings.show_typing !== false;
+  const dk = $("#set-duck"), dl = $("#set-duck-level");
+  if (dk) dk.checked = settings.duck_media !== false;
+  if (dl) { dl.value = String(settings.duck_level ?? 30); $("#set-duck-level-v").textContent = (settings.duck_level ?? 30) + "%"; }
   renderAccordionState();
   renderScanUI();
   renderMyAdapters();
@@ -2074,6 +2077,8 @@ function monDrop(key) {
   delete voiceMon[key];
   document.querySelectorAll(`[data-spk="${key}"]`).forEach((el) => el.classList.remove("speaking"));
   if (!Object.keys(voiceMon).length && monTimer) { clearInterval(monTimer); monTimer = null; }
+  // участник ушёл (или звонок закончился) — вернуть громкость видео, таймер может уже не тикать
+  if (typeof duckUpdate === "function") duckUpdate(true);
 }
 function startMonTimer() {
   if (monTimer) return;
@@ -2095,7 +2100,31 @@ function startMonTimer() {
         document.querySelectorAll(`[data-spk="${key}"]`).forEach((el) => el.classList.toggle("speaking", on));
       } catch {}
     }
+    duckUpdate();
   }, 150);
+}
+
+// ---------- приглушение видео, пока в звонке говорят ----------
+// Свой голос не считаем: громкость видео важна тому, кто слушает собеседника.
+// Возврат громкости — через 700 мс тишины, чтобы видео не «дышало» между словами.
+const duck = { on: false, offTimer: null };
+function duckLevel() { return Math.max(0, Math.min(90, Number(settings?.duck_level ?? 30))) / 100; }
+function duckWanted() {
+  if (!settings || settings.duck_media === false || typeof inVoice !== "function" || !inVoice()) return false;
+  return Object.entries(voiceMon).some(([key, m]) => key !== "me" && m.speaking);
+}
+function duckApply() {
+  try { wtApplyVolume(); } catch {}
+  if (!isDemo) invoke("ytb_duck", { k: duck.on ? duckLevel() : 1 }).catch(() => {});
+}
+function duckUpdate(force) {
+  const want = duckWanted();
+  if (want) {
+    if (duck.offTimer) { clearTimeout(duck.offTimer); duck.offTimer = null; }
+    if (!duck.on || force) { duck.on = true; duckApply(); }
+  } else if (duck.on && !duck.offTimer) {
+    duck.offTimer = setTimeout(() => { duck.offTimer = null; if (!duckWanted()) { duck.on = false; duckApply(); } }, force ? 0 : 700);
+  }
 }
 function tileHTML({ key, ava, name, sub, mic, off, screen, onwatch }) {
   return `<div class="vtile${off ? " off" : ""}" data-spk="${esc(key)}">${ava}<b>${esc(name)}</b><small>${esc(sub)}</small><span class="mic-ic">${mic}</span>${screen || ""}${onwatch || ""}</div>`;
@@ -4129,6 +4158,20 @@ $("#btn-scan-now").onclick = async () => {
   if (btn) btn.disabled = false;
 };
 
+// приглушение видео во время разговора
+{
+  const dk = $("#set-duck"), dl = $("#set-duck-level");
+  if (dk) dk.onchange = () => {
+    settings.duck_media = dk.checked;
+    duckUpdate(true);
+    invoke("save_settings", { settings }).catch((e) => toast("" + e, true));
+  };
+  if (dl) {
+    dl.oninput = () => { settings.duck_level = Number(dl.value); $("#set-duck-level-v").textContent = dl.value + "%"; duckUpdate(true); };
+    dl.onchange = () => invoke("save_settings", { settings }).catch((e) => toast("" + e, true));
+  }
+}
+
 // биндинг настроек чата
 {
   const st = $("#set-show-typing");
@@ -4653,7 +4696,7 @@ function wtPlayerReady() {
   if (wtState.playerReady) return;
   wtState.playerReady = true;
   if (wtState.readyTimer) { clearTimeout(wtState.readyTimer); wtState.readyTimer = null; }
-  try { wtState.player.setVolume(wtState.vol || 70); } catch {}
+  wtApplyVolume();
   const volEl = wtQ("wt-vol");
   if (volEl) volEl.value = String(wtState.vol || 70);
   wtShowLoader(false); wtHideError(); wtShowEmpty(false);
@@ -4748,6 +4791,15 @@ function wtUpdateControls() {
     ? '<svg class="ic" viewBox="0 0 24 24"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>'
     : '<svg class="ic" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
   wtSyncMuteIcon();
+}
+
+// Громкость плеера: своя громкость × приглушение, если сейчас кто-то говорит.
+function wtApplyVolume() {
+  const p = wtState.player;
+  if (!p || !wtState.playerReady) return;
+  const base = wtState.vol ?? 70;
+  const k = (typeof duck !== "undefined" && duck.on) ? duckLevel() : 1;
+  try { p.setVolume(Math.round(base * k)); } catch {}
 }
 
 function wtSyncMuteIcon() {
@@ -5443,7 +5495,7 @@ if (wtVolEl) {
   wtState.vol = Number(wtVolEl.value) || 70;
   wtVolEl.addEventListener("input", () => {
     wtState.vol = Number(wtVolEl.value) || 0;
-    try { wtState.player?.setVolume(wtState.vol); } catch {}
+    wtApplyVolume();
     try { localStorage.setItem(WT_VOL_KEY, String(wtState.vol)); } catch {}
     wtSyncMuteIcon();
   });

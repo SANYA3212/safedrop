@@ -184,6 +184,9 @@
             <div class="muted">Выход гейта (что реально уходит в звонок) <span id="gate-state">●</span></div>
             <div class="mic-meter"><div id="mic-level-out"></div></div>
             <label data-set-label="Громкость микрофона"><span>Громкость микрофона</span><input id="mic-vol" type="range" min="0" max="300" /><span class="val" id="mic-vol-v"></span></label>
+            <h3 style="margin-top:12px">Видео во время разговора</h3>
+            <label class="check" data-set-label="Приглушать видео, когда кто-то говорит"><input type="checkbox" id="set-duck" /> Приглушать видео, когда кто-то говорит</label>
+            <label data-set-label="Громкость видео при разговоре"><span>Громкость при разговоре</span><input id="set-duck-level" type="range" min="0" max="90" step="5" /><span class="val" id="set-duck-level-v"></span></label>
             <h3 style="margin-top:12px">Шумодав</h3>
             <label data-set-label="Алгоритм шумодава"><span>Алгоритм</span><select id="noise-engine"><option value="rnnoise">RNNoise — нейросетевой, локально</option><option value="webrtc">Встроенный шумодав WebRTC</option><option value="off">Выключен</option></select></label>
             <label data-set-label="Сила RNNoise"><span>Сила RNNoise</span><input id="noise-strength" type="range" min="0" max="100" /><span class="val" id="noise-strength-v"></span></label>

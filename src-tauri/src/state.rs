@@ -231,6 +231,10 @@ pub struct Settings {
     pub udp_port: u16, // QUIC endpoint port
     #[serde(default = "def_true")]
     pub show_typing: bool, // send "typing…" indicator while composing
+    #[serde(default = "def_true")]
+    pub duck_media: bool, // quieter YouTube/browser video while someone in the call talks
+    #[serde(default = "def_duck_level")]
+    pub duck_level: u8, // % of the normal video volume while ducked
     #[serde(default)]
     pub scan_adapters: Vec<String>, // adapter keys (name + ip) enabled for network scan (empty = all)
     #[serde(default)]
@@ -239,6 +243,7 @@ pub struct Settings {
     pub sections_open: std::collections::HashMap<String, bool>, // settings accordion open state
 }
 fn def_device() -> String { whoami_host() }
+fn def_duck_level() -> u8 { 30 }
 fn def_port() -> u16 { 47831 }
 fn def_sig_port() -> u16 { 47832 }
 fn def_true() -> bool { true }
@@ -306,6 +311,8 @@ impl Default for Settings {
             udp_enabled: false,
             udp_port: def_udp_port(),
             show_typing: true,
+            duck_media: true,
+            duck_level: 30,
             scan_adapters: Vec::new(),
             scan_manual: Vec::new(),
             sections_open: std::collections::HashMap::new(),
