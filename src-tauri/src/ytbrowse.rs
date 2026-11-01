@@ -398,6 +398,27 @@ pub async fn ytb_duck(app: AppHandle, k: f64) -> Result<(), String> {
     view.eval(js).map_err(|e| e.to_string())
 }
 
+/// Сообщение в чат звонка из панели браузера: главное окно отправит его.
+#[tauri::command]
+pub async fn ytb_chat_send(app: AppHandle, text: String) -> Result<(), String> {
+    let text = text.trim().to_string();
+    if text.is_empty() || text.chars().count() > 2000 {
+        return Err("пустое или слишком длинное сообщение".into());
+    }
+    app.emit_to(EventTarget::webview_window("main"), "ytb-chat-send", serde_json::json!({ "text": text }))
+        .map_err(|e| e.to_string())
+}
+
+/// Новое сообщение звонка — показать в панели браузера.
+#[tauri::command]
+pub async fn ytb_chat_show(app: AppHandle, from: String, text: String) -> Result<(), String> {
+    if app.get_webview(BAR).is_none() {
+        return Ok(());
+    }
+    app.emit_to(EventTarget::webview(BAR), "ytb-chat", serde_json::json!({ "from": from, "text": text }))
+        .map_err(|e| e.to_string())
+}
+
 /// Ответ главного окна для панели (например, «сначала начните звонок»).
 #[tauri::command]
 pub async fn ytb_notify(app: AppHandle, text: String, ok: bool) -> Result<(), String> {

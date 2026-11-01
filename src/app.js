@@ -4210,6 +4210,7 @@ try {
     if (!pushMsg(m)) return; // дубль
     const key = m.peer || curKey();
     setTypingState(key, m.from_nick, false); // сообщение пришло — «печатает» снимаем
+    try { wtChatIncoming(m, key); } catch {}
     const sameChat = key === curKey();
     if (sameChat) renderChat();
     else { unread[m.peer] = (unread[m.peer] || 0) + 1; renderContacts(); renderGroups(); toast(`<svg class='ic' viewBox='0 0 24 24'><path d="M20,2H4A2,2,0,0,0,2,4V22l4-4H20a2,2,0,0,0,2-2V4A2,2,0,0,0,20,2Z"/></svg> ${m.from_nick}: ${(m.text || "<svg class='ic' viewBox='0 0 24 24'><path d='M20,3H4A2,2,0,0,0,2,5V16.76l4.88-4.88A3,3,0,0,1,11,11.76l.87-.88A3,3,0,0,1,14,10a3,3,0,0,1,2.12.88L22,16.76V5A2,2,0,0,0,20,3ZM11,9a2,2,0,1,1,2-2A2,2,0,0,1,11,9ZM21.93,19.51a2,2,0,0,1-1.42,1.42A1.7,1.7,0,0,1,20,21H4a1.7,1.7,0,0,1-.51-.07,2,2,0,0,1-1.42-1.42L4,17.58l4.29-4.29a1,1,0,0,1,1.42,0L11,14.59l2.29-2.3a1,1,0,0,1,1.42,0L20,17.58Z'/></svg> картинка").slice(0, 80)}`); }
@@ -5023,6 +5024,64 @@ function wtFromBrowser(p) {
   else reply("Это не страница видео", false);
 }
 
+// ---------- чат поверх плеера и в окне браузера ----------
+// Это обычный чат звонка (личный или группы), просто показанный поверх видео.
+function wtChatKey() {
+  if (currentCall) return currentCall;
+  if (groupCall && groupCall.id) return `g:${groupCall.id}`;
+  return null;
+}
+let wtChatUnread = 0;
+async function wtChatEnsure(key) {
+  if (!key || chats[key]) return;
+  try { chats[key] = await invoke("get_chat", { peerIp: key }); chats[key].forEach((m) => seenIds.add(m.id)); } catch { chats[key] = []; }
+}
+function wtChatOpen() { return !wtQ("wt-chat")?.classList.contains("hidden"); }
+async function wtRenderChat() {
+  const list = wtQ("wt-chat-list");
+  if (!list || !wtChatOpen()) return;
+  const key = wtChatKey();
+  if (!key) { list.innerHTML = '<div class="wt-chat-empty">Чат доступен во время звонка.</div>'; return; }
+  await wtChatEnsure(key);
+  const rows = (chats[key] || []).slice(-50);
+  list.innerHTML = rows.length ? rows.map((m) => {
+    const text = m.text || ((m.images && m.images.length) || m.image ? "🖼 картинка" : m.audio ? "🎵 аудио" : "");
+    return `<div class="wt-cm${m.from_me ? " me" : ""}"><b>${esc(m.from_me ? "Ты" : (m.from_nick || "?"))}</b><span>${esc(text)}</span></div>`;
+  }).join("") : '<div class="wt-chat-empty">Сообщений пока нет — напишите первым.</div>';
+  list.scrollTop = list.scrollHeight;
+}
+function wtChatBadge() {
+  const c = wtQ("wt-chat-count");
+  if (c) { c.textContent = String(wtChatUnread); c.classList.toggle("hidden", !wtChatUnread); }
+}
+function wtChatToggle(force) {
+  const box = wtQ("wt-chat"); if (!box) return;
+  const on = typeof force === "boolean" ? force : box.classList.contains("hidden");
+  box.classList.toggle("hidden", !on);
+  if (on) { wtChatUnread = 0; wtChatBadge(); wtRenderChat(); setTimeout(() => wtQ("wt-chat-input")?.focus(), 30); }
+}
+async function wtChatSend(text) {
+  text = String(text || "").trim();
+  if (!text) return false;
+  const key = wtChatKey();
+  if (!key) { toast("Чат поверх видео работает во время звонка", true); return false; }
+  try {
+    const payload = { text, image: "", images: [], audio: "" };
+    const m = key.startsWith("g:")
+      ? await invoke("send_group_chat", { groupId: key.slice(2), ...payload })
+      : await invoke("send_chat", { peerIp: key, ...payload });
+    if (pushMsg(m)) { if (key === curKey()) renderChat(); }
+    wtRenderChat();
+    return true;
+  } catch (e) { toast("Не отправлено: " + e, true); return false; }
+}
+function wtChatIncoming(m, key) {
+  if (!m || m.from_me || key !== wtChatKey()) return;
+  if (wtChatOpen()) wtRenderChat();
+  else if (wtIsWatching() && !wtState.bg) { wtChatUnread++; wtChatBadge(); }
+  if (!isDemo) invoke("ytb_chat_show", { from: m.from_nick || "", text: m.text || "🖼 картинка" }).catch(() => {});
+}
+
 // ---------- очередь видео ----------
 // Все видят одну очередь: она едет в каждом yt-sync вместе с версией qv.
 // Берём чужую очередь, если её версия новее (при равных — по IP, чтобы все
@@ -5501,6 +5560,10 @@ if (typeof listen === "function") {
   listen("ytb-url", (e) => { try { webOnLocalUrl(e.payload || {}); } catch (err) { console.error("ytb-url", err); } }).catch(() => {});
   listen("ytb-share", (e) => { try { webOnShare(!!(e.payload && e.payload.on)); } catch (err) { console.error("ytb-share", err); } }).catch(() => {});
   listen("ytb-media", (e) => { try { webOnLocalMedia(e.payload || {}); } catch (err) { console.error("ytb-media", err); } }).catch(() => {});
+  listen("ytb-chat-send", (e) => {
+    const text = e.payload && e.payload.text;
+    wtChatSend(text).then((ok) => invoke("ytb_notify", { text: ok ? "Отправлено в чат звонка" : "Не отправлено: нужен звонок", ok }).catch(() => {}));
+  }).catch(() => {});
   listen("ytb-closed", () => { webState.share = false; webState.lastSent = ""; }).catch(() => {});
   listen("safedrop-web", (e) => { try { webOnRemote(e.payload || {}); } catch (err) { console.error("safedrop-web", err); } }).catch(() => {});
 }
@@ -5533,6 +5596,13 @@ wtOn("wt-queue-add", "click", async () => {
   const r = await wtQueueAdd(input ? input.value.trim() : "");
   if (r !== "bad") { if (input) input.value = ""; wtCloseChange(); }
 });
+wtOn("wt-chat-btn", "click", (e) => { e.stopPropagation(); wtChatToggle(); });
+const wtChatSubmit = async () => {
+  const i = wtQ("wt-chat-input");
+  if (i && await wtChatSend(i.value)) i.value = "";
+};
+wtOn("wt-chat-send", "click", wtChatSubmit);
+wtOn("wt-chat-input", "keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); wtChatSubmit(); } });
 wtOn("wt-queue-btn", "click", (e) => { e.stopPropagation(); wtHideMenu(); wtQ("wt-queue")?.classList.toggle("hidden"); });
 wtOn("wt-queue-add-link", "click", () => { wtQ("wt-queue")?.classList.add("hidden"); const i = wtQ("wt-url"); if (i) i.value = ""; wtOpenChange(); });
 wtOn("wt-queue-list", "click", (e) => {
@@ -5561,6 +5631,7 @@ wtQ("watch-together")?.addEventListener("pointerdown", (e) => {
 });
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  if (document.activeElement === wtQ("wt-chat-input")) { e.preventDefault(); e.stopPropagation(); wtQ("wt-chat-input").blur(); return; }
   const root = wtQ("watch-together");
   if (!root || root.classList.contains("hidden") || wtState.bg) return;
   if (!wtState.mini) {

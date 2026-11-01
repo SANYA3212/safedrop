@@ -2173,7 +2173,7 @@ fn main() {
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
             win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, own_installer,
             ytbrowse::ytb_open, ytbrowse::ytb_go, ytbrowse::ytb_nav, ytbrowse::ytb_watch, ytbrowse::ytb_notify, ytbrowse::ytb_state,
-            ytbrowse::ytb_set_share, ytbrowse::ytb_remote_nav, ytbrowse::ytb_pause_media, ytbrowse::ytb_media_apply, ytbrowse::ytb_duck,
+            ytbrowse::ytb_set_share, ytbrowse::ytb_remote_nav, ytbrowse::ytb_pause_media, ytbrowse::ytb_media_apply, ytbrowse::ytb_duck, ytbrowse::ytb_chat_send, ytbrowse::ytb_chat_show,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SafeDrop");

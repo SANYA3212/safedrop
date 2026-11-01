@@ -412,6 +412,7 @@
       <span id="wt-viewers" class="wt-viewers"></span>
       <button id="wt-browse" class="wt-hbtn wt-hide-mini" title="Открыть YouTube: поиск, рекомендации, плейлисты"><svg class="ic" viewBox="0 0 24 24"><path d="M21.6 7.2a2.5 2.5 0 0 0-1.76-1.77C18.27 5 12 5 12 5s-6.27 0-7.84.43A2.5 2.5 0 0 0 2.4 7.2 26 26 0 0 0 2 12a26 26 0 0 0 .4 4.8 2.5 2.5 0 0 0 1.76 1.77C5.73 19 12 19 12 19s6.27 0 7.84-.43a2.5 2.5 0 0 0 1.76-1.77A26 26 0 0 0 22 12a26 26 0 0 0-.4-4.8zM10 15V9l5.2 3z"/></svg></button>
       <button id="wt-change" class="wt-hbtn wt-hide-mini" title="Сменить видео"><svg class="ic" viewBox="0 0 24 24"><path d="M10.59 13.41a1 1 0 0 1 0-1.42l4.3-4.29a3 3 0 1 1 4.24 4.24l-2.12 2.13-1.42-1.42 2.13-2.12a1 1 0 0 0-1.42-1.42l-4.29 4.3a1 1 0 0 1-1.42 0z"/><path d="M13.41 10.59a1 1 0 0 1 0 1.42l-4.3 4.29a3 3 0 1 1-4.24-4.24l2.12-2.13 1.42 1.42-2.13 2.12a1 1 0 0 0 1.42 1.42l4.29-4.3a1 1 0 0 1 1.42 0z"/></svg></button>
+      <button id="wt-chat-btn" class="wt-hbtn wt-hide-mini" title="Чат поверх видео"><svg class="ic" viewBox="0 0 24 24"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg><span id="wt-chat-count" class="wt-qcount hidden">0</span></button>
       <button id="wt-queue-btn" class="wt-hbtn wt-hide-mini" title="Очередь видео"><svg class="ic" viewBox="0 0 24 24"><path d="M3 6h13v2H3zm0 5h13v2H3zm0 5h9v2H3zm15-2v-4h2v4h3v2h-3v4h-2v-4h-3v-2z"/></svg><span id="wt-queue-count" class="wt-qcount hidden">0</span></button>
       <button id="wt-more" class="wt-hbtn wt-hide-mini" title="Ещё"><svg class="ic" viewBox="0 0 24 24"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg></button>
       <button id="wt-bg" class="wt-hbtn" title="Играть в фоне: скрыть плеер, видео и звук продолжатся"><svg class="ic" viewBox="0 0 24 24"><path d="M12 3a9 9 0 0 0-9 9v7a2 2 0 0 0 2 2h2a1 1 0 0 0 1-1v-6a1 1 0 0 0-1-1H5v-1a7 7 0 0 1 14 0v1h-2a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2a2 2 0 0 0 2-2v-7a9 9 0 0 0-9-9Z"/></svg></button>
@@ -454,6 +455,10 @@
           <button id="wt-empty-browse" class="primary">Открыть YouTube</button>
           <button id="wt-empty-pick">Вставить ссылку</button>
         </div>
+      </div>
+      <div id="wt-chat" class="wt-chat hidden">
+        <div id="wt-chat-list" class="wt-chat-list"></div>
+        <div class="wt-chat-row"><input id="wt-chat-input" placeholder="Сообщение…" maxlength="2000" /><button id="wt-chat-send" title="Отправить"><svg class="ic" viewBox="0 0 24 24"><path d="M2 21l21-9L2 3v7l15 2-15 2z"/></svg></button></div>
       </div>
       <div id="wt-controls" class="wt-controls">
         <button id="wt-toggle" title="Плей / пауза"><svg class="ic" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></button>

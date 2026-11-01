@@ -24,10 +24,18 @@
   .share:hover { background: var(--btn); }
   .share.on { border-color: #3fbf6f; background: rgba(63,191,111,.16); color: #b9f5cf; }
   .hidden { display: none !important; }
+  .chat { flex: 0 1 260px; min-width: 140px; display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px; background: rgba(0,0,0,.35); }
+  .chat:focus-within { border-color: var(--accent2); }
+  .chat svg { flex: none; width: 15px; height: 15px; fill: var(--muted); }
+  .chat input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; user-select: text; }
+  .msg { position: fixed; left: 50%; top: 6px; transform: translate(-50%, -6px); max-width: 70%; padding: 6px 12px; border-radius: 10px; background: #1d2433; border: 1px solid var(--accent); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0; transition: .2s; pointer-events: none; }
+  .msg.show { opacity: 1; transform: translate(-50%, 0); }
+  .msg b { color: var(--accent); }
   .notice { position: fixed; right: 10px; top: 6px; max-width: 60%; padding: 6px 12px; border-radius: 10px; background: #2a2140; border: 1px solid var(--accent2); font-size: 12px; opacity: 0; transform: translateY(-6px); transition: .2s; pointer-events: none; }
   .notice.show { opacity: 1; transform: none; }
   .notice.ok { background: #1d2d22; border-color: #3fbf6f; }
   @media (max-width: 820px) { .title { display: none; } }
+  @media (max-width: 680px) { .chat { display: none; } }
 </style>
 </head>
 <body>
@@ -41,6 +49,10 @@
     <input id="addr" placeholder="Адрес сайта (reddit.com) или поиск в Google" spellcheck="false" />
   </label>
   <span class="title" id="title"></span>
+  <label class="chat" title="Сообщение в чат звонка">
+    <svg viewBox="0 0 24 24"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>
+    <input id="chat" placeholder="Написать в звонок…" maxlength="2000" spellcheck="true" />
+  </label>
   <button class="share" id="b-share" title="Друзья в звонке видят, что вы открываете, и могут листать вместе с вами">
     <svg viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11A2.99 2.99 0 1 0 15 5c0 .24.04.47.09.7L8.04 9.81a3 3 0 1 0 0 4.38l7.12 4.16c-.05.21-.08.43-.08.65A2.92 2.92 0 1 0 18 16.08z"/></svg>
     <span id="share-text">Листать вместе</span>
@@ -52,6 +64,7 @@
   </button>
 </div>
 <div class="notice" id="notice"></div>
+<div class="msg" id="msg"><b id="msg-from"></b> <span id="msg-text"></span></div>
 <script>
   const T = window.__TAURI__;
   const invoke = (cmd, args) => (T && T.core ? T.core.invoke(cmd, args || {}) : Promise.reject("нет Tauri (demo)"));
@@ -112,6 +125,20 @@
     watchBtn.disabled = true;
     invoke("ytb_watch").catch((e) => { notice(String(e)); watchBtn.disabled = false; });
   };
+  const chat = $("chat");
+  chat.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && chat.value.trim()) {
+      invoke("ytb_chat_send", { text: chat.value.trim() }).then(() => { chat.value = ""; }).catch((err) => notice(String(err)));
+    } else if (e.key === "Escape") chat.blur();
+  });
+  let msgTimer = null;
+  function showMsg(from, text) {
+    $("msg-from").textContent = from ? from + ":" : "";
+    $("msg-text").textContent = text;
+    $("msg").classList.add("show");
+    clearTimeout(msgTimer);
+    msgTimer = setTimeout(() => $("msg").classList.remove("show"), 6000);
+  }
   document.addEventListener("keydown", (e) => {
     if (e.altKey && e.key === "ArrowLeft") nav("back");
     if (e.altKey && e.key === "ArrowRight") nav("forward");
@@ -121,6 +148,7 @@
   if (T && T.event) {
     T.event.listen("ytb-url", (e) => applyState(e.payload));
     T.event.listen("ytb-share", (e) => applyShare(e.payload && e.payload.on));
+    T.event.listen("ytb-chat", (e) => { const p = e.payload || {}; showMsg(String(p.from || ""), String(p.text || "")); });
     T.event.listen("ytb-notice", (e) => {
       const p = e.payload || {};
       notice(p.text || "", p.ok);
