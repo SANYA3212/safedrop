@@ -1,4 +1,4 @@
-use crate::state::{Peer, TransferInfo};
+use crate::state::TransferInfo;
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Instant};
 use tauri::{AppHandle, Emitter, Manager};

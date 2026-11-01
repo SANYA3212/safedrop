@@ -142,10 +142,6 @@ pub fn my_ips() -> Vec<String> {
     v
 }
 
-pub fn radmin_ips() -> Vec<String> {
-    my_ips().into_iter().filter(|ip| ip.starts_with("26.")).collect()
-}
-
 /// Host range (inclusive, network+1 .. broadcast-1) of the subnet at
 /// `prefix` containing `ip`. For degenerate prefixes keeps the /24 window.
 fn subnet_range(ip: Ipv4Addr, prefix: u8) -> (u32, u32) {

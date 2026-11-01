@@ -1,36 +1,5 @@
 import { invoke, listen, isDemo, tauriFile, bridgeInfo } from "./tauri-shim.js";
 
-function fft(re, im, n) {
-  for (let i = 0; i < n; i++) {
-    let j = 0;
-    for (let b = n >> 1; b > 0; b >>= 1) { j |= (i & b) ? 1 : 0; j <<= 1; }
-    j >>= 1;
-    if (j > i) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
-  }
-  for (let len = 2; len <= n; len <<= 1) {
-    const ang = -2 * Math.PI / len;
-    const wr = Math.cos(ang), wi = Math.sin(ang);
-    for (let i = 0; i < n; i += len) {
-      let cwr = 1, cwi = 0;
-      for (let j = 0; j < len / 2; j++) {
-        const ur = re[i + j], ui = im[i + j];
-        const vr = re[i + j + len / 2] * cwr - im[i + j + len / 2] * cwi;
-        const vi = re[i + j + len / 2] * cwi + im[i + j + len / 2] * cwr;
-        re[i + j] = ur + vr; im[i + j] = ui + vi;
-        re[i + j + len / 2] = ur - vr; im[i + j + len / 2] = ui - vi;
-        const nwr = cwr * wr - cwi * wi;
-        cwi = cwr * wi + cwi * wr; cwr = nwr;
-      }
-    }
-  }
-}
-
-function ifft(re, im, n) {
-  for (let i = 0; i < n; i++) im[i] = -im[i];
-  fft(re, im, n);
-  for (let i = 0; i < n; i++) { re[i] /= n; im[i] = -im[i] / n; }
-}
-
 // все немые падения — сразу тостом на экран
 window.addEventListener("error", (e) => {
   try { toast("JS-ошибка: " + (e.message || e.error), true); } catch {}
@@ -2072,7 +2041,6 @@ let deafened = false;
 const voiceEls = {};
 let monCtx = null, monTimer = null;
 const voiceMon = {};
-function effPeerVol(ip) { return (deafened || peerVol(ip) === 0) ? 0 : peerVol(ip); }
 function applyDeafen() {
   for (const ip of Object.keys(voiceEls)) ampSet("v:" + ip, deafened ? 0 : peerVol(ip));
   for (const id of Object.keys(views)) applyViewVolume(id);
@@ -4479,7 +4447,6 @@ function wtViewerIps() {
   }
   return Object.keys(wtState.viewers);
 }
-function wtViewerCount() { return (wtIsWatching() ? 1 : 0) + wtViewerIps().length; }
 
 function wtStatus(text) {
   const el = wtQ("wt-now");
@@ -5102,14 +5069,28 @@ function webOnLocalUrl(p) {
   }
 }
 function webOnRemote(p) {
-  if (!p || p.action !== "nav" || !webIsUrl(p.url)) return;
+  if (!p || !webIsUrl(p.url)) return;
   if (p.ip && myIp && p.ip === myIp) return;
   const who = wtNick(p.ip || "", p.from);
+  if (p.action === "media") {
+    // пауза/плей/перемотка видео на той же странице (Rust сверит адрес)
+    const t = Number(p.t);
+    if (!isFinite(t) || !["play", "pause", "seek", "time"].includes(p.media)) return;
+    invoke("ytb_media_apply", { action: p.media, t, url: p.url, by: who }).catch(() => {});
+    return;
+  }
+  if (p.action !== "nav") return;
   webState.pending = { url: p.url, title: p.title || "", who };
   invoke("ytb_remote_nav", { url: p.url, by: who }).then((applied) => {
     if (applied) { webState.lastSent = p.url; webHideJoin(); }
     else webShowJoin();
   }).catch(() => webShowJoin());
+}
+// Наше действие с видео на странице (заметил Rust) — участникам.
+function webOnLocalMedia(p) {
+  if (!webState.share || !webIsUrl(p.url)) return;
+  if (typeof inVoice === "function" && !inVoice()) return;
+  webSend({ action: "media", media: p.action, t: Number(p.t) || 0, url: p.url });
 }
 function webShowJoin() {
   const p = webState.pending;
@@ -5271,6 +5252,7 @@ if (typeof listen === "function") {
   }).catch((err) => console.error("ytb listen", err));
   listen("ytb-url", (e) => { try { webOnLocalUrl(e.payload || {}); } catch (err) { console.error("ytb-url", err); } }).catch(() => {});
   listen("ytb-share", (e) => { try { webOnShare(!!(e.payload && e.payload.on)); } catch (err) { console.error("ytb-share", err); } }).catch(() => {});
+  listen("ytb-media", (e) => { try { webOnLocalMedia(e.payload || {}); } catch (err) { console.error("ytb-media", err); } }).catch(() => {});
   listen("ytb-closed", () => { webState.share = false; webState.lastSent = ""; }).catch(() => {});
   listen("safedrop-web", (e) => { try { webOnRemote(e.payload || {}); } catch (err) { console.error("safedrop-web", err); } }).catch(() => {});
 }

@@ -238,6 +238,7 @@ fn build_window(app: &AppHandle, start: Url) -> Result<(), String> {
     });
     layout(app);
     spawn_url_watch(app.clone());
+    spawn_media_watch(app.clone());
     Ok(())
 }
 
@@ -384,4 +385,164 @@ pub async fn ytb_notify(app: AppHandle, text: String, ok: bool) -> Result<(), St
 pub async fn ytb_state(app: AppHandle) -> Result<serde_json::Value, String> {
     let url = app.get_webview(VIEW).and_then(|v| v.url().ok()).map(|u| u.to_string()).unwrap_or_default();
     Ok(state_json(&url))
+}
+
+// ---------- синхронное видео на любых сайтах ----------
+//
+// В режиме «Листать вместе» раз в 0,7 с читаем состояние главного <video>
+// страницы (самого большого на экране). Заметили, что пользователь нажал
+// паузу/плей или перемотал, — отдаём главному окну `ytb-media`, оно шлёт
+// участникам. Чужие команды применяются через `ytb_media_apply`, после чего
+// на 1,5 с наши собственные «изменения» не рассылаются (защита от эха).
+// Работает только для видео прямо на странице: плееры во встроенных окнах
+// (iframe с другого сайта) отсюда не видны.
+
+const MEDIA_TICK: Duration = Duration::from_millis(700);
+const MEDIA_QUIET: Duration = Duration::from_millis(1500);
+/// Тот, кто последним управлял, раз в 5 с шлёт позицию для мягкой подгонки.
+const MEDIA_TIME_EVERY: Duration = Duration::from_secs(5);
+
+/// Чтение состояния главного видео. Возвращает объект — WebView2 сам
+/// сериализует его в JSON для колбэка.
+const MEDIA_READ_JS: &str = "(function(){var b=null,ba=0;document.querySelectorAll('video').forEach(function(v){var r=v.getBoundingClientRect(),a=r.width*r.height;if(a>ba){ba=a;b=v}});if(!b||ba<40000)return {has:false};return {has:true,paused:b.paused,t:b.currentTime,dur:isFinite(b.duration)?b.duration:0}})()";
+
+#[derive(Clone)]
+struct MediaSnap {
+    url: String,
+    paused: bool,
+    t: f64,
+    at: Instant,
+}
+
+#[derive(Default)]
+struct MediaSync {
+    prev: Option<MediaSnap>,
+    quiet_until: Option<Instant>,
+    leader: bool,
+    last_time_sent: Option<Instant>,
+}
+
+static MEDIA: Mutex<MediaSync> = Mutex::new(MediaSync { prev: None, quiet_until: None, leader: false, last_time_sent: None });
+
+fn url_no_fragment(u: &str) -> &str {
+    u.split('#').next().unwrap_or(u)
+}
+
+fn clean_time(t: f64) -> Option<f64> {
+    (t.is_finite() && (0.0..=1_000_000.0).contains(&t)).then_some(t)
+}
+
+/// Разбор ответа страницы. Страница может подсунуть что угодно, поэтому
+/// берём только нужные поля и проверяем числа.
+fn parse_media(raw: &str) -> Option<(bool, f64)> {
+    let mut v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if let serde_json::Value::String(s) = &v {
+        v = serde_json::from_str(s).ok()?;
+    }
+    if !v.get("has")?.as_bool()? {
+        return None;
+    }
+    let paused = v.get("paused")?.as_bool()?;
+    let t = clean_time(v.get("t")?.as_f64()?)?;
+    Some((paused, t))
+}
+
+fn on_media_read(app: &AppHandle, url: String, raw: String) {
+    let now = Instant::now();
+    let Ok(mut m) = MEDIA.lock() else { return };
+    let Some((paused, t)) = parse_media(&raw) else {
+        m.prev = None;
+        return;
+    };
+    let snap = MediaSnap { url: url.clone(), paused, t, at: now };
+    let prev = match m.prev.replace(snap) {
+        Some(p) if url_no_fragment(&p.url) == url_no_fragment(&url) => p,
+        _ => return, // новая страница или первое чтение — только запоминаем
+    };
+    if m.quiet_until.map(|q| now < q).unwrap_or(false) {
+        return;
+    }
+    let elapsed = now.duration_since(prev.at).as_secs_f64();
+    let expected = prev.t + if prev.paused { 0.0 } else { elapsed };
+    let action = if paused != prev.paused {
+        Some(if paused { "pause" } else { "play" })
+    } else if (t - expected).abs() > 2.0 {
+        Some("seek")
+    } else if m.leader && !paused && m.last_time_sent.map(|s| now.duration_since(s) >= MEDIA_TIME_EVERY).unwrap_or(true) {
+        Some("time")
+    } else {
+        None
+    };
+    let Some(action) = action else { return };
+    if action != "time" {
+        m.leader = true;
+    }
+    m.last_time_sent = Some(now);
+    drop(m);
+    let _ = app.emit_to(
+        EventTarget::webview_window("main"),
+        "ytb-media",
+        serde_json::json!({ "action": action, "t": t, "paused": paused, "url": url }),
+    );
+}
+
+fn spawn_media_watch(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(MEDIA_TICK).await;
+            let Some(view) = app.get_webview(VIEW) else { break };
+            if !SHARE.load(Ordering::Relaxed) {
+                if let Ok(mut m) = MEDIA.lock() {
+                    *m = MediaSync::default();
+                }
+                continue;
+            }
+            let Ok(url) = view.url().map(|u| u.to_string()) else { continue };
+            if !url.starts_with("http") {
+                continue;
+            }
+            let app_cb = app.clone();
+            let _ = view.eval_with_callback(MEDIA_READ_JS, move |raw| on_media_read(&app_cb, url.clone(), raw));
+        }
+    });
+}
+
+/// Команда участника для видео на той же странице. Возвращает false, если
+/// у нас другая страница или «Листать вместе» выключено.
+#[tauri::command]
+pub async fn ytb_media_apply(app: AppHandle, action: String, t: f64, url: String, by: String) -> Result<bool, String> {
+    if !SHARE.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    let view = app.get_webview(VIEW).ok_or("окно браузера закрыто")?;
+    let cur = view.url().map_err(|e| e.to_string())?.to_string();
+    if url_no_fragment(&cur) != url_no_fragment(&url) {
+        return Ok(false);
+    }
+    let t = clean_time(t).ok_or("bad time")?;
+    // фиксированные шаблоны, в страницу попадает только проверенное число
+    let body = match action.as_str() {
+        "play" => format!("if(Math.abs(b.currentTime-{t})>1.5)b.currentTime={t};b.play();"),
+        "pause" => format!("b.pause();if(Math.abs(b.currentTime-{t})>1.5)b.currentTime={t};"),
+        "seek" => format!("b.currentTime={t};"),
+        "time" => format!("if(!b.paused&&Math.abs(b.currentTime-{t})>2.5)b.currentTime={t};"),
+        _ => return Err("unknown action".into()),
+    };
+    let js = format!("(function(){{var b=null,ba=0;document.querySelectorAll('video').forEach(function(v){{var r=v.getBoundingClientRect(),a=r.width*r.height;if(a>ba){{ba=a;b=v}}}});if(!b)return;try{{{body}}}catch(e){{}}}})()");
+    if let Ok(mut m) = MEDIA.lock() {
+        m.quiet_until = Some(Instant::now() + MEDIA_QUIET);
+        m.leader = false;
+        m.prev = None;
+    }
+    view.eval(js).map_err(|e| e.to_string())?;
+    if action != "time" {
+        let who = if by.trim().is_empty() { "Участник".to_string() } else { by };
+        let what = match action.as_str() {
+            "play" => "включил видео".to_string(),
+            "pause" => "поставил на паузу".to_string(),
+            _ => format!("перемотал на {}:{:02}", (t / 60.0) as u64, (t % 60.0) as u64),
+        };
+        let _ = app.emit_to(EventTarget::webview(BAR), "ytb-notice", serde_json::json!({ "text": format!("{who} {what}"), "ok": true }));
+    }
+    Ok(true)
 }

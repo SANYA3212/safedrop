@@ -94,7 +94,7 @@ pub(crate) enum Frame {
     YtSync { from: String, #[serde(default)] ip: String, #[serde(default)] nickname: String, #[serde(default)] action: String, #[serde(default)] video: String, #[serde(default)] pos: f64, #[serde(default)] paused: bool, #[serde(default)] at: i64, #[serde(default)] seq: i64, #[serde(default)] title: String, #[serde(default)] by: String, #[serde(default)] watching: bool, #[serde(default)] vertical: bool, #[serde(default)] to_group: Option<String> },
     /// «Листать вместе»: участник открыл страницу в окне браузера.
     #[serde(rename = "web-sync")]
-    WebSync { from: String, #[serde(default)] action: String, #[serde(default)] url: String, #[serde(default)] title: String, #[serde(default)] at: i64, #[serde(default)] to_group: Option<String> },
+    WebSync { from: String, #[serde(default)] action: String, #[serde(default)] url: String, #[serde(default)] title: String, #[serde(default)] at: i64, #[serde(default)] media: String, #[serde(default)] t: f64, #[serde(default)] to_group: Option<String> },
     #[serde(other)]
     Unknown,
 }
@@ -123,10 +123,6 @@ fn trim_avatar(s: &str) -> String {
 /// from the future. Old clients only send `ts` (HH:MM), keep it as a fallback.
 fn normalize_sent_at(sent_at: i64) -> i64 {
     if sent_at <= 0 { 0 } else { sent_at.min(chrono::Utc::now().timestamp_millis()).max(1) }
-}
-
-pub fn clamp_sent_at(sent_at: i64) -> i64 {
-    if sent_at <= 0 { 0 } else { sent_at.min(chrono::Utc::now().timestamp_millis()) }
 }
 
 pub async fn run_signal_server(app: AppHandle, port: u16) {
@@ -409,7 +405,7 @@ pub(crate) async fn process_frame(
             let ip2 = ip.clone();
             tokio::spawn(async move { flush_pending_for_peer(&app2, &ip2, true).await; });
         }
-        Frame::HelloReply { nickname, avatar, device, file_confirm, chat_ack, watch, group_sync } => {
+        Frame::HelloReply { nickname, avatar, device, file_confirm, chat_ack, watch: _, group_sync } => {
             // only happens on client side reading; ignore on server
             let _ = (nickname, avatar, device, file_confirm, chat_ack);
             merge_group_sync(app, group_sync, Some(&ip)).await;
@@ -862,11 +858,12 @@ pub(crate) async fn process_frame(
             let _ = app.emit("safedrop-watch", serde_json::json!({"ip": ip, "payload": payload}));
         }
 
-        Frame::WebSync { from, action, url, title, at, .. } => {
+        Frame::WebSync { from, action, url, title, at, media, t, .. } => {
             // «Листать вместе»: только главному окну, решение о переходе — там
             let payload = serde_json::json!({
                 "kind": "web-sync", "from": from, "ip": ip,
                 "action": action, "url": url, "title": title, "at": at,
+                "media": media, "t": t,
             });
             let _ = app.emit_to("main", "safedrop-web", payload);
         }
@@ -944,14 +941,6 @@ async fn send_chat_sync(app: &AppHandle, peer_ip: &str, known_ids: Vec<String>) 
     }
 }
 
-pub async fn load_groups(state: &AppState) {
-    if let Ok(data) = std::fs::read_to_string(state.groups_path()) {
-        if let Ok(v) = serde_json::from_str::<Vec<Group>>(&data) {
-            *state.groups.lock().await = v;
-        }
-    }
-}
-
 /// Save avatar dataURL to a temp file for toast icons. Returns file path.
 /// Only png/jpeg are used (toast may reject webp/gif and drop the whole toast).
 pub fn avatar_icon_path(app_dir: &std::path::Path, ip: &str, avatar_dataurl: &str) -> Option<String> {
@@ -1002,24 +991,6 @@ fn notify_impl(title: &str, body: &str, icon: Option<String>) {
     // notification sound, including while the window is minimized.
     if let Err(e) = n.show() {
         eprintln!("SafeDrop notify failed: {e:?}");
-    }
-}
-
-pub async fn load_chats(state: &AppState) {
-    use std::collections::HashMap;
-    if let Ok(data) = std::fs::read_to_string(state.chats_path()) {
-        if let Ok(mut m) = serde_json::from_str::<HashMap<String, Vec<ChatMsg>>>(&data) {
-            for rows in m.values_mut() {
-                for msg in rows.iter_mut() {
-                    msg.sent_at = clamp_sent_at(msg.sent_at);
-                    if msg.images.is_empty() && !msg.image.is_empty() {
-                        msg.images.push(msg.image.clone());
-                    }
-                }
-                rows.sort_by(|a, b| a.sent_at.cmp(&b.sent_at).then_with(|| a.id.cmp(&b.id)));
-            }
-            *state.chats.lock().await = m;
-        }
     }
 }
 

@@ -1091,7 +1091,7 @@ fn ensure_notif_shortcut() {
     // the Tokio runtime context exists, which would panic.
     let _ = std::thread::spawn(|| -> Result<(), String> {
         use windows::{
-            core::{Interface, GUID, HSTRING, PCWSTR, PWSTR},
+            core::{Interface, GUID, HSTRING},
             Win32::{
                 Foundation::PROPERTYKEY,
                 System::{
@@ -1143,11 +1143,11 @@ fn ensure_notif_shortcut() {
                 pid: 5,
             };
             let idw: Vec<u16> = "com.safedrop.app".encode_utf16().chain(Some(0)).collect();
-            let mem = unsafe { CoTaskMemAlloc(idw.len() * 2) as *mut u16 };
+            let mem = CoTaskMemAlloc(idw.len() * 2) as *mut u16;
             if mem.is_null() {
                 return Err("oom".into());
             }
-            unsafe { std::ptr::copy_nonoverlapping(idw.as_ptr(), mem, idw.len()) };
+            std::ptr::copy_nonoverlapping(idw.as_ptr(), mem, idw.len());
             // PROPVARIANT assembled bottom-up by value (unions can't be
             // field-assigned through ManuallyDrop auto-deref).
             use windows::Win32::System::Com::StructuredStorage::{
@@ -1570,9 +1570,8 @@ async fn flash_window(app: tauri::AppHandle) -> Result<(), String> {
         uCount: 3,
         dwTimeout: 0,
     };
-    unsafe {
-        FlashWindowEx(&info);
-    }
+    // результат (было ли окно активным) не нужен
+    let _ = unsafe { FlashWindowEx(&info) };
     Ok(())
 }
 
@@ -2143,7 +2142,7 @@ fn main() {
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
             win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info,
             ytbrowse::ytb_open, ytbrowse::ytb_go, ytbrowse::ytb_nav, ytbrowse::ytb_watch, ytbrowse::ytb_notify, ytbrowse::ytb_state,
-            ytbrowse::ytb_set_share, ytbrowse::ytb_remote_nav, ytbrowse::ytb_pause_media,
+            ytbrowse::ytb_set_share, ytbrowse::ytb_remote_nav, ytbrowse::ytb_pause_media, ytbrowse::ytb_media_apply,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SafeDrop");

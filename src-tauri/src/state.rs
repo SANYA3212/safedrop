@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,19 +349,6 @@ pub struct Peer {
 }
 
 impl Peer {
-    /// Display name priority: local alias > synced nickname > device/ip
-    pub fn display_name(&self) -> String {
-        if !self.name.is_empty() && self.name != self.ip {
-            return self.name.clone();
-        }
-        if !self.nickname.is_empty() {
-            return self.nickname.clone();
-        }
-        if !self.name.is_empty() {
-            return self.name.clone();
-        }
-        self.ip.clone()
-    }
     /// Display avatar priority: local override > synced
     pub fn display_avatar(&self) -> String {
         if !self.custom_avatar.is_empty() {
@@ -544,4 +531,3 @@ impl AppState {
     pub fn group_sync_path(&self) -> PathBuf { self.app_dir.join("group-sync.json") }
 }
 
-pub type SharedState = Arc<AppState>;

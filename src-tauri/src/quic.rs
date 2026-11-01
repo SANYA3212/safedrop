@@ -7,7 +7,7 @@
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tauri::{AppHandle, Manager};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 const ALPN: &[u8] = b"safedrop/1";
 const MAX_LINE: usize = 1_048_576;
@@ -296,47 +296,6 @@ pub async fn send_frame_quic(
     let mut reader = BufReader::new(&mut recv);
     let buf = read_line_capped(&mut reader, MAX_LINE).await?;
     Ok(serde_json::from_slice::<serde_json::Value>(&buf).ok())
-}
-
-/// Send a file over QUIC (mirrors transfer::send_file_to, shared pump).
-pub async fn send_file_quic_to(
-    app: AppHandle,
-    peer_ip: String,
-    port: u16,
-    file_path: String,
-    device_name: String,
-    kind: String,
-    require_confirmation: bool,
-) -> Result<String, String> {
-    let prep = crate::transfer::prepare_upload(&file_path).await?;
-    let conn = connect(&peer_ip, port).await?;
-    let (mut send, mut recv) = tokio::time::timeout(STREAM_TIMEOUT, conn.open_bi())
-        .await
-        .map_err(|_| "quic timeout".to_string())?
-        .map_err(|e| e.to_string())?;
-    let offer = serde_json::json!({"name": prep.fname, "size": prep.total, "id": prep.id, "from": device_name, "kind": kind, "confirm": require_confirmation});
-    let mut header = serde_json::to_string(&offer).map_err(|e| e.to_string())?;
-    header.push('\n');
-    send.write_all(header.as_bytes()).await.map_err(|e| e.to_string())?;
-    if require_confirmation {
-        let mut reader = BufReader::new(&mut recv);
-        let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(120), reader.read_line(&mut line))
-            .await.map_err(|_| "Тайм-аут ожидания подтверждения приёма файла".to_string())?
-            .map_err(|e| e.to_string())?;
-        let reply: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| e.to_string())?;
-        if reply.get("accepted").and_then(|v| v.as_bool()) != Some(true) {
-            return Err("Получатель отклонил приём файла".into());
-        }
-    }
-    let id = crate::transfer::pump_upload(&app, prep, &peer_ip, &mut send).await?;
-    let _ = send.finish();
-    // make sure the receiver consumed the whole file before we go away
-    if let Err(e) = wait_peer_done(&mut recv, 30).await {
-        crate::transfer::set_transfer_error(&app, &id, &e).await;
-        return Err(e);
-    }
-    Ok(id)
 }
 
 /// Dual-stack send: TCP first (5s budget), QUIC fallback when beta is on.
