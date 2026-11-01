@@ -295,7 +295,7 @@ pub async fn ytb_nav(app: AppHandle, action: String) -> Result<(), String> {
 pub async fn ytb_watch(app: AppHandle) -> Result<(), String> {
     let view = app.get_webview(VIEW).ok_or("окно браузера закрыто")?;
     let url = view.url().map_err(|e| e.to_string())?.to_string();
-    let _ = view.eval("document.querySelectorAll('video').forEach(function(v){v.pause()})");
+    pause_media(&app);
     app.emit_to(
         EventTarget::webview_window("main"),
         "ytb-watch",
@@ -307,6 +307,29 @@ pub async fn ytb_watch(app: AppHandle) -> Result<(), String> {
         let _ = main.show();
         let _ = main.set_focus();
     }
+    Ok(())
+}
+
+/// Пауза всего видео и звука на странице браузера. Фиксированная строка,
+/// страница ничего не получает в ответ. Второй проход через секунду: YouTube
+/// после паузы иногда сам продолжает (автовоспроизведение, смена ролика).
+fn pause_media(app: &AppHandle) {
+    const JS: &str = "document.querySelectorAll('video,audio').forEach(function(m){try{m.pause()}catch(e){}})";
+    let Some(view) = app.get_webview(VIEW) else { return };
+    let _ = view.eval(JS);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        if let Some(v) = app.get_webview(VIEW) {
+            let _ = v.eval(JS);
+        }
+    });
+}
+
+/// «Остановить для всех» и подобное: браузер тоже замолкает.
+#[tauri::command]
+pub async fn ytb_pause_media(app: AppHandle) -> Result<(), String> {
+    pause_media(&app);
     Ok(())
 }
 

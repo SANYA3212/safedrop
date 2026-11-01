@@ -4821,6 +4821,7 @@ function wtApplyCommand(p) {
 
 function wtRemoteStop() {
   try { wtState.player?.stopVideo(); } catch {}
+  if (webState.share) invoke("ytb_pause_media").catch(() => {});
   wtCloseMe(true);
   wtClearSession();
   wtStatus("Сессия просмотра остановлена");
@@ -4832,6 +4833,8 @@ function wtStopAll() {
     if (!ok) return;
     wtSend({ action: "stop" });
     try { wtState.player?.stopVideo(); } catch {}
+    // видео, выбранное в окне браузера, играет в самом браузере — глушим и его
+    if (!isDemo) invoke("ytb_pause_media").catch(() => {});
     wtCloseMe(true);
     wtClearSession();
     toast("Смотреть вместе остановлено");
@@ -5067,10 +5070,11 @@ const webIsUrl = (u) => /^https?:\/\//i.test(String(u || ""));
 
 function webSend(payload) {
   const targets = wtTargets();
-  if (!targets.length) return;
   const msg = Object.assign({ kind: "web-sync", from: myNick(), at: Date.now() }, payload);
   for (const ip of targets) invoke("sig_send", { peerIp: ip, payload: msg }).catch(() => {});
+  return targets.length;
 }
+const webNotify = (text, ok) => invoke("ytb_notify", { text, ok }).catch(() => {});
 function webOnShare(on) {
   if (on && typeof inVoice === "function" && !inVoice()) {
     invoke("ytb_notify", { text: "«Листать вместе» работает во время звонка", ok: false }).catch(() => {});
@@ -5079,14 +5083,23 @@ function webOnShare(on) {
   }
   webState.share = on;
   webState.lastSent = "";
-  if (on) webHideJoin();
+  webState.sentOnce = false;
+  if (on) {
+    webHideJoin();
+    webNotify("Листаем вместе: участники звонка увидят страницы, которые вы открываете", true);
+  }
 }
 function webOnLocalUrl(p) {
   if (!webState.share || p.remote || !webIsUrl(p.url)) return;
   if (typeof inVoice === "function" && !inVoice()) return;
   if (p.url === webState.lastSent) return;
   webState.lastSent = p.url;
-  webSend({ action: "nav", url: p.url, title: p.title || "" });
+  const n = webSend({ action: "nav", url: p.url, title: p.title || "" });
+  // первая отправка после включения — показать, дошло ли до кого-то
+  if (!webState.sentOnce) {
+    webState.sentOnce = true;
+    webNotify(n ? "Страница отправлена участникам: " + n : "Некому отправить: в звонке нет участников с новой версией SafeDrop", n > 0);
+  }
 }
 function webOnRemote(p) {
   if (!p || p.action !== "nav" || !webIsUrl(p.url)) return;
@@ -5101,6 +5114,9 @@ function webOnRemote(p) {
 function webShowJoin() {
   const p = webState.pending;
   if (!p) return;
+  if (wtQ("vb-web")?.classList.contains("hidden") && wtQ("cs-web")?.classList.contains("hidden")) {
+    toast(p.who + " листает браузер. Нажмите «" + p.who + " в браузере» на панели звонка, чтобы смотреть вместе");
+  }
   for (const id of ["vb-web", "cs-web"]) {
     const b = wtQ(id);
     if (!b) continue;
