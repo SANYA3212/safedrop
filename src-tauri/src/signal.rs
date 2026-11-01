@@ -26,9 +26,9 @@ pub struct GroupRef {
 #[serde(tag = "kind")]
 pub(crate) enum Frame {
     #[serde(rename = "hello")]
-    Hello { nickname: String, avatar: String, device: String, #[serde(default)] file_confirm: bool, #[serde(default)] chat_ack: bool, #[serde(default)] watch: bool, #[serde(default)] group_sync: GroupSyncState },
+    Hello { nickname: String, avatar: String, device: String, #[serde(default)] file_confirm: bool, #[serde(default)] chat_ack: bool, #[serde(default)] watch: bool, #[serde(default)] version: String, #[serde(default)] group_sync: GroupSyncState },
     #[serde(rename = "hello-reply")]
-    HelloReply { nickname: String, avatar: String, device: String, #[serde(default)] file_confirm: bool, #[serde(default)] chat_ack: bool, #[serde(default)] watch: bool, #[serde(default)] group_sync: GroupSyncState },
+    HelloReply { nickname: String, avatar: String, device: String, #[serde(default)] file_confirm: bool, #[serde(default)] chat_ack: bool, #[serde(default)] watch: bool, #[serde(default)] version: String, #[serde(default)] group_sync: GroupSyncState },
     #[serde(rename = "group-sync")]
     GroupSync { #[serde(default)] state: GroupSyncState },
     #[serde(rename = "chat")]
@@ -357,7 +357,7 @@ pub(crate) async fn process_frame(
     let now = chrono::Local::now().format("%H:%M").to_string();
 
     match frame {
-        Frame::Hello { nickname, avatar, device, file_confirm, chat_ack, watch, group_sync } => {
+        Frame::Hello { nickname, avatar, device, file_confirm, chat_ack, watch, version, group_sync } => {
             merge_group_sync(app, group_sync, Some(&ip)).await;
             let avatar = trim_avatar(&avatar);
             {
@@ -369,6 +369,7 @@ pub(crate) async fn process_frame(
                     supports_file_confirm: file_confirm, supports_chat_ack: chat_ack, supports_watch: watch,
                     phash: String::new(), state: "idle".into(), detail: String::new(),
                     ips: vec![ip.clone()],
+                    version: String::new(),
                 });
                 e.nickname = nickname.clone();
                 e.avatar = avatar.clone();
@@ -376,6 +377,7 @@ pub(crate) async fn process_frame(
                 e.supports_file_confirm = file_confirm;
                 e.supports_chat_ack = chat_ack;
                 e.supports_watch = watch;
+                e.version = version.clone();
                 e.online = true;
                 if !e.ips.contains(&ip) { e.ips.push(ip.clone()); }
                 e.last_seen = Some(chrono::Local::now().format("%H:%M:%S").to_string());
@@ -396,7 +398,7 @@ pub(crate) async fn process_frame(
                 )
             };
             let group_sync = state.group_sync.lock().await.clone();
-            let reply = serde_json::json!({"kind":"hello-reply","nickname":nn,"avatar":av,"device":dev,"file_confirm":true,"chat_ack":true,"watch":true,"group_sync":group_sync});
+            let reply = serde_json::json!({"kind":"hello-reply","nickname":nn,"avatar":av,"device":dev,"file_confirm":true,"chat_ack":true,"watch":true,"version":crate::app_version(),"group_sync":group_sync});
             let mut out = serde_json::to_string(&reply).unwrap_or_default();
             out.push('\n');
             // write back on same stream
@@ -405,7 +407,7 @@ pub(crate) async fn process_frame(
             let ip2 = ip.clone();
             tokio::spawn(async move { flush_pending_for_peer(&app2, &ip2, true).await; });
         }
-        Frame::HelloReply { nickname, avatar, device, file_confirm, chat_ack, watch: _, group_sync } => {
+        Frame::HelloReply { nickname, avatar, device, file_confirm, chat_ack, watch: _, version: _, group_sync } => {
             // only happens on client side reading; ignore on server
             let _ = (nickname, avatar, device, file_confirm, chat_ack);
             merge_group_sync(app, group_sync, Some(&ip)).await;
@@ -706,6 +708,7 @@ pub(crate) async fn process_frame(
                     supports_file_confirm: false, supports_chat_ack: false, supports_watch: false,
                     phash: String::new(), state: "idle".into(), detail: String::new(),
                     ips: vec![ip.clone()],
+                    version: String::new(),
                 });
                 e.online = true;
                 e.last_seen = Some(chrono::Local::now().format("%H:%M:%S").to_string());
@@ -1158,7 +1161,7 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
         )
     };
     let group_sync = state.group_sync.lock().await.clone();
-    let v = serde_json::json!({"kind":"hello","nickname":nn,"avatar":av,"device":dev,"file_confirm":true,"chat_ack":true,"watch":true,"group_sync":group_sync});
+    let v = serde_json::json!({"kind":"hello","nickname":nn,"avatar":av,"device":dev,"file_confirm":true,"chat_ack":true,"watch":true,"version":crate::app_version(),"group_sync":group_sync});
     let reply = match send_frame(ip, port, v.clone(), true).await {
         Ok(Some(r)) => Some(r),
         _ if udp_on => crate::quic::send_frame_quic(ip, udp_port, v, true).await.ok().flatten(),
@@ -1177,6 +1180,7 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
                 let file_confirm = reply.get("file_confirm").and_then(|x| x.as_bool()).unwrap_or(false);
                 let chat_ack = reply.get("chat_ack").and_then(|x| x.as_bool()).unwrap_or(false);
                 let watch = reply.get("watch").and_then(|x| x.as_bool()).unwrap_or(false);
+                let version = reply.get("version").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 {
                     let mut g = state.peers.lock().await;
                     if let Some(p) = g.get_mut(ip) {
@@ -1187,6 +1191,7 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
                         p.supports_file_confirm = file_confirm;
                         p.supports_chat_ack = chat_ack;
                         p.supports_watch = watch;
+                        p.version = version.clone();
                         if p.name.is_empty() || p.name == p.ip {
                             p.name = if dev.is_empty() { nn } else { dev };
                         }

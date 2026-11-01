@@ -332,6 +332,9 @@ pub struct Peer {
     pub supports_chat_ack: bool,
     #[serde(default)]
     pub supports_watch: bool,
+    /// Версия SafeDrop у контакта (из hello). Пусто — старая версия без этого поля.
+    #[serde(default)]
+    pub version: String,
     #[serde(default)]
     pub online: bool,
     #[serde(default)]

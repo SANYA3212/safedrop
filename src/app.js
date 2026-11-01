@@ -3614,6 +3614,51 @@ $("#upd-yes").onclick = async () => {
   try { await invoke("apply_update", { path: o.path, version: o.version }); }
   catch (e) { toast("Не вышло: " + e, true); }
 };
+// ---------- версии у друзей в звонке: предложить обновление ----------
+// Версию контакт сообщает в hello (с 0.3.25). Пусто — версия старше, чем
+// эта проверка. Новые функции (браузер вместе, видео в фоне) работают только
+// при одинаковых версиях, поэтому в звонке один раз спрашиваем, отправить ли
+// установщик. Свой установщик ищет Rust (own_installer), иначе — выбрать файл.
+const updAsked = new Set();
+let updMyVer = "";
+async function updCheckCallPeers() {
+  if (isDemo || typeof inVoice !== "function" || !inVoice()) return;
+  if (!$("#confirm-modal").classList.contains("hidden")) return;
+  if (!updMyVer) updMyVer = await refreshMyVer();
+  const ips = currentCall ? [currentCall] : (groupCall ? groupCall.members : []);
+  for (const ip of ips) {
+    if (!ip || ip === myIp) continue;
+    const p = peers.find((x) => x.ip === ip);
+    if (!p || !p.online) continue;
+    const theirs = p.version || "";
+    if (theirs && cmpVer(theirs, updMyVer) >= 0) continue;
+    const key = ip + "|" + theirs;
+    if (updAsked.has(key)) continue;
+    updAsked.add(key);
+    await updOfferSend(p, theirs);
+    return; // по одному вопросу за раз
+  }
+}
+async function updOfferSend(p, theirs) {
+  const name = dispName(p);
+  const vers = theirs ? `У него ${theirs}, у тебя ${updMyVer}.` : `Его версия старше 0.3.25 (не сообщает номер), у тебя ${updMyVer}.`;
+  const ok = await askConfirm(`У ${name} старая версия SafeDrop`,
+    `${vers} Браузер вместе, видео в фоне и другие новинки работают, только когда версии совпадают. Отправить ему установщик?`,
+    "Отправить");
+  if (!ok) return;
+  let path = await invoke("own_installer").catch(() => null);
+  if (!path) {
+    toast(`Не нашёл свой установщик — выбери файл SafeDrop_${updMyVer}_x64-setup.exe`);
+    const picked = await invoke("pick_files").catch(() => null);
+    path = (picked || [])[0];
+    if (!path) return;
+  }
+  toast(`Отправляю обновление: ${name}…`);
+  try {
+    await invoke("send_update", { peerIp: p.ip, filePath: path });
+    toast(`${name}: установщик доставлен — у него появится предложение обновиться`);
+  } catch (e) { toast("Не удалось отправить обновление: " + e, true); }
+}
 // окно: drag по топбару + кнопки через движок (надёжно)
 (function () {
   const tb = $("#topbar");
@@ -5505,3 +5550,4 @@ function sweepStale() {
 }
 setInterval(() => { refreshTransfers(); sweepStale(); }, 1500);
 setInterval(async () => { try { peers = await invoke("get_peers"); renderContacts(); renderConv(); renderPeerCard(); } catch {} }, 10000);
+setInterval(() => { updCheckCallPeers().catch(() => {}); }, 10000);

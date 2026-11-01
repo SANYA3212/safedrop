@@ -139,6 +139,7 @@ async fn add_peer(
         supports_file_confirm: false, supports_chat_ack: false, supports_watch: false,
         phash: String::new(), state: "idle".into(), detail: String::new(),
         ips: vec![ip.clone()],
+        version: String::new(),
     };
     g.insert(ip.clone(), p.clone());
     drop(g);
@@ -297,6 +298,7 @@ async fn refresh_live_inner(app: &tauri::AppHandle, state: &tauri::State<'_, App
                     ping_ms: Some(*ping), last_seen: Some(now.clone()),
                     phash: String::new(), state: "idle".into(), detail: String::new(),
                     ips: vec![ip.clone()],
+                    version: String::new(),
                 });
             }
         }
@@ -1767,7 +1769,7 @@ async fn test_notify(state: tauri::State<'_, AppState>) -> Result<String, String
 
 /// Displayed app version: version.txt next to exe (written by updater
 /// from the archive name) wins, otherwise the compiled version.
-fn app_version() -> String {
+pub(crate) fn app_version() -> String {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             if let Ok(s) = std::fs::read_to_string(dir.join("version.txt")) {
@@ -1781,6 +1783,35 @@ fn app_version() -> String {
         }
     }
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Свой установщик для раздачи друзьям: SafeDrop_<версия>_x64-setup.exe.
+/// Ищем рядом со сборкой (dist\..\update), среди полученных обновлений и в
+/// «Загрузках». Nothing — пусть пользователь выберет файл сам.
+#[tauri::command]
+async fn own_installer() -> Result<Option<String>, String> {
+    let prefix = format!("SafeDrop_{}_x64-setup", app_version());
+    let mut dirs_to_check: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dirs_to_check.push(dir.join("..").join("update"));
+            dirs_to_check.push(dir.to_path_buf());
+        }
+    }
+    dirs_to_check.push(std::env::temp_dir().join("safedrop-updates"));
+    if let Some(d) = dirs::download_dir() {
+        dirs_to_check.push(d);
+    }
+    for dir in dirs_to_check {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) && name.to_ascii_lowercase().ends_with(".exe") {
+                return Ok(Some(entry.path().to_string_lossy().to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Build identity: proves which exe is actually running (kills "old exe" ambiguity).
@@ -2140,7 +2171,7 @@ fn main() {
             pick_files, pick_image, pick_folder, pick_audio, read_image_dataurl,
             clear_peers, scan_debug, factory_reset, open_firewall, set_ctx_menu, refresh_ctx_menu, get_pending_send,
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
-            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info,
+            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, own_installer,
             ytbrowse::ytb_open, ytbrowse::ytb_go, ytbrowse::ytb_nav, ytbrowse::ytb_watch, ytbrowse::ytb_notify, ytbrowse::ytb_state,
             ytbrowse::ytb_set_share, ytbrowse::ytb_remote_nav, ytbrowse::ytb_pause_media, ytbrowse::ytb_media_apply,
         ])
