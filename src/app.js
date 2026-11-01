@@ -4450,6 +4450,8 @@ const wtState = {
   seeking: false, vol: 70, muted: false,
   pending: null, remotePos: 0, remotePaused: true,
   viewers: {},
+  // общая очередь: список видео и её версия (счётчик Лэмпорта, без часов)
+  queue: [], qv: 0, advancedAt: 0,
 };
 window.__wtId = window.__wtId || null;
 let wtUiSig = "";
@@ -4515,6 +4517,8 @@ function wtClearSession() {
   wtState.session = false; wtState.videoId = null; wtState.title = ""; wtState.by = "";
   wtState.vertical = false; wtState.pending = null;
   wtState.remotePos = 0; wtState.remotePaused = true; wtState.viewers = {};
+  wtState.queue = []; wtState.qv = 0;
+  wtRenderQueue();
   window.__wtId = null;
   wtQ("watch-together")?.classList.remove("wt-vert");
   wtQ("wt-stage")?.style.removeProperty("--wt-bg");
@@ -4542,6 +4546,8 @@ function wtSend(payload, directIp) {
     by: wtState.by || "",
     vertical: !!wtState.vertical,
     watching: wtIsWatching(),
+    queue: wtState.queue,
+    qv: wtState.qv,
   }, payload || {});
   for (const ip of targets) invoke("sig_send", { peerIp: ip, payload: msg }).catch(() => {});
 }
@@ -4598,7 +4604,7 @@ function wtShowError(text, retry = true) {
 }
 function wtHideError() { wtQ("wt-error")?.classList.add("hidden"); }
 function wtShowEmpty(on) { wtQ("wt-empty")?.classList.toggle("hidden", !on); }
-function wtHideMenu() { wtQ("wt-menu")?.classList.add("hidden"); }
+function wtHideMenu() { wtQ("wt-menu")?.classList.add("hidden"); wtQ("wt-queue")?.classList.add("hidden"); }
 
 function wtSyncEntryButtons() {
   const on = wtHasSession();
@@ -4738,6 +4744,7 @@ function wtOnPlayerState(e) {
   else if (st === 1 || st === 2 || st === 5) wtShowLoader(false);
   // видео пошло без движения мыши (команда участника, загрузка) — панель тоже прячется
   if (st === 1) wtPokeControls();
+  if (st === 0) wtQueueNext();
   wtUpdateControls();
   // Команды шлём только из наших кнопок: так реклама и служебные
   // переключения YouTube не рассылаются участникам как действия пользователя.
@@ -4895,7 +4902,16 @@ function wtApplyCommand(p) {
   const who = wtNick(p.ip || "", p.from);
   const pos = Number(p.pos || 0);
   try {
+    let sameVideo = false;
     if (p.action === "load") {
+      try {
+        const vid = wtState.player.getVideoData ? wtState.player.getVideoData()?.video_id : "";
+        sameVideo = vid === p.video && Math.abs((wtState.player.getCurrentTime() || 0) - pos) < 4;
+      } catch {}
+    }
+    if (p.action === "load" && sameVideo) {
+      wtStatus(who + ": включил видео");
+    } else if (p.action === "load") {
       wtState.applyingUntil = Date.now() + 1100;
       wtState.justLoadedUntil = Date.now() + 1900;
       wtState.player.loadVideoById(p.video, pos);
@@ -4997,10 +5013,105 @@ function wtFromBrowser(p) {
     toast("Смотреть вместе: сначала начните звонок", true);
     return reply("Сначала начните звонок — тогда видео откроется у всех", false);
   }
+  if (p.queue) {
+    wtQueueAdd(p.url, p.title).then((r) => reply(r === "queued" ? "Добавлено в очередь" : r === "played" ? "Очередь была пуста — открыто у всех" : "Это не страница видео", r !== "bad"));
+    return;
+  }
   if (!wtState.open) wtOpen();
   else if (wtState.mini) wtSetMini(false);
   if (wtLoadVideo(p.url, p.title)) reply("Открыто у всех в звонке", true);
   else reply("Это не страница видео", false);
+}
+
+// ---------- очередь видео ----------
+// Все видят одну очередь: она едет в каждом yt-sync вместе с версией qv.
+// Берём чужую очередь, если её версия новее (при равных — по IP, чтобы все
+// пришли к одному результату). Когда видео кончилось, каждый смотрящий сам
+// включает следующее; одинаковые «load» у других просто совпадают.
+const WT_QUEUE_MAX = 30;
+const wtIdOk = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{6,20}$/.test(id);
+function wtQueueClean(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const it of list.slice(0, WT_QUEUE_MAX)) {
+    if (!it || !wtIdOk(it.id)) continue;
+    out.push({
+      id: it.id,
+      title: typeof it.title === "string" ? it.title.slice(0, 200) : "Видео YouTube",
+      by: typeof it.by === "string" ? it.by.slice(0, 60) : "",
+      v: !!it.v,
+    });
+  }
+  return out;
+}
+function wtAdoptQueue(p) {
+  const q = wtQueueClean(p.queue);
+  const qv = Number(p.qv);
+  if (!q || !isFinite(qv)) return;
+  const newer = qv > wtState.qv || (qv === wtState.qv && qv > 0 && String(p.ip || "") > String(myIp || ""));
+  if (!newer) return;
+  wtState.queue = q; wtState.qv = qv;
+  wtRenderQueue();
+}
+function wtQueueSet(list, announce) {
+  wtState.queue = list.slice(0, WT_QUEUE_MAX);
+  wtState.qv += 1;
+  wtRenderQueue();
+  if (announce) wtSend({ action: "queue" });
+}
+async function wtFetchTitle(id) {
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 2500);
+    const r = await fetch("https://www.youtube.com/oembed?format=json&url=" + encodeURIComponent("https://www.youtube.com/watch?v=" + id), { signal: ctl.signal });
+    clearTimeout(t);
+    const j = await r.json();
+    return typeof j.title === "string" ? j.title : "";
+  } catch { return ""; }
+}
+async function wtQueueAdd(url, title) {
+  const pr = parseYT(url);
+  if (!pr.id) { toast("Не ссылка на YouTube", true); return "bad"; }
+  if (!wtHasSession()) {
+    if (!wtState.open) wtOpen();
+    return wtLoadVideo(url, title) ? "played" : "bad";
+  }
+  const name = title || (await wtFetchTitle(pr.id)) || "Видео YouTube";
+  wtQueueSet(wtState.queue.concat([{ id: pr.id, title: name, by: myNick(), v: !!pr.vertical }]), true);
+  wtStatus(myNick() + ": добавил в очередь «" + name + "»");
+  return "queued";
+}
+function wtQueuePlay(index) {
+  const it = wtState.queue[index];
+  if (!it) return;
+  wtQueueSet(wtState.queue.filter((_, i) => i !== index), false);
+  wtLoadVideo((it.v ? "https://youtube.com/shorts/" : "https://youtu.be/") + it.id, it.title);
+}
+function wtQueueRemove(index) {
+  if (!wtState.queue[index]) return;
+  wtQueueSet(wtState.queue.filter((_, i) => i !== index), true);
+}
+function wtQueueNext() {
+  if (!wtHasSession() || !wtIsWatching() || !wtState.queue.length) return;
+  try {
+    const vid = wtState.player?.getVideoData?.()?.video_id;
+    if (vid && vid !== wtState.videoId) return; // кончилась реклама, а не видео
+  } catch {}
+  if (Date.now() - wtState.advancedAt < 3000) return;
+  wtState.advancedAt = Date.now();
+  wtQueuePlay(0);
+}
+function wtRenderQueue() {
+  const n = wtState.queue.length;
+  const cnt = wtQ("wt-queue-count");
+  if (cnt) { cnt.textContent = String(n); cnt.classList.toggle("hidden", !n); }
+  const list = wtQ("wt-queue-list");
+  if (!list) return;
+  wtQ("wt-queue-empty")?.classList.toggle("hidden", n > 0);
+  list.innerHTML = wtState.queue.map((it, i) =>
+    `<div class="wt-qitem" data-i="${i}"><img src="https://i.ytimg.com/vi/${it.id}/default.jpg" alt="">` +
+    `<div class="wt-qtext"><b title="${esc(it.title)}">${esc(it.title)}</b><small>${it.by ? esc(it.by) : ""}</small></div>` +
+    `<button data-act="play" title="Включить сейчас">▶</button><button data-act="del" title="Убрать из очереди">✕</button></div>`).join("");
 }
 
 function wtSubmitChange() {
@@ -5370,6 +5481,8 @@ if (typeof listen === "function") {
         return;
       }
       if (!wtAccept(p)) return;
+      wtAdoptQueue(p);
+      if (p.action === "queue") { wtRefreshUI(); return; }
       if (p.action === "state") {
         // Состояние от участника, который сам не смотрит, не применяем:
         // он мог закрыть окно и поставить видео на паузу только у себя.
@@ -5400,7 +5513,7 @@ wtOn("wt-min2", "click", () => wtToggleMini());
 wtOn("wt-close", "click", () => wtCloseMe());
 wtOn("wt-close-me", "click", () => { wtHideMenu(); wtCloseMe(); });
 wtOn("wt-stop-all", "click", () => { wtHideMenu(); wtStopAll(); });
-wtOn("wt-more", "click", (e) => { e.stopPropagation(); wtQ("wt-menu")?.classList.toggle("hidden"); });
+wtOn("wt-more", "click", (e) => { e.stopPropagation(); wtQ("wt-queue")?.classList.add("hidden"); wtQ("wt-menu")?.classList.toggle("hidden"); });
 wtOn("wt-change", "click", () => wtOpenChange());
 wtOn("wt-empty-pick", "click", () => wtOpenChange());
 wtOn("wt-browse", "click", () => wtOpenBrowser());
@@ -5415,6 +5528,20 @@ wtOn("cs-web", "click", () => webJoin());
 wtOn("wt-empty-browse", "click", () => wtOpenBrowser());
 wtOn("wt-change-cancel", "click", () => wtCloseChange());
 wtOn("wt-load", "click", () => wtSubmitChange());
+wtOn("wt-queue-add", "click", async () => {
+  const input = wtQ("wt-url");
+  const r = await wtQueueAdd(input ? input.value.trim() : "");
+  if (r !== "bad") { if (input) input.value = ""; wtCloseChange(); }
+});
+wtOn("wt-queue-btn", "click", (e) => { e.stopPropagation(); wtHideMenu(); wtQ("wt-queue")?.classList.toggle("hidden"); });
+wtOn("wt-queue-add-link", "click", () => { wtQ("wt-queue")?.classList.add("hidden"); const i = wtQ("wt-url"); if (i) i.value = ""; wtOpenChange(); });
+wtOn("wt-queue-list", "click", (e) => {
+  const b = e.target.closest("button[data-act]"), row = e.target.closest(".wt-qitem");
+  if (!b || !row) return;
+  const i = Number(row.dataset.i);
+  if (b.dataset.act === "play") { wtQ("wt-queue")?.classList.add("hidden"); wtQueuePlay(i); }
+  else wtQueueRemove(i);
+});
 wtOn("wt-url", "keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); wtSubmitChange(); } });
 wtOn("wt-toggle", "click", () => wtTogglePlay());
 wtOn("wt-back10", "click", () => wtSeekBy(-10));

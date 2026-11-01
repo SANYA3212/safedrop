@@ -570,6 +570,20 @@ details.set-sec > .card:first-of-type { border-top: 0; }
 .wt-menu button { background: transparent; border: 0; color: var(--text); text-align: left; padding: 9px 10px; border-radius: 8px; cursor: pointer; }
 .wt-menu button:hover { background: var(--hover); }
 .wt-menu button.danger { color: #ff8b90; }
+/* очередь видео */
+.wt-hbtn { position: relative; }
+.wt-qcount { position: absolute; top: 1px; right: 1px; min-width: 15px; height: 15px; padding: 0 3px; border-radius: 8px; background: var(--accent); color: #fff; font-size: 10px; font-weight: 700; line-height: 15px; text-align: center; }
+.wt-queue { width: 340px; max-height: 60%; overflow-y: auto; right: 60px; }
+.wt-queue-head { display: flex; align-items: baseline; gap: 8px; padding: 4px 6px 6px; }
+.wt-queue-head small { color: var(--muted); font-size: 11px; }
+.wt-queue-empty { color: var(--muted); font-size: 12px; padding: 6px; }
+.wt-qitem { display: flex; align-items: center; gap: 8px; padding: 4px; border-radius: 8px; }
+.wt-qitem:hover { background: var(--hover); }
+.wt-qitem img { width: 64px; height: 36px; object-fit: cover; border-radius: 6px; background: #000; flex: none; }
+.wt-qitem .wt-qtext { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.wt-qitem .wt-qtext b { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wt-qitem .wt-qtext small { font-size: 11px; color: var(--muted); }
+.wt-menu .wt-qitem button { padding: 5px 7px; flex: none; }
 .wt-stage {
   position: relative;
   flex: 1;

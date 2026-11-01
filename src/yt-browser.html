@@ -45,6 +45,7 @@
     <svg viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11A2.99 2.99 0 1 0 15 5c0 .24.04.47.09.7L8.04 9.81a3 3 0 1 0 0 4.38l7.12 4.16c-.05.21-.08.43-.08.65A2.92 2.92 0 1 0 18 16.08z"/></svg>
     <span id="share-text">Листать вместе</span>
   </button>
+  <button class="share hidden" id="b-queue" title="Добавить это видео в очередь «Смотреть вместе»">+ В очередь</button>
   <button class="watch hidden" id="b-watch" title="Открыть это видео в синхронном плеере звонка">
     <svg viewBox="0 0 24 24"><path d="M16 11a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm-8 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5C15 14.17 10.33 13 8 13zm8 0c-.29 0-.62.02-.97.05A4.22 4.22 0 0 1 17 16.5V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
     Смотреть вместе
@@ -85,6 +86,7 @@
     // синхронный плеер звонка умеет только YouTube: кнопка — на странице видео
     const v = isVideo(url);
     watchBtn.classList.toggle("hidden", !v);
+    $("b-queue").classList.toggle("hidden", !v);
     watchBtn.disabled = false;
     if (s && "share" in s) applyShare(s.share);
   }
@@ -105,6 +107,7 @@
       addr.blur();
     }
   });
+  $("b-queue").onclick = () => invoke("ytb_watch", { queue: true }).catch((e) => notice(String(e)));
   watchBtn.onclick = () => {
     watchBtn.disabled = true;
     invoke("ytb_watch").catch((e) => { notice(String(e)); watchBtn.disabled = false; });

@@ -91,7 +91,7 @@ pub(crate) enum Frame {
     #[serde(rename = "chat-typing")]
     ChatTyping { from: String, nickname: String, #[serde(default)] to_group: Option<String> },
     #[serde(rename = "yt-sync")]
-    YtSync { from: String, #[serde(default)] ip: String, #[serde(default)] nickname: String, #[serde(default)] action: String, #[serde(default)] video: String, #[serde(default)] pos: f64, #[serde(default)] paused: bool, #[serde(default)] at: i64, #[serde(default)] seq: i64, #[serde(default)] title: String, #[serde(default)] by: String, #[serde(default)] watching: bool, #[serde(default)] vertical: bool, #[serde(default)] to_group: Option<String> },
+    YtSync { from: String, #[serde(default)] ip: String, #[serde(default)] nickname: String, #[serde(default)] action: String, #[serde(default)] video: String, #[serde(default)] pos: f64, #[serde(default)] paused: bool, #[serde(default)] at: i64, #[serde(default)] seq: i64, #[serde(default)] title: String, #[serde(default)] by: String, #[serde(default)] watching: bool, #[serde(default)] vertical: bool, #[serde(default)] queue: serde_json::Value, #[serde(default)] qv: i64, #[serde(default)] to_group: Option<String> },
     /// «Листать вместе»: участник открыл страницу в окне браузера.
     #[serde(rename = "web-sync")]
     WebSync { from: String, #[serde(default)] action: String, #[serde(default)] url: String, #[serde(default)] title: String, #[serde(default)] at: i64, #[serde(default)] media: String, #[serde(default)] t: f64, #[serde(default)] to_group: Option<String> },
@@ -841,7 +841,7 @@ pub(crate) async fn process_frame(
             }));
         }
 
-        Frame::YtSync { from, nickname, action, video, pos, paused, at, seq, title, by, watching, vertical, .. } => {
+        Frame::YtSync { from, nickname, action, video, pos, paused, at, seq, title, by, watching, vertical, queue, qv, .. } => {
             let nm = if nickname.is_empty() { from.clone() } else { nickname.clone() };
             let payload = serde_json::json!({
                 "kind":"yt-sync",
@@ -857,6 +857,8 @@ pub(crate) async fn process_frame(
                 "by": by,
                 "watching": watching,
                 "vertical": vertical,
+                "queue": queue,
+                "qv": qv,
             });
             let _ = app.emit("safedrop-watch", serde_json::json!({"ip": ip, "payload": payload}));
         }

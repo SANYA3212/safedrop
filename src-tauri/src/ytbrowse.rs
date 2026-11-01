@@ -293,16 +293,23 @@ pub async fn ytb_nav(app: AppHandle, action: String) -> Result<(), String> {
 /// «Смотреть вместе» для YouTube: ставим видео в окне на паузу и отдаём
 /// адрес главному окну, где запускается синхронный плеер.
 #[tauri::command]
-pub async fn ytb_watch(app: AppHandle) -> Result<(), String> {
+pub async fn ytb_watch(app: AppHandle, queue: Option<bool>) -> Result<(), String> {
     let view = app.get_webview(VIEW).ok_or("окно браузера закрыто")?;
     let url = view.url().map_err(|e| e.to_string())?.to_string();
-    pause_media(&app);
+    let queue = queue.unwrap_or(false);
+    // в очередь — видео в браузере не трогаем, пользователь листает дальше
+    if !queue {
+        pause_media(&app);
+    }
     app.emit_to(
         EventTarget::webview_window("main"),
         "ytb-watch",
-        serde_json::json!({ "url": url, "title": current_title() }),
+        serde_json::json!({ "url": url, "title": current_title(), "queue": queue }),
     )
     .map_err(|e| e.to_string())?;
+    if queue {
+        return Ok(());
+    }
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.unminimize();
         let _ = main.show();
