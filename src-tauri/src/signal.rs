@@ -92,6 +92,9 @@ pub(crate) enum Frame {
     ChatTyping { from: String, nickname: String, #[serde(default)] to_group: Option<String> },
     #[serde(rename = "yt-sync")]
     YtSync { from: String, #[serde(default)] ip: String, #[serde(default)] nickname: String, #[serde(default)] action: String, #[serde(default)] video: String, #[serde(default)] pos: f64, #[serde(default)] paused: bool, #[serde(default)] at: i64, #[serde(default)] seq: i64, #[serde(default)] title: String, #[serde(default)] by: String, #[serde(default)] watching: bool, #[serde(default)] vertical: bool, #[serde(default)] to_group: Option<String> },
+    /// «Листать вместе»: участник открыл страницу в окне браузера.
+    #[serde(rename = "web-sync")]
+    WebSync { from: String, #[serde(default)] action: String, #[serde(default)] url: String, #[serde(default)] title: String, #[serde(default)] at: i64, #[serde(default)] to_group: Option<String> },
     #[serde(other)]
     Unknown,
 }
@@ -857,6 +860,15 @@ pub(crate) async fn process_frame(
                 "vertical": vertical,
             });
             let _ = app.emit("safedrop-watch", serde_json::json!({"ip": ip, "payload": payload}));
+        }
+
+        Frame::WebSync { from, action, url, title, at, .. } => {
+            // «Листать вместе»: только главному окну, решение о переходе — там
+            let payload = serde_json::json!({
+                "kind": "web-sync", "from": from, "ip": ip,
+                "action": action, "url": url, "title": title, "at": at,
+            });
+            let _ = app.emit_to("main", "safedrop-web", payload);
         }
         Frame::Unknown => { }
     }

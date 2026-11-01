@@ -648,6 +648,15 @@ details.set-sec > .card:first-of-type { border-top: 0; }
 .wt-call-tile .wt-thumb { max-width: 180px; }
 .cs-btn.on { color: #d9c7ff; background: #2a2140; }
 #vb-watch.on { background: linear-gradient(var(--button-gradient-angle), var(--button-gradient-from), var(--button-gradient-to)); border-color: transparent; color: #fff; }
+/* фоновый режим: плеер вне экрана (не display:none — iframe должен играть дальше) */
+#watch-together.wt-bg { position: fixed !important; left: -10000px !important; top: 0 !important; right: auto !important; bottom: auto !important; width: 480px !important; height: 270px !important; opacity: 0; pointer-events: none; }
+#vb-wt-play.on, #cs-wt-play.on { color: #b9f5cf; }
+.cs-btn.hidden { display: none; }
+.cs-btn.cs-web { color: #fff; background: linear-gradient(135deg, #2f9e5b, #3fbf6f); }
+.cs-btn.cs-web span { font-size: 12px; font-weight: 600; white-space: nowrap; }
+#vb-web {width: auto; padding: 0 10px; gap: 6px; display: inline-flex; align-items: center; color: #fff; background: linear-gradient(135deg, #2f9e5b, #3fbf6f); border-color: transparent; }
+#vb-web.hidden { display: none; }
+#vb-web span { font-size: 12px; font-weight: 600; white-space: nowrap; }
 /* ручка размера мини-окна демонстрации */
 #mini-watch { position: fixed; overflow: visible; }
 .mw-resize { position: absolute; right: 0; bottom: 0; width: 16px; height: 16px; cursor: nwse-resize; background: linear-gradient(135deg, transparent 50%, rgba(255,255,255,.4) 50%); border-bottom-right-radius: 14px; }

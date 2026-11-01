@@ -4347,7 +4347,7 @@ const WT_VOL_KEY = "sd.wt.vol";
 const wtState = {
   player: null, apiStarted: false, apiPoll: null, playerReady: false,
   videoId: null, title: "", by: "", vertical: false,
-  session: false, open: false, mini: false, joining: false,
+  session: false, open: false, mini: false, bg: false, joining: false,
   applyingUntil: 0, justLoadedUntil: 0, joinedUntil: 0, contentDuration: 0,
   // seq от времени запуска: после перезапуска приложения номера не начинаются
   // заново с нуля и не отбрасываются как старые у остальных участников.
@@ -4384,7 +4384,7 @@ function parseYT(url) {
 }
 
 function wtHasSession() { return !!wtState.session && !!wtState.videoId; }
-function wtIsWatching() { return !!(wtState.open || wtState.mini); }
+function wtIsWatching() { return !!(wtState.open || wtState.mini || wtState.bg); }
 function wtSessionInfo() {
   if (!wtHasSession()) return null;
   return { id: wtState.videoId, title: wtState.title || "Видео", by: wtState.by || "", vertical: !!wtState.vertical };
@@ -4510,6 +4510,7 @@ function wtHideMenu() { wtQ("wt-menu")?.classList.add("hidden"); }
 function wtSyncEntryButtons() {
   const on = wtHasSession();
   for (const id of ["vb-watch", "cs-yt"]) wtQ(id)?.classList.toggle("on", on);
+  for (const id of ["vb-wt-play", "cs-wt-play"]) wtQ(id)?.classList.toggle("hidden", !(on && wtState.bg));
 }
 let wtViewersSig = "";
 function wtRefreshViewers() {
@@ -4683,6 +4684,15 @@ function wtUpdateControls() {
   }
   const time = wtQ("wt-time");
   if (time) time.textContent = wtFmt(cur) + " / " + wtFmt(dur);
+  for (const id of ["vb-wt-play", "cs-wt-play"]) {
+    const b = wtQ(id);
+    if (!b || b.classList.contains("hidden")) continue;
+    b.innerHTML = st === 1
+      ? '<svg class="ic" viewBox="0 0 24 24"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>'
+      : '<svg class="ic" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
+    b.classList.toggle("on", st === 1);
+    b.title = (wtState.title || "Видео") + (st === 1 ? " — пауза" : " — продолжить");
+  }
   const toggle = wtQ("wt-toggle");
   if (toggle) toggle.innerHTML = st === 1
     ? '<svg class="ic" viewBox="0 0 24 24"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>'
@@ -4897,9 +4907,9 @@ function wtOpen() {
   if (typeof inVoice === "function" && !inVoice()) return toast("Смотреть вместе доступно во время звонка", true);
   const root = wtQ("watch-together");
   if (!root) return;
-  root.classList.remove("hidden", "wt-min", "wt-fullscreen");
+  root.classList.remove("hidden", "wt-min", "wt-fullscreen", "wt-bg");
   root.classList.toggle("wt-vert", !!wtState.vertical);
-  wtState.open = true; wtState.mini = false; wtState.joining = true;
+  wtState.open = true; wtState.mini = false; wtState.bg = false; wtState.joining = true;
   wtState.joinedUntil = Date.now() + 6000;
   wtSyncMiniButton();
   wtHideMenu(); wtCloseChange();
@@ -4943,11 +4953,11 @@ function wtOpen() {
 function wtCloseMe(silent) {
   const root = wtQ("watch-together");
   root?.classList.add("hidden");
-  root?.classList.remove("wt-min", "wt-fullscreen");
+  root?.classList.remove("wt-min", "wt-fullscreen", "wt-bg");
   root?.style.removeProperty("left"); root?.style.removeProperty("top");
   root?.style.removeProperty("right"); root?.style.removeProperty("bottom");
   root?.style.removeProperty("width");
-  wtState.open = false; wtState.mini = false;
+  wtState.open = false; wtState.mini = false; wtState.bg = false;
   try { wtState.player?.pauseVideo(); } catch {}
   wtHideMenu(); wtCloseChange(); wtHideError(); wtShowEmpty(false);
   wtShowLoader(true, "Загрузка плеера…");
@@ -4969,6 +4979,8 @@ function wtSyncMiniButton() {
 function wtSetMini(on) {
   const root = wtQ("watch-together");
   if (!root) return;
+  root.classList.remove("wt-bg");
+  wtState.bg = false;
   if (on) {
     root.classList.remove("hidden", "wt-fullscreen");
     root.classList.add("wt-min");
@@ -4987,6 +4999,23 @@ function wtSetMini(on) {
 }
 
 function wtToggleMini() { wtSetMini(!wtState.mini); }
+
+// Фон: плеер уходит за экран (iframe продолжает играть), окна нет вообще.
+// Управление — кнопкой в панели звонка, вернуть плеер — «Смотреть вместе».
+function wtSetBg(on) {
+  const root = wtQ("watch-together");
+  if (!root) return;
+  if (on && !wtHasSession()) { toast("Сначала включите видео", true); return; }
+  root.classList.toggle("wt-bg", !!on);
+  wtState.bg = !!on;
+  if (on) {
+    root.classList.remove("hidden", "wt-fullscreen");
+    wtHideMenu(); wtCloseChange();
+    toast("Видео играет в фоне. Вернуть плеер — кнопка «Смотреть вместе»");
+  }
+  wtSyncEntryButtons();
+  wtUpdateControls();
+}
 
 function wtToggleFull() {
   const root = wtQ("watch-together");
@@ -5026,6 +5055,76 @@ function wtEndCall() {
   wtCloseMe(true);
   wtClearSession();
   wtState.seen = {}; wtState.lastAt = {};
+  webReset();
+}
+
+// ---------- «Листать вместе»: общий браузер ----------
+// Включено в окне браузера кнопкой «Листать вместе»: каждый свой переход
+// уходит участникам звонка (web-sync), чужие переходы открываются у нас.
+// Переход, открытый по команде участника, Rust помечает remote — его не шлём.
+const webState = { share: false, lastSent: "", pending: null };
+const webIsUrl = (u) => /^https?:\/\//i.test(String(u || ""));
+
+function webSend(payload) {
+  const targets = wtTargets();
+  if (!targets.length) return;
+  const msg = Object.assign({ kind: "web-sync", from: myNick(), at: Date.now() }, payload);
+  for (const ip of targets) invoke("sig_send", { peerIp: ip, payload: msg }).catch(() => {});
+}
+function webOnShare(on) {
+  if (on && typeof inVoice === "function" && !inVoice()) {
+    invoke("ytb_notify", { text: "«Листать вместе» работает во время звонка", ok: false }).catch(() => {});
+    invoke("ytb_set_share", { on: false }).catch(() => {});
+    return;
+  }
+  webState.share = on;
+  webState.lastSent = "";
+  if (on) webHideJoin();
+}
+function webOnLocalUrl(p) {
+  if (!webState.share || p.remote || !webIsUrl(p.url)) return;
+  if (typeof inVoice === "function" && !inVoice()) return;
+  if (p.url === webState.lastSent) return;
+  webState.lastSent = p.url;
+  webSend({ action: "nav", url: p.url, title: p.title || "" });
+}
+function webOnRemote(p) {
+  if (!p || p.action !== "nav" || !webIsUrl(p.url)) return;
+  if (p.ip && myIp && p.ip === myIp) return;
+  const who = wtNick(p.ip || "", p.from);
+  webState.pending = { url: p.url, title: p.title || "", who };
+  invoke("ytb_remote_nav", { url: p.url, by: who }).then((applied) => {
+    if (applied) { webState.lastSent = p.url; webHideJoin(); }
+    else webShowJoin();
+  }).catch(() => webShowJoin());
+}
+function webShowJoin() {
+  const p = webState.pending;
+  if (!p) return;
+  for (const id of ["vb-web", "cs-web"]) {
+    const b = wtQ(id);
+    if (!b) continue;
+    const t = wtQ(id + "-text");
+    if (t) t.textContent = p.who + " в браузере";
+    b.title = "Присоединиться: " + (p.title || p.url);
+    b.classList.remove("hidden");
+  }
+}
+function webHideJoin() { for (const id of ["vb-web", "cs-web"]) wtQ(id)?.classList.add("hidden"); }
+function webJoin() {
+  const p = webState.pending;
+  if (!p) return webHideJoin();
+  webHideJoin();
+  webState.lastSent = p.url;
+  invoke("ytb_open", { url: p.url, remote: true })
+    .then(() => invoke("ytb_set_share", { on: true }))
+    .catch((e) => toast("Браузер: " + e, true));
+}
+function webReset() {
+  webHideJoin();
+  webState.pending = null;
+  if (webState.share && !isDemo) invoke("ytb_set_share", { on: false }).catch(() => {});
+  webState.share = false; webState.lastSent = "";
 }
 
 // ---------- мини-окно: перетаскивание и размер ----------
@@ -5154,6 +5253,10 @@ if (typeof listen === "function") {
   listen("ytb-watch", (e) => {
     try { wtFromBrowser(e.payload || {}); } catch (err) { console.error("ytb-watch", err); }
   }).catch((err) => console.error("ytb listen", err));
+  listen("ytb-url", (e) => { try { webOnLocalUrl(e.payload || {}); } catch (err) { console.error("ytb-url", err); } }).catch(() => {});
+  listen("ytb-share", (e) => { try { webOnShare(!!(e.payload && e.payload.on)); } catch (err) { console.error("ytb-share", err); } }).catch(() => {});
+  listen("ytb-closed", () => { webState.share = false; webState.lastSent = ""; }).catch(() => {});
+  listen("safedrop-web", (e) => { try { webOnRemote(e.payload || {}); } catch (err) { console.error("safedrop-web", err); } }).catch(() => {});
 }
 
 // ---------- обработчики UI ----------
@@ -5168,6 +5271,14 @@ wtOn("wt-more", "click", (e) => { e.stopPropagation(); wtQ("wt-menu")?.classList
 wtOn("wt-change", "click", () => wtOpenChange());
 wtOn("wt-empty-pick", "click", () => wtOpenChange());
 wtOn("wt-browse", "click", () => wtOpenBrowser());
+wtOn("vb-browser", "click", () => wtOpenBrowser());
+wtOn("wt-bg", "click", () => wtSetBg(true));
+wtOn("wt-bg-menu", "click", () => { wtHideMenu(); wtSetBg(true); });
+wtOn("cs-browser", "click", () => wtOpenBrowser());
+wtOn("vb-wt-play", "click", () => wtTogglePlay());
+wtOn("cs-wt-play", "click", () => wtTogglePlay());
+wtOn("vb-web", "click", () => webJoin());
+wtOn("cs-web", "click", () => webJoin());
 wtOn("wt-empty-browse", "click", () => wtOpenBrowser());
 wtOn("wt-change-cancel", "click", () => wtCloseChange());
 wtOn("wt-load", "click", () => wtSubmitChange());
@@ -5191,7 +5302,7 @@ wtQ("watch-together")?.addEventListener("pointerdown", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   const root = wtQ("watch-together");
-  if (!root || root.classList.contains("hidden")) return;
+  if (!root || root.classList.contains("hidden") || wtState.bg) return;
   if (!wtState.mini) {
     e.preventDefault(); e.stopPropagation();
     if (root.classList.contains("wt-fullscreen")) wtToggleFull();
