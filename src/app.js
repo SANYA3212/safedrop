@@ -3554,6 +3554,44 @@ $("#btn-theme-export").onclick = () => {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob); a.download = "safedrop-theme.json"; a.click();
 };
+// Импорт темы из файла (*.safedrop-theme.json или экспортированного safedrop-theme.json).
+// Берём только известные поля оформления с проверкой типов; картинку фона,
+// если в файле её нет, оставляем свою.
+const THEME_KEYS = {
+  bg_mode: "s", bg_color: "s", bg_gradient: "s", bg_image: "s", blur: "n", opacity: "n", accent: "s",
+  button_gradient_from: "s", button_gradient_to: "s", button_gradient_angle: "n", radius: "n", font: "s",
+  custom_css: "s", text_color: "s", muted_color: "s", btn_color: "s", btn_text: "s", link_color: "s",
+};
+function themeFromFile(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("это не файл темы");
+  const out = {};
+  for (const [k, t] of Object.entries(THEME_KEYS)) {
+    const v = obj[k];
+    if (t === "s" && typeof v === "string" && v.length <= 20000) out[k] = v;
+    if (t === "n" && typeof v === "number" && isFinite(v)) out[k] = v;
+  }
+  if (!Object.keys(out).length) throw new Error("в файле нет настроек оформления");
+  if (out.bg_mode && !["gradient", "color", "image"].includes(out.bg_mode)) delete out.bg_mode;
+  return out;
+}
+$("#btn-theme-import").onclick = () => $("#theme-import-file").click();
+$("#theme-import-file").onchange = async (e) => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  try {
+    if (file.size > 1_000_000) throw new Error("файл слишком большой для темы");
+    const imported = themeFromFile(JSON.parse(await file.text()));
+    const keepImage = !imported.bg_image && settings.theme && settings.theme.bg_image;
+    settings.theme = Object.assign({}, settings.theme, imported);
+    if (keepImage) settings.theme.bg_image = keepImage;
+    if (settings.theme.bg_mode === "image" && !settings.theme.bg_image) {
+      toast("Тема импортирована. В ней фон-картинка — выбери свою кнопкой «Картинка…»");
+    } else toast("Тема импортирована");
+    await invoke("save_settings", { settings });
+    loadAll();
+  } catch (err) { toast("Не удалось импортировать тему: " + (err && err.message ? err.message : err), true); }
+};
 $("#btn-theme-reset").onclick = async () => {
   settings.theme = { bg_mode: "gradient", bg_color: "#141824", bg_gradient: "linear-gradient(135deg,#1a2138,#0d1020)", bg_image: "", blur: 14, opacity: 0.85, accent: "#5b8cff", button_gradient_from: "#5b8cff", button_gradient_to: "#9b59ff", button_gradient_angle: 135, radius: 18, font: "Segoe UI", custom_css: "", text_color: "#eef1f8", muted_color: "#9aa3b8", btn_color: "rgba(255,255,255,.1)", btn_text: "#eef1f8", link_color: "#7aa2ff" };
   try { await invoke("save_settings", { settings }); loadAll(); } catch (e) { toast("" + e, true); }
