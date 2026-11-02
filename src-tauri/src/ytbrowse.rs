@@ -257,11 +257,13 @@ fn build_window(app: &AppHandle, start: Url) -> Result<(), String> {
         })
         .on_navigation(|u| {
             // обычные сайты — здесь; служебные адреса приложения — нельзя;
-            // mailto:, tel: и прочие схемы — системе
+            // системе отдаём только mailto: и tel:. Остальные схемы (file:,
+            // search-ms:, ms-*:) сайт мог бы использовать, чтобы запустить
+            // программу на компьютере без вопроса.
             if nav_allowed(u) || matches!(u.scheme(), "about" | "blob") {
                 return true;
             }
-            if !web_url(u) && u.scheme() != "tauri" {
+            if matches!(u.scheme(), "mailto" | "tel") {
                 let _ = open::that(u.as_str());
             }
             false
@@ -318,6 +320,7 @@ fn build_window(app: &AppHandle, start: Url) -> Result<(), String> {
 /// стартовую — звук и видео замолкают), выключить «вместе» и чат.
 fn shut(app: &AppHandle) {
     OPEN.store(false, Ordering::Relaxed);
+    LAST_INPUT.store(0, Ordering::Relaxed);
     SHARE.store(false, Ordering::Relaxed);
     CHAT_OPEN.store(false, Ordering::Relaxed);
     OPT_OUT.store(false, Ordering::Relaxed);
@@ -380,7 +383,13 @@ pub async fn ytb_open(app: AppHandle, url: Option<String>, remote: Option<bool>)
         let _ = win.set_focus();
         return Ok(());
     }
-    build_window(&app, target.unwrap_or_else(start_url))
+    static BUILDING: AtomicBool = AtomicBool::new(false);
+    if BUILDING.swap(true, Ordering::SeqCst) {
+        return Ok(()); // окно уже создаётся
+    }
+    let r = build_window(&app, target.unwrap_or_else(start_url));
+    BUILDING.store(false, Ordering::SeqCst);
+    r
 }
 
 /// Переход по строке из панели: адрес или поисковый запрос.
@@ -624,13 +633,14 @@ const MEDIA_TIME_EVERY: Duration = Duration::from_secs(5);
 
 /// Чтение состояния главного видео. Возвращает объект — WebView2 сам
 /// сериализует его в JSON для колбэка.
-const MEDIA_READ_JS: &str = "(function(){var b=null,ba=0;document.querySelectorAll('video').forEach(function(v){var r=v.getBoundingClientRect(),a=r.width*r.height;if(a>ba){ba=a;b=v}});if(!b||ba<40000)return {has:false};return {has:true,paused:b.paused,t:b.currentTime,dur:isFinite(b.duration)?b.duration:0}})()";
+const MEDIA_READ_JS: &str = "(function(){var b=null,ba=0;document.querySelectorAll('video').forEach(function(v){var r=v.getBoundingClientRect(),a=r.width*r.height;if(a>ba){ba=a;b=v}});if(!b||ba<40000)return {has:false};return {has:true,paused:b.paused,t:b.currentTime,dur:isFinite(b.duration)?b.duration:0,ad:!!document.querySelector('.ad-showing')}})()";
 
 #[derive(Clone)]
 struct MediaSnap {
     url: String,
     paused: bool,
     t: f64,
+    dur: f64,
     at: Instant,
 }
 
@@ -654,7 +664,7 @@ fn clean_time(t: f64) -> Option<f64> {
 
 /// Разбор ответа страницы. Страница может подсунуть что угодно, поэтому
 /// берём только нужные поля и проверяем числа.
-fn parse_media(raw: &str) -> Option<(bool, f64)> {
+fn parse_media(raw: &str) -> Option<(bool, f64, f64)> {
     let mut v: serde_json::Value = serde_json::from_str(raw).ok()?;
     if let serde_json::Value::String(s) = &v {
         v = serde_json::from_str(s).ok()?;
@@ -662,21 +672,26 @@ fn parse_media(raw: &str) -> Option<(bool, f64)> {
     if !v.get("has")?.as_bool()? {
         return None;
     }
+    if v.get("ad").and_then(|x| x.as_bool()).unwrap_or(false) {
+        return None; // реклама: ни паузы, ни перемотки не рассылаем
+    }
     let paused = v.get("paused")?.as_bool()?;
     let t = clean_time(v.get("t")?.as_f64()?)?;
-    Some((paused, t))
+    let dur = v.get("dur").and_then(|x| x.as_f64()).filter(|x| x.is_finite() && *x >= 0.0).unwrap_or(0.0);
+    Some((paused, t, dur))
 }
 
 fn on_media_read(app: &AppHandle, url: String, raw: String) {
     let now = Instant::now();
     let Ok(mut m) = MEDIA.lock() else { return };
-    let Some((paused, t)) = parse_media(&raw) else {
+    let Some((paused, t, dur)) = parse_media(&raw) else {
         m.prev = None;
         return;
     };
-    let snap = MediaSnap { url: url.clone(), paused, t, at: now };
+    let snap = MediaSnap { url: url.clone(), paused, t, dur, at: now };
     let prev = match m.prev.replace(snap) {
-        Some(p) if url_no_fragment(&p.url) == url_no_fragment(&url) => p,
+        // другая длительность — сменился ролик в том же <video> (реклама, плейлист)
+        Some(p) if url_no_fragment(&p.url) == url_no_fragment(&url) && (p.dur - dur).abs() < 1.0 => p,
         _ => return, // новая страница или первое чтение — только запоминаем
     };
     if m.quiet_until.map(|q| now < q).unwrap_or(false) {
@@ -824,7 +839,7 @@ function arrow(c){
   svg.appendChild(p); el.appendChild(svg); return el;
 }
 function def(n, f){ try { Object.defineProperty(window, n, {value: f}); } catch (e) {} }
-def('__sdA', function(){ var e = se(); return {i:st.i, x:st.x, y:st.y, t:st.t, u:st.u, sy:scrollY, sh:e ? e.scrollHeight : 0, vw:innerWidth, vh:innerHeight}; });
+def('__sdA', function(){ var e = se(); return {i:st.i, x:st.x, y:st.y, t:st.t, u:st.u, ap:st.ap, sy:scrollY, sh:e ? e.scrollHeight : 0, vw:innerWidth, vh:innerHeight}; });
 def('__sdCur', function(id, c, fx, fy){
   if (!ensure()) return;
   var el = curs[id];
@@ -849,6 +864,7 @@ struct AgentRead {
     y: f64,
     t: f64,
     user_scroll: f64,
+    applied: f64,
     sy: f64,
     sh: f64,
     vw: f64,
@@ -867,6 +883,7 @@ fn parse_agent(raw: &str) -> Option<AgentRead> {
         y: n("y")?,
         t: n("t")?,
         user_scroll: n("u")?,
+        applied: n("ap").unwrap_or(0.0),
         sy: n("sy")?.max(0.0),
         sh: n("sh")?.max(0.0),
         vw: n("vw")?,
@@ -886,7 +903,7 @@ struct AgentState {
 fn agent_step(app: &AppHandle, s: &mut AgentState, url: &str, a: Option<AgentRead>) {
     if let Some(a) = &a {
         if a.input > 0.0 {
-            LAST_INPUT.fetch_max(a.input as u64, Ordering::Relaxed);
+            LAST_INPUT.fetch_max((a.input as u64).min(now_ms()), Ordering::Relaxed);
         }
     }
     // адрес — уже после отметки клика: переход по ссылке не сочтём чужим
@@ -910,6 +927,11 @@ fn agent_step(app: &AppHandle, s: &mut AgentState, url: &str, a: Option<AgentRea
             s.cursor_at = Some(now);
             let _ = app.emit_to(main.clone(), "ytb-cursor", serde_json::json!({ "x": x, "y": y, "url": url }));
         }
+    }
+    if a.applied > 0.0 && (now_ms() as f64 - a.applied) < 600.0 {
+        // прокрутку только что применили от участника — не отсылаем её обратно
+        s.sy = a.sy;
+        return;
     }
     let user_recent = a.user_scroll > 0.0 && (now_ms() as f64 - a.user_scroll) < 1500.0;
     if user_recent && (a.sy - s.sy).abs() >= 4.0 && s.scroll_at.map(|t| now.duration_since(t) >= SCROLL_EVERY).unwrap_or(true) {

@@ -45,7 +45,12 @@
   @keyframes load { from { left: -30%; } to { left: 100%; } }
   @media (max-width: 1400px) { .people b { display: none; } .people span { padding: 0 7px; } }
   @media (max-width: 1050px) { .title { display: none; } }
-  @media (max-width: 680px) { .chat { display: none; } }
+  /* узкое окно: у кнопок остаются только значки, иначе «Смотреть вместе» уезжала за край */
+  @media (max-width: 1000px) {
+    .addr { min-width: 140px; }
+    .share, .watch { font-size: 0; gap: 0; padding: 0 9px; }
+    #b-queue { font-size: 12px; padding: 0 8px; }
+  }
 </style>
 </head>
 <body>
@@ -180,21 +185,23 @@
   });
 
   if (T && T.event) {
-    T.event.listen("ytb-url", (e) => applyState(e.payload));
-    T.event.listen("ytb-share", (e) => applyShare(e.payload && e.payload.on));
-    T.event.listen("ytb-people", (e) => renderPeople(e.payload));
-    T.event.listen("ytb-loading", (e) => setLoading(e.payload && e.payload.on));
-    T.event.listen("ytb-chat", (e) => {
+    // только события для панели: без target сюда приходило и то, что шлют чату
+    const on = (n, h) => T.event.listen(n, h, { target: { kind: "AnyLabel", label: "ytb-bar" } });
+    on("ytb-url", (e) => applyState(e.payload));
+    on("ytb-share", (e) => applyShare(e.payload && e.payload.on));
+    on("ytb-people", (e) => renderPeople(e.payload));
+    on("ytb-loading", (e) => setLoading(e.payload && e.payload.on));
+    on("ytb-chat", (e) => {
       const p = e.payload || {};
       showMsg(String(p.from || ""), String(p.text || ""));
       if (!chatOpen) { unread++; setBadge(); }
     });
-    T.event.listen("ytb-chat-state", (e) => {
+    on("ytb-chat-state", (e) => {
       chatOpen = !!(e.payload && e.payload.open);
       $("b-chat").classList.toggle("on", chatOpen);
       if (chatOpen) { unread = 0; setBadge(); }
     });
-    T.event.listen("ytb-notice", (e) => {
+    on("ytb-notice", (e) => {
       const p = e.payload || {};
       notice(p.text || "", p.ok);
       watchBtn.disabled = false;

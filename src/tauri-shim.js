@@ -67,6 +67,15 @@ export async function listen(event, handler) {
   return () => {};
 }
 
+// Только события, адресованные этому окну. Обычный listen получает и то, что
+// Rust шлёт другим окнам через emit_to (например, панели браузера) — дубли.
+export async function listenHere(event, handler) {
+  const ev = window.__TAURI__?.event;
+  if (!ev?.listen) return () => {};
+  const label = window.__TAURI_INTERNALS__?.metadata?.currentWebview?.label || "main";
+  return ev.listen(event, handler, { target: { kind: "AnyLabel", label } });
+}
+
 // демо-настройки только для просмотра вёрстки
 const demo = {
   settings: JSON.parse(localStorage.getItem("sd-settings") || "null") || {

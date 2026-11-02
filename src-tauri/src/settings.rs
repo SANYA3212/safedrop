@@ -10,7 +10,12 @@ pub fn app_dir() -> std::path::PathBuf {
 pub fn load_settings(state: &AppState) {
     let path = state.settings_path();
     if let Ok(data) = fs::read_to_string(&path) {
-        if let Ok(s) = serde_json::from_str::<Settings>(&data) {
+        if let Ok(mut s) = serde_json::from_str::<Settings>(&data) {
+            // an old or hand-edited file without a folder would save files
+            // into the working directory
+            if s.loaddrop_dir.trim().is_empty() {
+                s.loaddrop_dir = Settings::default().loaddrop_dir;
+            }
             if let Ok(mut g) = state.settings.try_lock() {
                 *g = s;
             }
@@ -23,8 +28,21 @@ pub fn load_settings(state: &AppState) {
     let _ = fs::create_dir_all(state.app_dir.clone());
 }
 
+/// The persist helpers are sync and called from many places; a plain
+/// `try_lock` silently dropped the write whenever a background task held the
+/// lock for a moment. Retry for up to half a second instead.
+pub fn try_lock_briefly<T>(m: &tokio::sync::Mutex<T>) -> Option<tokio::sync::MutexGuard<'_, T>> {
+    for _ in 0..100 {
+        if let Ok(g) = m.try_lock() {
+            return Some(g);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    None
+}
+
 pub fn persist_settings(state: &AppState) {
-    if let Ok(g) = state.settings.try_lock() {
+    if let Some(g) = try_lock_briefly(&state.settings) {
         let _ = fs::create_dir_all(&state.app_dir);
         if let Ok(data) = serde_json::to_string_pretty(&*g) {
             let _ = fs::write(state.settings_path(), data);
@@ -47,7 +65,7 @@ pub fn load_peers(state: &AppState) {
 }
 
 pub fn persist_peers(state: &AppState) {
-    if let Ok(g) = state.peers.try_lock() {
+    if let Some(g) = try_lock_briefly(&state.peers) {
         let list: Vec<_> = g.values().cloned().collect();
         if let Ok(data) = serde_json::to_string_pretty(&list) {
             let _ = fs::write(state.peers_path(), data);

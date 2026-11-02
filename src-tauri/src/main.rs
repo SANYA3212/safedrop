@@ -29,10 +29,16 @@ async fn save_settings(
     if settings.loaddrop_dir.trim().is_empty() {
         return Err("LoadDrop path is empty".into());
     }
-    {
+    let settings = {
         let mut g = state.settings.lock().await;
-        *g = settings.clone();
-    }
+        // profile and LoadDrop are changed by their own commands; the page keeps
+        // the copy it loaded at start, so never let it write them back
+        let mut s = settings;
+        s.profile = g.profile.clone();
+        s.loaddrop_dir = g.loaddrop_dir.clone();
+        *g = s.clone();
+        s
+    };
     settings::persist_settings(&state);
     let _ = settings::apply_autostart(settings.autostart);
     let _ = app.emit("safedrop-settings", settings);
@@ -132,6 +138,13 @@ async fn add_peer(
     let ip = ip.trim().to_string();
     if ip.is_empty() { return Err("empty ip".into()); }
     let mut g = state.peers.lock().await;
+    if let Some(existing) = g.get_mut(&ip) {
+        if !name.trim().is_empty() { existing.name = name.trim().to_string(); }
+        let p = existing.clone();
+        drop(g);
+        settings::persist_peers(&state);
+        return Ok(p);
+    }
     let p = Peer {
         ip: ip.clone(),
         name: if name.trim().is_empty() { ip.clone() } else { name.trim().to_string() },
@@ -436,8 +449,7 @@ async fn send_chat(
 // ---------- chat delete / clear ----------
 
 fn persist_chats(state: &tauri::State<'_, AppState>) {
-    let g_block = state.chats.try_lock();
-    if let Ok(g) = g_block {
+    if let Some(g) = settings::try_lock_briefly(&state.chats) {
         let _ = std::fs::create_dir_all(&state.app_dir);
         if let Ok(data) = serde_json::to_string_pretty(&*g) {
             let _ = std::fs::write(state.chats_path(), data);
@@ -623,16 +635,22 @@ async fn leave_group(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let member_ip = discovery::my_ips().into_iter().find(|ip| ip.starts_with("26.")).or_else(|| discovery::my_ips().into_iter().next()).ok_or("локальный IP не найден")?;
     let group = state.groups.lock().await.iter().find(|g| g.id == id).cloned().ok_or("group not found")?;
+    // Peers know us by whichever address they reached us on, so leave with all
+    // of our addresses that are in the group (or all of them if none is).
+    let mine = discovery::my_ips();
+    let mut leave_ips: Vec<String> = mine.iter().filter(|ip| group.members.contains(ip)).cloned().collect();
+    if leave_ips.is_empty() { leave_ips = mine; }
+    if leave_ips.is_empty() { return Err("локальный IP не найден".into()); }
+    let left_at = chrono::Utc::now().timestamp_millis();
     signal::merge_group_sync(&app, state::GroupSyncState {
         deleted: Vec::new(),
-        departures: vec![state::GroupDeparture {
-            group_id: id,
-            member_ip: member_ip.clone(),
-            left_at: chrono::Utc::now().timestamp_millis(),
-            members: group.members,
-        }],
+        departures: leave_ips.into_iter().map(|member_ip| state::GroupDeparture {
+            group_id: id.clone(),
+            member_ip,
+            left_at,
+            members: group.members.clone(),
+        }).collect(),
         rejoins: Vec::new(),
         metas: Vec::new(),
     }, None).await;
@@ -679,17 +697,20 @@ async fn group_remove_member(
     id: String,
     ip: String,
 ) -> Result<(), String> {
-    {
-        let mut gs = state.groups.lock().await;
-        if let Some(g) = gs.iter_mut().find(|x| x.id == id) {
-            g.members.retain(|m| m != &ip);
-        } else {
-            return Err("group not found".into());
-        }
-    }
-    signal::persist_groups(&state).await;
-    let gs: Vec<Group> = state.groups.lock().await.clone();
-    let _ = app.emit("safedrop-groups", gs);
+    let group = state.groups.lock().await.iter().find(|x| x.id == id).cloned().ok_or("group not found")?;
+    // A plain local edit is undone by the next message that carries the old
+    // member list; a departure is remembered and sent to every member.
+    signal::merge_group_sync(&app, state::GroupSyncState {
+        deleted: Vec::new(),
+        departures: vec![state::GroupDeparture {
+            group_id: id,
+            member_ip: ip,
+            left_at: chrono::Utc::now().timestamp_millis(),
+            members: group.members,
+        }],
+        rejoins: Vec::new(),
+        metas: Vec::new(),
+    }, None).await;
     Ok(())
 }
 
@@ -770,7 +791,7 @@ async fn send_group_chat(
     let _ = app.emit("safedrop-chat", msg.clone());
     // Fan out in parallel; unreachable members keep the message queued ("sent")
     // until the next hello and are deduplicated by id on the receiving side.
-    for m in &group.members {
+    for m in &without_me(&group.members) {
         let v = serde_json::json!({
             "kind": "chat", "id": msg.id, "sent_at": sent_at, "from": nick, "nickname": nick, "text": text, "ts": ts,
             "image": image, "images": images, "audio": audio_file_name(&audio), "to_group": group.id, "group_name": group.name, "members": group.members, "reply_to": msg.reply_to,
@@ -785,6 +806,12 @@ async fn send_group_chat(
 }
 
 // ---------- chat edit / reactions / typing ----------
+
+/// Group member lists may contain our own addresses; don't send to ourselves.
+fn without_me(members: &[String]) -> Vec<String> {
+    let mine = discovery::my_ips();
+    members.iter().filter(|m| !mine.contains(m)).cloned().collect()
+}
 
 fn my_nick(settings: &crate::state::Settings) -> String {
     if settings.profile.nickname.is_empty() {
@@ -827,7 +854,7 @@ async fn chat_edit(
     // fan-out to the direct peer or to every group member
     let members: Option<Vec<String>> = if let Some(gid) = peer_ip.strip_prefix("g:") {
         let g = state.groups.lock().await;
-        g.iter().find(|x| x.id == gid).map(|x| x.members.clone())
+        g.iter().find(|x| x.id == gid).map(|x| without_me(&x.members))
     } else {
         None
     };
@@ -901,7 +928,7 @@ async fn chat_react(
     let _ = app.emit("safedrop-chat-changed", serde_json::json!({"peer": peer_ip}));
     let members: Option<Vec<String>> = if let Some(gid) = peer_ip.strip_prefix("g:") {
         let g = state.groups.lock().await;
-        g.iter().find(|x| x.id == gid).map(|x| x.members.clone())
+        g.iter().find(|x| x.id == gid).map(|x| without_me(&x.members))
     } else {
         None
     };
@@ -944,7 +971,7 @@ async fn chat_typing(
     };
     let (members, to_group): (Option<Vec<String>>, Option<String>) = if let Some(gid) = peer_ip.strip_prefix("g:") {
         let g = state.groups.lock().await;
-        let found = g.iter().find(|x| x.id == gid).map(|x| x.members.clone());
+        let found = g.iter().find(|x| x.id == gid).map(|x| without_me(&x.members));
         (found, Some(gid.to_string()))
     } else {
         (None, None)
@@ -1353,11 +1380,13 @@ async fn factory_reset(
         state.history_path(),
         state.chats_path(),
         state.groups_path(),
+        state.group_sync_path(),
     ] {
         let _ = std::fs::remove_file(f);
     }
     let _ = std::fs::remove_dir_all(state.app_dir.join("avatars"));
     let _ = reg(&["delete", ctx_base(), "/f"]);
+    let _ = reg(&["delete", &clsid_key(), "/f"]);
     let _ = settings::apply_autostart(false);
     let fresh = Settings::default();
     let _ = std::fs::create_dir_all(&fresh.loaddrop_dir);
@@ -1366,6 +1395,7 @@ async fn factory_reset(
     state.transfers.lock().await.clear();
     state.chats.lock().await.clear();
     state.groups.lock().await.clear();
+    *state.group_sync.lock().await = state::GroupSyncState::default();
     settings::persist_settings(&state);
     let _ = app.emit("safedrop-peers", Vec::<Peer>::new());
     let _ = app.emit("safedrop-reset", ());
@@ -2001,7 +2031,6 @@ fn main() {
                 let _ = window.app_handle().emit("safedrop-quit-requested", ());
             }
         })
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // launched from Explorer while already running:
             // forward the file to the open window instead of a 2nd window
@@ -2013,6 +2042,7 @@ fn main() {
             }
             focus_main(app);
         }))
+        .plugin(tauri_plugin_notification::init())
         // microphone is core feature: grant it outright so an accidental
         // "deny" can never silently break calls (no prompt at all)
         .on_permission_request(|_, kind| match kind {
@@ -2151,11 +2181,7 @@ fn main() {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let state: tauri::State<'_, AppState> = handle4.state();
-                    let port = state
-                        .settings
-                        .try_lock()
-                        .map(|s| s.tcp_port)
-                        .unwrap_or(47831);
+                    let port = state.settings.lock().await.tcp_port;
                     let dead = signal::dead_online(&state, port).await;
                     if !dead.is_empty() {
                         settings::persist_peers(&state);

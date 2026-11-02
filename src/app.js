@@ -1,4 +1,4 @@
-import { invoke, listen, isDemo, tauriFile, bridgeInfo } from "./tauri-shim.js";
+import { invoke, listen, listenHere, isDemo, tauriFile, bridgeInfo } from "./tauri-shim.js";
 
 // все немые падения — сразу тостом на экран
 window.addEventListener("error", (e) => {
@@ -37,7 +37,13 @@ function fmtSize(b) { const u=["Б","КБ","МБ","ГБ","ТБ"]; let i=0,v=b||0
 function fileName(p) { return String(p || "").split(/[\\/]/).pop(); }
 function dispName(p) { if (p.name && p.name !== p.ip) return p.nickname ? `${p.name} · ${p.nickname}` : p.name; return p.nickname || p.name || p.ip; }
 function dispAva(p) { return p.custom_avatar || p.avatar || ""; }
-function avaInner(a, letter) { return a ? `<img src="${a}" />` : esc(letter); }
+// Avatars and chat images come from peers: accept only a base64 image data URL
+// (or a local file URL we built ourselves), always escaped.
+function safeImg(src) {
+  const s = String(src || "");
+  return /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(s) || /^(https?:\/\/asset\.localhost\/|asset:\/\/)/.test(s) ? s : "";
+}
+function avaInner(a, letter) { const s = safeImg(a); return s ? `<img src="${esc(s)}" />` : esc(letter); }
 function avaHTML(p, cls) {
   const letter = (dispName(p) || "?")[0].toUpperCase();
   return `<span class="ava ${cls}${p.online === false ? " off" : ""}"><span>${avaInner(dispAva(p), letter)}</span></span>`;
@@ -437,7 +443,7 @@ function normalizeGroups() {
   }
 }
 function groupAva(g, cls) {
-  const letter = esc(((g?.name || "?"))[0].toUpperCase());
+  const letter = ((g?.name || "?"))[0].toUpperCase();
   return `<span class="ava ${cls}"><span>${avaInner(g?.avatar || "", letter)}</span></span>`;
 }
 let groupAvatarEdit = "";
@@ -664,7 +670,7 @@ function buildRow(m, p, g, myLetter, myNick) {
   const me = !!m.from_me;
   const { av, letter } = rowAvatar(m, p, g, myLetter);
   const images = msgImages(m);
-  const imgsHTML = images.length ? `<div class="chat-imgs">${images.map((src, i) => `<img class="chat-img" data-i="${i}" src="${src}" />`).join("")}</div>` : "";
+  const imgsHTML = images.length ? `<div class="chat-imgs">${images.map((src, i) => `<img class="chat-img" data-i="${i}" src="${esc(safeImg(src))}" />`).join("")}</div>` : "";
   const editMark = m.edited_at ? `<span class="medit">изм.</span>` : "";
   const d = document.createElement("div");
   d.className = "msgrow" + (me ? " me" : "");
@@ -951,7 +957,11 @@ async function sendChat() {
     if (pushMsg(m)) renderChat(); // событие из Rust дубль отсечёт по id
     setReply(null);
     stopTypingLocal(); // своё сообщение = сразу снять «печатает»
-  } catch (e) { toast("Не отправлено: " + e, true); }
+  } catch (e) {
+    if (!inp.value.trim()) inp.value = text;
+    if (!pendingImages.length) { pendingImages = images; renderPendingAttachments(); }
+    toast("Не отправлено: " + e, true);
+  }
 }
 
 // ---------- ответ / правка / реакции ----------
@@ -1106,7 +1116,7 @@ function renderPendingAttachments() {
   pendingImages.forEach((src, i) => {
     const chip = document.createElement("div");
     chip.className = "att-chip";
-    chip.innerHTML = `<img src="${src}" alt="" /><button title="Убрать">×</button>`;
+    chip.innerHTML = `<img src="${esc(safeImg(src))}" alt="" /><button title="Убрать">×</button>`;
     chip.querySelector("img").onclick = () => openImg(src);
     chip.querySelector("button").onclick = () => { pendingImages.splice(i, 1); renderPendingAttachments(); };
     host.appendChild(chip);
@@ -1355,7 +1365,9 @@ async function refreshCameraList() {
 }
 let camPreviewStream = null;
 let camPreviewOwned = false;
+let camPreviewGen = 0; // bumps on every start/stop; a late stream from an older start is dropped
 function stopCameraPreview() {
+  camPreviewGen++;
   if (camPreviewOwned) { try { camPreviewStream?.getTracks().forEach((t) => t.stop()); } catch {} }
   camPreviewStream = null;
   camPreviewOwned = false;
@@ -1383,8 +1395,11 @@ async function previewCamera() {
     v.play().catch(() => {});
     return;
   }
+  const gen = camPreviewGen;
   try {
-    camPreviewStream = await cameraStream(640, 360, 30);
+    const s = await cameraStream(640, 360, 30);
+    if (gen !== camPreviewGen) { s.getTracks().forEach((t) => t.stop()); return; }
+    camPreviewStream = s;
     camPreviewOwned = true;
     v.srcObject = camPreviewStream;
     v.play().catch(() => {});
@@ -1418,9 +1433,31 @@ async function switchCamera(deviceId) {
   renderStages(); renderCallStage(); renderShareList();
   toast("Камера переключена");
 }
-async function startMic() {
+// One start at a time: two overlapping starts each grabbed a microphone and the
+// first one was never released.
+let micChain = Promise.resolve();
+function startMic() {
+  const run = micChain.then(startMicNow, startMicNow);
+  micChain = run.catch(() => {});
+  return run;
+}
+// Ends the microphone capture when no call needs it any more.
+function stopMic() {
+  if (inVoice()) return;
+  try { localStream?.getTracks().forEach((t) => t.stop()); } catch {}
+  try { micDest?.stream?.getTracks().forEach((t) => t.stop()); } catch {}
+  try { if (micCtx) micCtx.close(); } catch {}
+  localStream = null;
+  micCtx = micGain = micDest = gateNode = rnnoiseNode = rnnoiseWetGain = rnnoiseDryGain = micCompressor = null;
+  micMonitorNode = null;
+  gateGen++;
+  stopMicMeter();
+}
+async function startMicNow() {
+  const oldIds = new Set(micTracks().map((t) => t.id));
   try {
     if (localStream) localStream.getTracks().forEach((t) => t.stop());
+    micMonitorNode = null;
     try { if (micCtx) micCtx.close(); } catch {}
     micCtx = micGain = micDest = gateNode = rnnoiseNode = rnnoiseWetGain = rnnoiseDryGain = micCompressor = null;
     const noiseEngine = settings.noise_filter || "rnnoise";
@@ -1490,8 +1527,16 @@ async function startMic() {
     applyMicVolume();
     gateMeter();
     const tracks = micTracks();
-    if (pc) tracks.forEach((t) => { try { pc.addTrack(t, localStream); } catch {} });
-    for (const ip of Object.keys(gpc)) { try { tracks.forEach((t) => gpc[ip].pc.addTrack(t, localStream)); } catch {} }
+    // A live call already has a sender for the old mic: swap the track in place.
+    // addTrack would need renegotiation, which never happens, so the other side
+    // heard silence after changing the microphone mid-call.
+    const swap = async (conn) => {
+      const sender = conn.getSenders().find((s) => s.track && oldIds.has(s.track.id));
+      if (sender && tracks[0]) { await sender.replaceTrack(tracks[0]); return; }
+      tracks.forEach((t) => conn.addTrack(t, localStream));
+    };
+    if (pc) { try { await swap(pc); } catch {} }
+    for (const ip of Object.keys(gpc)) { try { await swap(gpc[ip].pc); } catch {} }
     micMeter(micTrackStream());
     monWatch("me", (micDest?.stream) || localStream);
   } catch (e) {
@@ -1651,14 +1696,20 @@ function gateMeter() {
     tick();
   } catch {}
 }
+let meterCtx = null;
+function stopMicMeter() {
+  if (meterCtx) { try { meterCtx.close(); } catch {} meterCtx = null; }
+  const el = $("#mic-level"); if (el) el.style.width = "0%";
+}
 function micMeter(stream) {
+  stopMicMeter();
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = meterCtx = new (window.AudioContext || window.webkitAudioContext)();
     const an = ctx.createAnalyser(); an.fftSize = 256;
     ctx.createMediaStreamSource(stream).connect(an);
     const data = new Uint8Array(an.frequencyBinCount);
     const tick = () => {
-      if (stream.getTracks().every((t) => t.readyState === "ended")) return;
+      if (ctx !== meterCtx || stream.getTracks().every((t) => t.readyState === "ended")) return;
       an.getByteFrequencyData(data);
       const v = Math.min(100, Math.round((data.reduce((a, b) => a + b, 0) / data.length / 255) * 300));
       const el = $("#mic-level"); if (el) el.style.width = v + "%";
@@ -1704,7 +1755,7 @@ function blip(freq = 880, ms = 120) {
     if (ctx.state === "suspended") ctx.resume().catch(() => {});
     const o = ctx.createOscillator(), g = ctx.createGain();
     o.frequency.value = freq; o.connect(g); g.connect(ctx.destination);
-    o.start(); setTimeout(() => o.stop(), ms);
+    o.start(); setTimeout(() => { try { o.stop(); } catch {} ctx.close().catch(() => {}); }, ms);
   } catch {}
 }
 function playOneShot(path, fallback) {
@@ -1714,6 +1765,7 @@ function playOneShot(path, fallback) {
     if (settings.speaker_id && a.setSinkId) a.setSinkId(settings.speaker_id).catch(() => {});
     // если файл виснет — не молчим, а играем запасной звук
     const to = setTimeout(() => { try { a.pause(); } catch {} fallback?.(); }, 6000);
+    a.addEventListener("playing", () => clearTimeout(to));
     a.addEventListener("ended", () => clearTimeout(to));
     a.addEventListener("error", () => { clearTimeout(to); fallback?.(); });
     a.play().then(() => {}).catch(() => { clearTimeout(to); fallback?.(); });
@@ -1788,11 +1840,11 @@ function incomingRingtoneStart() {
   if (!settings?.sound) return;
   if (settings.ringtone) {
     try {
-      incomingRingAudio = new Audio(tauriFile(settings.ringtone));
-      incomingRingAudio.loop = true;
+      const a = incomingRingAudio = new Audio(tauriFile(settings.ringtone));
+      a.loop = true;
       const spk = settings.speaker_id;
-      if (spk && incomingRingAudio.setSinkId) incomingRingAudio.setSinkId(spk).catch(() => {});
-      incomingRingAudio.play().catch(() => incomingRingtoneStartBuiltIn());
+      if (spk && a.setSinkId) a.setSinkId(spk).catch(() => {});
+      a.play().catch(() => { if (incomingRingAudio === a) incomingRingtoneStartBuiltIn(); });
       return;
     } catch {}
   }
@@ -1816,11 +1868,11 @@ function ringbackStart() {
   if (!settings?.sound) return;
   if (settings?.ringback_file) {
     try {
-      ringbackAudio = new Audio(tauriFile(settings.ringback_file));
-      ringbackAudio.loop = true;
+      const a = ringbackAudio = new Audio(tauriFile(settings.ringback_file));
+      a.loop = true;
       const spk = settings.speaker_id;
-      if (spk && ringbackAudio.setSinkId) ringbackAudio.setSinkId(spk).catch(() => {});
-      ringbackAudio.play().catch(() => ringbackBeeps());
+      if (spk && a.setSinkId) a.setSinkId(spk).catch(() => {});
+      a.play().catch(() => { if (ringbackAudio === a) ringbackBeeps(); });
       return;
     } catch {}
   }
@@ -1915,6 +1967,7 @@ function hideCallUI() {
   monDrop("me");
   if (pc) { try { pc.close(); } catch {} pc = null; }
   const a = $("#remote-audio"); if (a) a.srcObject = null;
+  stopMic();
   updateVoiceBar(); renderConv(); renderCallPanel(); renderCallStage(); updateBusy();
 }
 async function startCall(peerIp) {
@@ -1937,7 +1990,13 @@ async function acceptCall() {
   const { ip, sdp } = pendingOffer; pendingOffer = null;
   callSetupPeer = ip;
   $("#call-modal").classList.add("hidden"); ringbackStop();
-  try { await startMic(); } catch { callSetupPeer = null; return; }
+  try { await startMic(); }
+  catch {
+    callSetupPeer = null;
+    invoke("sig_send", { peerIp: ip, payload: { kind: "call-hangup", from: myNick() } }).catch(() => {});
+    requestMic();
+    return;
+  }
   try {
     ensurePC(ip);
     await pc.setRemoteDescription(JSON.parse(sdp));
@@ -2446,8 +2505,8 @@ async function offerTo(peerIp, group) {
 async function startGroupCall(g) {
   if (!g?.members?.length) return toast("В группе нет участников", true);
   if (currentCall || groupCall || pendingOffer || callSetupPeer) return toast("Сначала заверши текущий звонок или ответь на приглашение", true);
+  endGroupCall(true); // before the mic starts: ending a call releases the mic
   try { await startMic(); } catch { requestMic(); return; }
-  endGroupCall(true);
   groupCall = { id: g.id, name: g.name, members: [...g.members], initiator: myIp };
   showGroupUI();
   ringbackStart();
@@ -2486,8 +2545,13 @@ async function acceptMeshOffer(ip, sdp) {
   await invoke("sig_send", { peerIp: ip, payload: { kind: "call-answer", from: myNick(), sdp: JSON.stringify(ans) } });
 }
 async function joinGroupCall(gref, viaIp, viaSdp) {
-  try { await startMic(); } catch { requestMic(); return; }
-  endGroupCall(true);
+  endGroupCall(true); // before the mic starts: ending a call releases the mic
+  try { await startMic(); }
+  catch {
+    invoke("sig_send", { peerIp: viaIp, payload: { kind: "call-hangup", from: myNick() } }).catch(() => {});
+    requestMic();
+    return;
+  }
   groupCall = { id: gref.id, name: gref.name || "Группа", members: [...(gref.members || [])], initiator: gref.initiator || viaIp };
   if (!groupCall.members.includes(viaIp)) groupCall.members.push(viaIp);
   showGroupUI();
@@ -2517,6 +2581,7 @@ function endGroupCall(silent) {
     $("#call-panel").classList.add("hidden");
   }
   if (hadCall && !silent) toast("Групповой звонок завершён");
+  stopMic(); // also covers the silent end when the last peer leaves
   updateVoiceBar(); renderConv(); renderCallPanel(); renderCallStage(); updateBusy();
 }
 let groupLeaveInFlight = false;
@@ -3328,7 +3393,11 @@ $("#btn-netdbg").onclick = async () => {
   } catch (e) { toast("" + e, true); }
 };
 // Custom ringtone selection is handled by the visible [data-ringback="custom"] option below.
-$("#btn-ringback-test").onclick = () => { ringbackStart(); setTimeout(ringbackStop, 3000); };
+$("#btn-ringback-test").onclick = () => {
+  if (inVoice() || pendingOffer) return toast("Во время звонка проверить гудки нельзя", true);
+  ringbackStart();
+  setTimeout(() => { if (!inVoice() && !pendingOffer) ringbackStop(); }, 3000);
+};
 $("#btn-ringback-clear").onclick = async () => {
   settings.ringback_melody = "default";
   settings.ringback_file = "";
@@ -3601,6 +3670,7 @@ function themeFromFile(obj) {
   }
   if (!Object.keys(out).length) throw new Error("в файле нет настроек оформления");
   if (out.bg_mode && !["gradient", "color", "image"].includes(out.bg_mode)) delete out.bg_mode;
+  if (out.bg_image && /^(\\\\|\/\/)|:\/\//.test(out.bg_image)) delete out.bg_image;
   return out;
 }
 $("#btn-theme-import").onclick = () => $("#theme-import-file").click();
@@ -3936,7 +4006,7 @@ const PRESETS = [
   { name: "Графит", theme: { bg_mode: "color", bg_color: "#1b1e27", bg_gradient: "", bg_image: "", blur: 0, opacity: 1, accent: "#5b8cff", radius: 14, font: "Segoe UI", custom_css: "", text_color: "#eef1f8", muted_color: "#9aa3b8", btn_color: "#333a4d", btn_text: "#eef1f8", link_color: "#7aa2ff" } },
 ];
 const pr = $("#presets");
-PRESETS.forEach((p) => { const b = document.createElement("button"); b.textContent = p.name; b.onclick = async () => { settings.theme = p.theme; try { await invoke("save_settings", { settings }); loadAll(); } catch (e) { toast("" + e, true); } }; pr.appendChild(b); });
+PRESETS.forEach((p) => { const b = document.createElement("button"); b.textContent = p.name; b.onclick = async () => { settings.theme = structuredClone(p.theme); try { await invoke("save_settings", { settings }); loadAll(); } catch (e) { toast("" + e, true); } }; pr.appendChild(b); });
 
 // ---------- аккордеон настроек: 9 секций, состояние запоминается ----------
 const ACC_SECTION_IDS = ["sec-profile", "sec-net", "sec-call", "sec-notif", "sec-chat", "sec-files", "sec-appearance", "sec-system", "sec-about"];
@@ -3974,10 +4044,13 @@ function bindAccordion() {
 
 // ---------- поиск по настройкам ----------
 let setSearchTimer = null;
-const setSearchOriginal = new Map(); // element -> original html
+const setSearchOriginal = new Set(); // elements that got <mark> highlights
 function restoreSettingsSearch() {
   document.querySelectorAll(".set-empty-hint").forEach((el) => el.remove());
-  for (const [el, saved] of setSearchOriginal) el.innerHTML = saved;
+  for (const el of setSearchOriginal) {
+    el.querySelectorAll("mark").forEach((m) => m.replaceWith(document.createTextNode(m.textContent)));
+    el.normalize();
+  }
   setSearchOriginal.clear();
   document.querySelectorAll("#settings-acc .set-hit, #settings-acc .set-dim, .set-sec.set-nohits")
     .forEach((el) => el.classList.remove("set-hit", "set-dim", "set-nohits"));
@@ -4027,8 +4100,8 @@ function runSettingsSearch() {
   }
 }
 function markTextMatches(el, q) {
-  // обёртка совпадений тегом <mark>; сохраняем оригинал ДО любых изменений
-  if (!setSearchOriginal.has(el)) setSearchOriginal.set(el, el.innerHTML);
+  // обёртка совпадений тегом <mark>; при сбросе метки разворачиваются обратно
+  setSearchOriginal.add(el);
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
   const targets = [];
   while (walker.nextNode()) {
@@ -4530,8 +4603,16 @@ function wtClearSession() {
   wtRefreshUI();
 }
 
+// Шлёт ли этот адрес участник текущего звонка (с учётом его других адресов).
+function callHasIp(ip) {
+  if (!ip || !inVoice()) return false;
+  const ms = webMembers().concat(typeof gpc !== "undefined" ? Object.keys(gpc) : []);
+  if (ms.includes(ip)) return true;
+  const p = peers.find((x) => x.ip === ip || (x.ips || []).includes(ip));
+  return !!p && [p.ip, ...(p.ips || [])].some((a) => ms.includes(a));
+}
 function wtAdopt(p) {
-  if (!p.video) return;
+  if (!wtIdOk(p.video)) return;
   wtSetSession(p.video, p.title || "Видео", p.by || p.from || wtState.by, !!p.vertical);
   wtState.remotePos = Number(p.pos) || 0;
   wtState.remotePaused = !!p.paused;
@@ -4667,7 +4748,13 @@ function wtEnsureApi() {
   if (!document.querySelector('script[src*="youtube.com/iframe_api"]')) {
     const tag = document.createElement("script");
     tag.src = "https://www.youtube.com/iframe_api";
-    tag.onerror = () => wtShowError("Не удалось загрузить YouTube. Проверьте подключение к интернету.", true);
+    tag.onerror = () => {
+      // убрать сломанный тег, иначе «Повторить» его найдёт и не загрузит заново
+      tag.remove();
+      if (wtState.apiPoll) { clearInterval(wtState.apiPoll); wtState.apiPoll = null; }
+      wtState.apiStarted = false;
+      wtShowError("Не удалось загрузить YouTube. Проверьте подключение к интернету.", true);
+    };
     document.head.appendChild(tag);
   }
   wtState.apiPoll = setInterval(() => {
@@ -5021,7 +5108,7 @@ function wtFromBrowser(p) {
     return reply("Сначала начните звонок — тогда видео откроется у всех", false);
   }
   if (p.queue) {
-    wtQueueAdd(p.url, p.title).then((r) => reply(r === "queued" ? "Добавлено в очередь" : r === "played" ? "Очередь была пуста — открыто у всех" : "Это не страница видео", r !== "bad"));
+    wtQueueAdd(p.url, p.title).then((r) => (r === "played" && invoke("ytb_pause_media").catch(() => {}), r)).then((r) => reply(r === "queued" ? "Добавлено в очередь" : r === "played" ? "Очередь была пуста — открыто у всех" : "Это не страница видео", r !== "bad"));
     return;
   }
   if (!wtState.open) wtOpen();
@@ -5165,10 +5252,14 @@ async function wtQueueAdd(url, title) {
 function wtQueuePlay(index) {
   const it = wtState.queue[index];
   if (!it) return;
+  wtState.qi = index; wtState.qiGone = false; wtState.qiVid = it.id;
   wtLoadVideo((it.v ? "https://youtube.com/shorts/" : "https://youtu.be/") + it.id, it.title);
 }
 function wtQueueRemove(index) {
   if (!wtState.queue[index]) return;
+  // играющий пункт убрали — следующим остаётся тот, что шёл за ним
+  if (wtState.qi === index) { wtState.qi = index - 1; wtState.qiGone = true; }
+  else if (wtState.qi > index) wtState.qi--;
   wtQueueSet(wtState.queue.filter((_, i) => i !== index), true);
 }
 // Видео закончилось: повтор, следующее в плейлисте или (по кругу) первое.
@@ -5181,7 +5272,10 @@ function wtQueueNext() {
   } catch {}
   if (Date.now() - wtState.advancedAt < 3000) return;
   const q = wtState.queue;
-  const i = q.findIndex((it) => it.id === wtState.videoId);
+  const qi = typeof wtState.qi === "number" ? wtState.qi : -2;
+  // одинаковые видео в списке: findIndex всегда находил первое и крутил A→B→A→B
+  const i = qi >= -1 && qi < q.length && (wtState.qiGone ? wtState.qiVid === wtState.videoId : q[qi]?.id === wtState.videoId)
+    ? qi : q.findIndex((it) => it.id === wtState.videoId);
   if (wtState.loop === "one" || (wtState.loop === "all" && (!q.length || (q.length === 1 && i === 0)))) {
     wtState.advancedAt = Date.now();
     wtReplay();
@@ -5411,6 +5505,7 @@ function wtRetryPlayer() {
 }
 
 function wtEndCall() {
+  wtChatUnread = 0; wtChatBadge();
   try { wtState.player?.stopVideo(); } catch {}
   wtCloseMe(true);
   wtClearSession();
@@ -5513,6 +5608,7 @@ function webOnLocalUrl(p) {
 function webOnRemote(p) {
   if (!p) return;
   if (p.ip && myIp && p.ip === myIp) return;
+  if (!callHasIp(p.ip)) return; // после звонка чужие переходы и «закрыть» не применяем
   const who = wtNick(p.ip || "", p.from);
   if (p.action === "close") { webRemoteClose(who); return; }
   if (!webIsUrl(p.url)) return;
@@ -5577,7 +5673,7 @@ function webCloseAll() {
 function webRemoteClose(who) {
   webHideJoin();
   webState.pending = null; webState.leader = false;
-  if (isDemo) return;
+  if (isDemo || !webState.share) return; // свой браузер без «Листать вместе» не трогаем
   invoke("ytb_close").then((was) => { if (was) toast(who + " закрыл браузер у всех"); }).catch(() => {});
 }
 function webShowJoin() {
@@ -5714,6 +5810,7 @@ if (typeof listen === "function") {
       if (p.kind !== "yt-sync") return;
       const srcIp = t.ip || p.ip || "";
       if (srcIp && myIp && srcIp === myIp) return;
+      if (!callHasIp(srcIp)) return; // не участник звонка — не командует
       if (srcIp) p.ip = srcIp;
       if (p.action === "state-request") {
         wtMarkViewer(srcIp, !!p.watching);
@@ -5743,8 +5840,8 @@ if (typeof listen === "function") {
   listen("ytb-watch", (e) => {
     try { wtFromBrowser(e.payload || {}); } catch (err) { console.error("ytb-watch", err); }
   }).catch((err) => console.error("ytb listen", err));
-  listen("ytb-url", (e) => { try { webOnLocalUrl(e.payload || {}); } catch (err) { console.error("ytb-url", err); } }).catch(() => {});
-  listen("ytb-share", (e) => { try { webOnShare(!!(e.payload && e.payload.on), !!(e.payload && e.payload.auto)); } catch (err) { console.error("ytb-share", err); } }).catch(() => {});
+  listenHere("ytb-url", (e) => { try { webOnLocalUrl(e.payload || {}); } catch (err) { console.error("ytb-url", err); } }).catch(() => {});
+  listenHere("ytb-share", (e) => { try { webOnShare(!!(e.payload && e.payload.on), !!(e.payload && e.payload.auto)); } catch (err) { console.error("ytb-share", err); } }).catch(() => {});
   listen("ytb-cursor", (e) => { try { webOnLocalPointer("cursor", e.payload || {}); } catch {} }).catch(() => {});
   listen("ytb-scroll", (e) => { try { webOnLocalPointer("scroll", e.payload || {}); } catch {} }).catch(() => {});
   listen("ytb-close-all", () => { try { webCloseAll(); } catch (err) { console.error("ytb-close-all", err); } }).catch(() => {});
@@ -5754,7 +5851,7 @@ if (typeof listen === "function") {
     const text = e.payload && e.payload.text;
     wtChatSend(text).then((ok) => { if (!ok) invoke("ytb_notify", { text: "Не отправлено: нужен звонок", ok: false }).catch(() => {}); });
   }).catch(() => {});
-  listen("ytb-closed", () => { webState.share = false; webState.leader = false; webPeople(); }).catch(() => {});
+  listenHere("ytb-closed", () => { webState.share = false; webState.leader = false; webPeople(); }).catch(() => {});
   listen("safedrop-web", (e) => { try { webOnRemote(e.payload || {}); } catch (err) { console.error("safedrop-web", err); } }).catch(() => {});
 }
 

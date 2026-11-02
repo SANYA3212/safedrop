@@ -10,7 +10,9 @@ use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 const ALPN: &[u8] = b"safedrop/1";
-const MAX_LINE: usize = 1_048_576;
+/// One JSON line per stream. A chat message may carry up to 10 images of up
+/// to 700 KB each, so 1 MB was too small and such messages were dropped.
+pub(crate) const MAX_LINE: usize = 12 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -149,10 +151,22 @@ async fn read_line_capped(
     reader: &mut (impl AsyncBufRead + Unpin),
     cap: usize,
 ) -> Result<Vec<u8>, String> {
+    read_line_limited(reader, cap, STREAM_TIMEOUT.max(Duration::from_secs((cap / 200_000) as u64))).await
+}
+
+/// Reads one `\n`-terminated line, never buffering more than `cap + 1` bytes
+/// and never waiting longer than `wait`: a peer that streams bytes without a
+/// newline, or stalls mid-line, can't exhaust memory or hang the task.
+pub(crate) async fn read_line_limited(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    cap: usize,
+    wait: Duration,
+) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
     let mut buf = Vec::new();
-    tokio::time::timeout(STREAM_TIMEOUT, reader.read_until(b'\n', &mut buf))
+    tokio::time::timeout(wait, (&mut *reader).take(cap as u64 + 1).read_until(b'\n', &mut buf))
         .await
-        .map_err(|_| "quic read timeout".to_string())?
+        .map_err(|_| "read timeout".to_string())?
         .map_err(|e| e.to_string())?;
     if buf.is_empty() {
         return Err("empty frame".into());
@@ -243,9 +257,10 @@ async fn handle_quic_stream(
         let drop_dir: String = app
             .state::<crate::state::AppState>()
             .settings
-            .try_lock()
-            .map(|s| s.loaddrop_dir.clone())
-            .unwrap_or_default();
+            .lock()
+            .await
+            .loaddrop_dir
+            .clone();
         crate::transfer::receive_stream(app, offer, &mut reader, ip, drop_dir, None)
             .await
             .map_err(|e| e.to_string())
@@ -463,5 +478,23 @@ mod tests {
 
         server.await.expect("server task");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::read_line_limited;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn line_reads_are_capped() {
+        let mut ok: &[u8] = b"{\"kind\":\"x\"}\nrest";
+        let line = read_line_limited(&mut ok, 100, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(line, b"{\"kind\":\"x\"}\n");
+        // no newline within the cap: rejected after reading cap+1 bytes, the rest stays unread
+        let big = vec![b'a'; 10_000];
+        let mut r: &[u8] = &big;
+        assert!(read_line_limited(&mut r, 100, Duration::from_secs(1)).await.is_err());
+        assert_eq!(r.len(), 10_000 - 101);
     }
 }

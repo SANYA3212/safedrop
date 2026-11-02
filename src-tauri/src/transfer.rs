@@ -42,6 +42,37 @@ async fn peer_supports_resume(app: &AppHandle, peer_ip: &str) -> bool {
     parse_ver(&ver).map(|v| v >= RESUME_SINCE).unwrap_or(false)
 }
 
+/// Resumable downloads the user cancelled: (peer, fkey) -> when. The sender
+/// retries after a dropped connection, so without this a cancel just restarted
+/// the download from zero.
+fn cancelled_parts() -> &'static std::sync::Mutex<std::collections::HashMap<(String, String), Instant>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(String, String), Instant>>> = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+fn was_cancelled(peer_ip: &str, fkey: &str) -> bool {
+    let mut m = cancelled_parts().lock().unwrap_or_else(|e| e.into_inner());
+    m.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(600));
+    m.contains_key(&(peer_ip.to_string(), fkey.to_string()))
+}
+
+/// Which receiver currently owns a partial file. A retry from the sender may
+/// arrive while the old connection is still alive; the newer one wins and the
+/// old one stops writing instead of appending a second copy.
+fn part_owners() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, u64>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>> = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+fn part_owner_is(p: &Path, token: u64) -> bool {
+    part_owners().lock().unwrap_or_else(|e| e.into_inner()).get(p) == Some(&token)
+}
+
+/// An update installer is a few tens of MB; anything far larger is not one.
+const MAX_UPDATE_SIZE: u64 = 512 * 1024 * 1024;
+/// A file offer header is a short JSON line.
+const MAX_OFFER_LINE: usize = 64 * 1024;
+
 fn valid_fkey(k: &str) -> bool {
     (16..=64).contains(&k.len()) && k.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -139,12 +170,14 @@ pub async fn run_server(app: AppHandle, port: u16) {
         };
         let app2 = app.clone();
         // current LoadDrop (user may move it in settings anytime)
+        // a busy lock used to yield "" and save into the working directory
         let drop_dir: String = app
             .state::<crate::state::AppState>()
             .settings
-            .try_lock()
-            .map(|s| s.loaddrop_dir.clone())
-            .unwrap_or_default();
+            .lock()
+            .await
+            .loaddrop_dir
+            .clone();
         tokio::spawn(async move {
             let _ = sock.set_nodelay(true);
             let sock = match crate::tls::accept(sock).await {
@@ -167,9 +200,10 @@ async fn handle_conn(
     let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr).to_string();
     let (read_half, mut write_half) = tokio::io::split(sock);
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
-    let offer: Offer = serde_json::from_str(line.trim())?;
+    let line = crate::quic::read_line_limited(&mut reader, MAX_OFFER_LINE, std::time::Duration::from_secs(30))
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let offer: Offer = serde_json::from_slice(&line)?;
     let resume = if offer.resume && offer.kind != "update" && valid_fkey(&offer.fkey) {
         clean_old_partials(&drop_dir).await;
         let p = partial_path(&drop_dir, &peer_ip, &offer.fkey);
@@ -179,9 +213,13 @@ async fn handle_conn(
         None
     };
     // Продолжение уже принятого файла от того же отправителя второй раз не спрашиваем.
-    let accepted = match &resume {
-        Some((_, have)) if *have > 0 => true,
-        _ => authorize_offer(&app, &offer, &peer_ip).await,
+    let accepted = if resume.is_some() && was_cancelled(&peer_ip, &offer.fkey) {
+        false
+    } else {
+        match &resume {
+            Some((_, have)) if *have > 0 => true,
+            _ => authorize_offer(&app, &offer, &peer_ip).await,
+        }
     };
     if offer.confirm || resume.is_some() {
         let offset = resume.as_ref().map(|(_, h)| *h).unwrap_or(0);
@@ -204,6 +242,9 @@ pub(crate) async fn authorize_offer(app: &AppHandle, offer: &Offer, peer_ip: &st
     let trusted = state.peers.lock().await.get(peer_ip).map(|p| p.trusted).unwrap_or(false);
     // An update offer is followed by a separate, explicit install prompt after
     // download. Do not block the transfer behind the generic file approval UI.
+    if offer.kind == "update" && offer.size > MAX_UPDATE_SIZE {
+        return false;
+    }
     if offer.kind == "update" || should_auto_accept(auto_trusted, trusted, offer.size, limit_mb) {
         return true;
     }
@@ -259,8 +300,17 @@ pub(crate) async fn receive_stream(
             if let Some(dir) = p.parent() { let _ = tokio::fs::create_dir_all(dir).await; }
             (p, have)
         }
-        None => (final_path.with_extension("safedrop-part"), 0),
+        // named after the transfer, not the file: photo.jpg and photo.png
+        // arriving together used to share one temp file
+        None => {
+            let tag: String = offer.id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect();
+            let tag = if tag.is_empty() { safe_name.clone() } else { tag };
+            (Path::new(&target_dir).join(format!(".{tag}.safedrop-part")), 0)
+        }
     };
+    static NEXT_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let owner = NEXT_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    part_owners().lock().unwrap_or_else(|e| e.into_inner()).insert(part_path.clone(), owner);
     // при обрыве недокачанное оставляем для докачки, иначе — удаляем
     let drop_part = |p: PathBuf| async move { if !resumable { let _ = tokio::fs::remove_file(p).await; } };
 
@@ -288,7 +338,14 @@ pub(crate) async fn receive_stream(
             }
             Err(_) => {}
         }
-        tokio::fs::OpenOptions::new().append(true).open(&part_path).await
+        // write exactly from `offset`: a stale writer may have added bytes
+        match tokio::fs::OpenOptions::new().write(true).open(&part_path).await {
+            Ok(mut f) => match f.set_len(offset).await {
+                Ok(()) => f.seek(std::io::SeekFrom::Start(offset)).await.map(|_| f),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
     } else {
         File::create(&part_path).await
     };
@@ -313,7 +370,16 @@ pub(crate) async fn receive_stream(
             user_cancel = true;
             break;
         }
-        let n = match reader.read(&mut buf).await {
+        if !part_owner_is(&part_path, owner) {
+            // a newer connection for the same file took over; leave the part to it
+            return Ok(());
+        }
+        // a sender that vanished without closing the socket must not keep the
+        // transfer "active" forever
+        let read = tokio::time::timeout(std::time::Duration::from_secs(60), reader.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "нет данных 60 с")));
+        let n = match read {
             Ok(n) => n,
             Err(e) => {
                 let msg = if resumable {
@@ -328,6 +394,9 @@ pub(crate) async fn receive_stream(
                 return Err(anyhow::anyhow!(msg));
             }
         };
+        if n == 0 { break; }
+        // never write past the declared size
+        let n = n.min(total.saturating_sub(done) as usize);
         if n == 0 { break; }
         if let Err(e) = out.write_all(&buf[..n]).await {
             let msg = format!("can't write to disk: {e}");
@@ -359,6 +428,10 @@ pub(crate) async fn receive_stream(
     }
     if done < total {
         // cancelled or broken connection: no half-baked files, clean the cache
+        if resumable && user_cancel {
+            cancelled_parts().lock().unwrap_or_else(|e| e.into_inner())
+                .insert((peer_ip.clone(), offer.fkey.clone()), Instant::now());
+        }
         let _ = tokio::fs::remove_file(&part_path).await;
         set_transfer_status(&app, &id, "cancelled").await;
         let _ = app.emit("safedrop-cancelled", serde_json::json!({
@@ -366,6 +439,9 @@ pub(crate) async fn receive_stream(
         }));
         return Ok(());
     }
+    part_owners().lock().unwrap_or_else(|e| e.into_inner()).remove(&part_path);
+    // another download may have taken this name while we were receiving
+    let final_path = unique_path(final_path);
     if tokio::fs::rename(&part_path, &final_path).await.is_err() {
         // antivirus/file lock can hold the fresh file briefly — one retry
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;

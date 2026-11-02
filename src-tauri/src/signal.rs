@@ -111,8 +111,20 @@ pub fn profile_hash(nick: &str, avatar: &str) -> String {
 
 const MAX_AVATAR: usize = 300_000; // chars
 
+/// Peers' avatars and chat images are rendered as <img src>, so accept only a
+/// plain base64 image data URL — anything else could break out of the attribute.
+pub fn is_data_image(s: &str) -> bool {
+    let body = ["data:image/png;base64,", "data:image/jpeg;base64,", "data:image/webp;base64,", "data:image/gif;base64,"]
+        .iter()
+        .find_map(|p| s.strip_prefix(p));
+    match body {
+        Some(b) => b.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'='),
+        None => false,
+    }
+}
+
 fn trim_avatar(s: &str) -> String {
-    if s.len() > MAX_AVATAR {
+    if s.len() > MAX_AVATAR || !is_data_image(s) {
         String::new()
     } else {
         s.to_string()
@@ -153,13 +165,12 @@ pub async fn run_signal_server(app: AppHandle, port: u16) {
 async fn handle_frame(app: AppHandle, sock: TcpStream, ip: String) -> Result<(), String> {
     let (mut sock, _encrypted) = crate::tls::accept(sock).await.map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(&mut sock);
-    let mut buf = Vec::new();
-    // one JSON line per connection (avatar up to ~300KB fits)
-    reader.read_until(b'\n', &mut buf).await.map_err(|e| e.to_string())?;
+    // one JSON line per connection, size- and time-limited
+    let buf = crate::quic::read_line_limited(&mut reader, crate::quic::MAX_LINE, std::time::Duration::from_secs(60)).await?;
     if buf.is_empty() {
         return Ok(());
     }
-    if buf.len() > 1_048_576 {
+    if buf.len() > crate::quic::MAX_LINE {
         return Err("frame too big".into());
     }
     let frame: Frame = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
@@ -295,6 +306,7 @@ pub async fn merge_group_sync(app: &AppHandle, incoming: GroupSyncState, source_
         groups.retain(|g| !all_deleted.contains(&g.id) && !local_departures.contains(&g.id));
         for rejoin in &all_rejoins {
             if all_deleted.contains(&rejoin.group_id) { continue; }
+            if all_departures.iter().any(|d| d.group_id == rejoin.group_id && d.member_ip == rejoin.member_ip && d.left_at >= rejoin.joined_at) { continue; }
             if local_ips.contains(&rejoin.member_ip) && !groups.iter().any(|g| g.id == rejoin.group_id) {
                 groups.push(Group { id: rejoin.group_id.clone(), name: rejoin.name.clone(), members: rejoin.members.clone(), avatar: String::new(), updated_at: 0 });
             }
@@ -445,10 +457,10 @@ pub(crate) async fn process_frame(
         Frame::Chat { from: _, nickname, text, ts, id, sent_at, image, images, audio, to_group, group_name, mut members, reply_to } => {
             let text = text.chars().take(2000).collect::<String>();
             let mut images: Vec<String> = images.into_iter()
-                .filter(|s| !s.is_empty() && s.len() <= 700_000)
+                .filter(|s| s.len() <= 700_000 && is_data_image(s))
                 .take(10)
                 .collect();
-            if images.is_empty() && !image.is_empty() && image.len() <= 700_000 {
+            if images.is_empty() && image.len() <= 700_000 && is_data_image(&image) {
                 images.push(image);
             }
             let image = images.first().cloned().unwrap_or_default();
@@ -473,7 +485,7 @@ pub(crate) async fn process_frame(
                 {
                     return Ok(());
                 }
-                members.retain(|m| !sync.departures.iter().any(|d| d.group_id == gid && d.member_ip == *m));
+                members.retain(|m| !my_ips.contains(m) && !sync.departures.iter().any(|d| d.group_id == gid && d.member_ip == *m));
                 let meta = sync.metas.iter().find(|m| m.id == gid).cloned();
                 {
                     let mut gs = state.groups.lock().await;
@@ -539,15 +551,24 @@ pub(crate) async fn process_frame(
                 edited_at: 0,
                 reactions: Vec::new(),
             };
-            {
+            let is_new = {
                 let mut c = state.chats.lock().await;
                 let rows = c.entry(key.clone()).or_default();
-                if !rows.iter().any(|m| m.id == msg.id) {
+                let fresh = !rows.iter().any(|m| m.id == msg.id);
+                if fresh {
                     rows.push(msg.clone());
                     rows.sort_by_key(|m| m.sent_at);
                 }
-            }
+                fresh
+            };
             let ack_id = msg.id.clone();
+            if !is_new {
+                // A resend of a message we already have: just confirm it again.
+                let app2 = app.clone();
+                let ip2 = ip.clone();
+                tokio::spawn(async move { send_chat_ack(&app2, &ip2, vec![ack_id]).await; });
+                return Ok(());
+            }
             persist_chats(&state).await;
             let _ = app.emit("safedrop-chat", msg.clone());
             // native Windows toast: avatar + name + text
@@ -926,12 +947,15 @@ async fn send_chat_sync(app: &AppHandle, peer_ip: &str, known_ids: Vec<String>) 
     let messages = {
         let chats = state.chats.lock().await;
         let mut out = Vec::new();
+        // The requester lists only its last 500 ids per chat. Offering rows
+        // older than that re-sent the whole history on every hello (~30 s), so
+        // look only at our own last 400 rows: they overlap the requester's window.
         if let Some(rows) = chats.get(peer_ip) {
-            out.extend(rows.iter().filter(|m| !known.contains(&m.id)).cloned());
+            out.extend(rows.iter().rev().take(400).filter(|m| !known.contains(&m.id)).cloned());
         }
         for key in group_ids {
             if let Some(rows) = chats.get(&key) {
-                out.extend(rows.iter().filter(|m| !known.contains(&m.id)).cloned());
+                out.extend(rows.iter().rev().take(400).filter(|m| !known.contains(&m.id)).cloned());
             }
         }
         out.sort_by(|a, b| a.sent_at.cmp(&b.sent_at).then_with(|| a.id.cmp(&b.id)));
@@ -939,16 +963,19 @@ async fn send_chat_sync(app: &AppHandle, peer_ip: &str, known_ids: Vec<String>) 
     };
     if messages.is_empty() { return; }
     let port = state.settings.lock().await.sig_port;
+    // Older peers accept frames up to 1 MB, so keep batches below that. Each
+    // message is measured once instead of re-serializing the growing batch.
     let mut batch = Vec::new();
+    let mut batch_len = 0usize;
     for msg in messages {
-        batch.push(msg);
-        let frame = serde_json::json!({"kind":"chat-sync", "messages": batch});
-        if serde_json::to_vec(&frame).map(|v| v.len()).unwrap_or(1_048_577) > 850_000 && batch.len() > 1 {
-            let last = batch.pop().unwrap();
-            let payload = serde_json::json!({"kind":"chat-sync", "messages": batch});
+        let len = serde_json::to_vec(&msg).map(|v| v.len()).unwrap_or(usize::MAX / 2) + 1;
+        if !batch.is_empty() && batch_len + len > 850_000 {
+            let payload = serde_json::json!({"kind":"chat-sync", "messages": std::mem::take(&mut batch)});
             let _ = crate::quic::send_frame_dual(app, peer_ip, port, payload, false).await;
-            batch = vec![last];
+            batch_len = 0;
         }
+        batch.push(msg);
+        batch_len += len;
     }
     if !batch.is_empty() {
         let payload = serde_json::json!({"kind":"chat-sync", "messages": batch});
@@ -1229,8 +1256,8 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
                     }
                     known_ids.sort();
                     known_ids.dedup();
-                    if known_ids.len() > 2000 {
-                        known_ids.drain(..known_ids.len() - 2000);
+                    if known_ids.len() > 8000 {
+                        known_ids.drain(..known_ids.len() - 8000);
                     }
                     drop(chats);
                     let request = serde_json::json!({"kind":"chat-sync-request", "known_ids": known_ids});
@@ -1248,17 +1275,30 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
 /// Quick liveness check of currently-online peers (cheap: only known online).
 /// Marks dead ones offline. Returns their ips.
 pub async fn dead_online(state: &AppState, port: u16) -> Vec<String> {
-    let online: Vec<String> = state
+    // A contact may answer on any of its addresses (LAN, Radmin, ...): the scan
+    // marks it online through any of them, so it is dead only when none answers.
+    let online: Vec<(String, Vec<String>)> = state
         .peers
         .lock()
         .await
         .values()
         .filter(|p| p.online)
-        .map(|p| p.ip.clone())
+        .map(|p| {
+            let mut addrs = vec![p.ip.clone()];
+            addrs.extend(p.ips.iter().filter(|x| **x != p.ip).cloned());
+            (p.ip.clone(), addrs)
+        })
         .collect();
     let mut dead = Vec::new();
-    for ip in online {
-        if crate::discovery::tcp_ping(&ip, port, 1200).await.is_some() {
+    for (ip, addrs) in online {
+        let mut alive = false;
+        for a in &addrs {
+            if crate::discovery::tcp_ping(a, port, 1200).await.is_some() {
+                alive = true;
+                break;
+            }
+        }
+        if alive {
             state.unreachable_since.lock().await.remove(&ip);
             continue;
         }
@@ -1316,5 +1356,21 @@ pub async fn announce_all(app: AppHandle) {
         let a = app.clone();
         let ip2 = ip.clone();
         tokio::spawn(async move { announce_to(&a, &ip2).await; });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_data_image;
+
+    #[test]
+    fn only_plain_image_data_urls_pass() {
+        assert!(is_data_image("data:image/png;base64,iVBORw0KGgo="));
+        assert!(is_data_image("data:image/jpeg;base64,/9j/4AAQ+/="));
+        assert!(!is_data_image(""));
+        assert!(!is_data_image("x\" onerror=\"alert(1)"));
+        assert!(!is_data_image("data:image/png;base64,abc\" onerror=\"x"));
+        assert!(!is_data_image("data:image/svg+xml;base64,PHN2Zz4="));
+        assert!(!is_data_image("https://example.com/a.png"));
     }
 }

@@ -92,8 +92,9 @@
   $("close").onclick = () => invoke("ytb_chat_toggle", { open: false }).catch(() => {});
 
   if (T && T.event) {
-    T.event.listen("ytb-chat-history", (e) => render(e.payload || {}));
-    T.event.listen("ytb-chat", (e) => add(e.payload || {}));
+    const on = (n, h) => T.event.listen(n, h, { target: { kind: "AnyLabel", label: "ytb-chat" } });
+    on("ytb-chat-history", (e) => render(e.payload || {}));
+    on("ytb-chat", (e) => add(e.payload || {}));
     T.event.listen("ytb-notice", (e) => { const p = e.payload || {}; if (!p.ok) showErr(p.text || ""); });
     invoke("ytb_chat_request").catch(() => {});
     // вернулись в панель — подтянуть сообщения, отправленные из главного окна
