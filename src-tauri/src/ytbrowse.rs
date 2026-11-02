@@ -25,6 +25,10 @@ const WIN: &str = "ytb";
 const BAR: &str = "ytb-bar";
 const VIEW: &str = "ytb-view";
 const BAR_H: f64 = 48.0;
+const CHAT: &str = "ytb-chat";
+const CHAT_W: f64 = 340.0;
+/// Открыта ли панель чата справа.
+static CHAT_OPEN: AtomicBool = AtomicBool::new(false);
 /// Сколько после перехода по команде участника считать изменения адреса
 /// (редиректы сайта) чужими и не отправлять обратно.
 const REMOTE_QUIET: Duration = Duration::from_millis(2500);
@@ -40,37 +44,32 @@ fn web_url(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
 }
 
-/// Стартовая страница: плитки сайтов. Отдаётся как data: URL — у неё нет
-/// доступа к приложению (как и у любого сайта в этом окне).
-const START_HTML: &str = r#"<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Начальная страница</title>
-<style>
-body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:26px;background:radial-gradient(1200px 700px at 50% 30%,#2a2150,#0f1220 70%);color:#eef1f8;font:15px "Segoe UI",system-ui,sans-serif}
-h1{margin:0;font-size:22px;font-weight:600}
-p{margin:0;color:#9aa3b8;font-size:13px}
-.grid{display:grid;grid-template-columns:repeat(4,150px);gap:14px}
-a{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;height:110px;border-radius:16px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.09);color:#eef1f8;text-decoration:none;transition:.15s}
-a:hover{background:rgba(255,255,255,.12);transform:translateY(-2px)}
-b{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;color:#fff}
-@media(max-width:700px){.grid{grid-template-columns:repeat(2,150px)}}
-</style></head><body>
-<h1>Куда пойдём?</h1>
-<div class="grid">
-<a href="https://www.youtube.com/"><b style="background:#ff0033">▶</b>YouTube</a>
-<a href="https://www.google.com/"><b style="background:#4285f4">G</b>Google</a>
-<a href="https://www.reddit.com/"><b style="background:#ff4500">r/</b>Reddit</a>
-<a href="https://www.twitch.tv/"><b style="background:#9146ff">T</b>Twitch</a>
-<a href="https://vkvideo.ru/"><b style="background:#0077ff">VK</b>VK Видео</a>
-<a href="https://rutube.ru/"><b style="background:#100943">R</b>Rutube</a>
-<a href="https://www.kinopoisk.ru/"><b style="background:#ff6600">K</b>Кинопоиск</a>
-<a href="https://ru.wikipedia.org/"><b style="background:#636466">W</b>Википедия</a>
-</div>
-<p>Любой сайт — введите адрес или запрос в строку сверху. «Листать вместе» — друг увидит, что вы открываете.</p>
-</body></html>"#;
-
+/// Стартовая страница с плитками сайтов — локальный файл `start.html`.
+/// (Раньше был data:-адрес: без особой опции Tauri такой webview не создаётся,
+/// и в окне оставалась только панель — «окно браузера закрыто».)
 fn start_url() -> Url {
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(START_HTML.as_bytes());
-    Url::parse(&format!("data:text/html;charset=utf-8;base64,{b64}")).expect("data url")
+    let base = if cfg!(windows) { "http://tauri.localhost/start.html" } else { "tauri://localhost/start.html" };
+    Url::parse(base).expect("static url")
+}
+
+/// Служебные адреса самого приложения (tauri.localhost, ipc.localhost …).
+/// Сайт или собеседник не должен уводить окно браузера на них: страницы
+/// приложения имеют доступ к его командам. Разрешена только стартовая страница.
+fn is_app_host(u: &Url) -> bool {
+    u.scheme() == "tauri" || u.host_str().map(|h| h.to_ascii_lowercase().ends_with(".localhost")).unwrap_or(false)
+}
+
+fn is_start_page(u: &Url) -> bool {
+    let s = start_url();
+    u.scheme() == s.scheme() && u.host_str() == s.host_str() && u.path() == s.path()
+}
+
+/// Куда можно переходить внутри окна браузера.
+fn nav_allowed(u: &Url) -> bool {
+    if is_start_page(u) {
+        return true;
+    }
+    web_url(u) && !is_app_host(u)
 }
 
 /// Строка из поля ввода: адрес — открываем, иначе ищем в Google.
@@ -144,11 +143,25 @@ fn layout(app: &AppHandle) {
             size: PhysicalSize::new(size.width, bar_h).into(),
         });
     }
+    let below = size.height.saturating_sub(bar_h);
+    let chat_open = CHAT_OPEN.load(Ordering::Relaxed) && app.get_webview(CHAT).is_some();
+    let chat_w = if chat_open { ((CHAT_W * scale).round() as u32).min(size.width / 2) } else { 0 };
     if let Some(view) = app.get_webview(VIEW) {
         let _ = view.set_bounds(Rect {
             position: PhysicalPosition::new(0, bar_h as i32).into(),
-            size: PhysicalSize::new(size.width, size.height.saturating_sub(bar_h)).into(),
+            size: PhysicalSize::new(size.width - chat_w, below).into(),
         });
+    }
+    if let Some(chat) = app.get_webview(CHAT) {
+        if chat_open {
+            let _ = chat.set_bounds(Rect {
+                position: PhysicalPosition::new((size.width - chat_w) as i32, bar_h as i32).into(),
+                size: PhysicalSize::new(chat_w, below).into(),
+            });
+            let _ = chat.show();
+        } else {
+            let _ = chat.hide();
+        }
     }
 }
 
@@ -174,6 +187,7 @@ fn spawn_url_watch(app: AppHandle) {
         }
         // окно закрыли: режим «вместе» выключается и здесь, и в главном окне
         SHARE.store(false, Ordering::Relaxed);
+        CHAT_OPEN.store(false, Ordering::Relaxed);
         let _ = app.emit_to(EventTarget::webview_window("main"), "ytb-closed", ());
     });
 }
@@ -196,18 +210,22 @@ fn build_window(app: &AppHandle, start: Url) -> Result<(), String> {
 
     let app_title = app.clone();
     let app_popup = app.clone();
-    let view = WebviewBuilder::new(VIEW, WebviewUrl::External(start))
+    let view_url = if is_start_page(&start) { WebviewUrl::App("start.html".into()) } else { WebviewUrl::External(start) };
+    let view = WebviewBuilder::new(VIEW, view_url)
         .on_navigation(|u| {
-            // обычные сайты — здесь; mailto:, tel: и прочие схемы — системе
-            if web_url(u) || matches!(u.scheme(), "about" | "blob" | "data") {
+            // обычные сайты — здесь; служебные адреса приложения — нельзя;
+            // mailto:, tel: и прочие схемы — системе
+            if nav_allowed(u) || matches!(u.scheme(), "about" | "blob") {
                 return true;
             }
-            let _ = open::that(u.as_str());
+            if !web_url(u) && u.scheme() != "tauri" {
+                let _ = open::that(u.as_str());
+            }
             false
         })
         .on_new_window(move |u, _| {
             // ссылки «в новой вкладке» открываем в этом же окне
-            if web_url(&u) {
+            if nav_allowed(&u) {
                 let app = app_popup.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Some(v) = app.get_webview(VIEW) {
@@ -224,12 +242,16 @@ fn build_window(app: &AppHandle, start: Url) -> Result<(), String> {
             }
             emit_current(&app_title);
         });
-    win.add_child(
+    if let Err(e) = win.add_child(
         view,
         LogicalPosition::new(0.0, BAR_H),
         LogicalSize::new(size.width, (size.height - BAR_H).max(100.0)),
-    )
-    .map_err(|e| e.to_string())?;
+    ) {
+        // без страницы окно бесполезно — закрываем, чтобы следующее открытие
+        // создало его заново, и показываем причину
+        let _ = win.close();
+        return Err(format!("не удалось открыть страницу: {e}"));
+    }
 
     let app_ev = app.clone();
     win.on_window_event(move |e| match e {
@@ -250,7 +272,7 @@ pub async fn ytb_open(app: AppHandle, url: Option<String>, remote: Option<bool>)
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .map(input_to_url)
-        .filter(web_url);
+        .filter(nav_allowed);
     if remote.unwrap_or(false) {
         if let Some(u) = &target {
             mark_remote(u);
@@ -272,7 +294,11 @@ pub async fn ytb_open(app: AppHandle, url: Option<String>, remote: Option<bool>)
 #[tauri::command]
 pub async fn ytb_go(app: AppHandle, input: String) -> Result<(), String> {
     let view = app.get_webview(VIEW).ok_or("окно браузера закрыто")?;
-    view.navigate(input_to_url(&input)).map_err(|e| e.to_string())
+    let u = input_to_url(&input);
+    if !nav_allowed(&u) {
+        return Err("этот адрес нельзя открыть".into());
+    }
+    view.navigate(u).map_err(|e| e.to_string())
 }
 
 /// Кнопки панели. В страницу уходят только фиксированные строки
@@ -363,7 +389,7 @@ pub async fn ytb_remote_nav(app: AppHandle, url: String, by: String) -> Result<b
     }
     let Some(view) = app.get_webview(VIEW) else { return Ok(false) };
     let u = Url::parse(&url).map_err(|e| e.to_string())?;
-    if !web_url(&u) {
+    if !nav_allowed(&u) {
         return Err("неподдерживаемый адрес".into());
     }
     if view.url().map(|cur| cur == u).unwrap_or(false) {
@@ -409,14 +435,54 @@ pub async fn ytb_chat_send(app: AppHandle, text: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Новое сообщение звонка — показать в панели браузера.
+/// Новое сообщение звонка: в открытую панель чата, иначе — всплывашка в панели браузера.
 #[tauri::command]
-pub async fn ytb_chat_show(app: AppHandle, from: String, text: String) -> Result<(), String> {
+pub async fn ytb_chat_show(app: AppHandle, from: String, text: String, mine: Option<bool>) -> Result<(), String> {
     if app.get_webview(BAR).is_none() {
         return Ok(());
     }
-    app.emit_to(EventTarget::webview(BAR), "ytb-chat", serde_json::json!({ "from": from, "text": text }))
-        .map_err(|e| e.to_string())
+    let payload = serde_json::json!({ "from": from, "text": text, "mine": mine.unwrap_or(false) });
+    if CHAT_OPEN.load(Ordering::Relaxed) && app.get_webview(CHAT).is_some() {
+        return app.emit_to(EventTarget::webview(CHAT), "ytb-chat", payload).map_err(|e| e.to_string());
+    }
+    if mine.unwrap_or(false) {
+        return Ok(());
+    }
+    app.emit_to(EventTarget::webview(BAR), "ytb-chat", payload).map_err(|e| e.to_string())
+}
+
+/// Открыть/закрыть панель чата справа (во всю высоту окна под панелью).
+#[tauri::command]
+pub async fn ytb_chat_toggle(app: AppHandle, open: Option<bool>) -> Result<bool, String> {
+    let win = app.get_window(WIN).ok_or("окно браузера закрыто")?;
+    let on = open.unwrap_or(!CHAT_OPEN.load(Ordering::Relaxed));
+    if on && app.get_webview(CHAT).is_none() {
+        let chat = WebviewBuilder::new(CHAT, WebviewUrl::App("yt-chat.html".into()));
+        win.add_child(chat, LogicalPosition::new(0.0, BAR_H), LogicalSize::new(CHAT_W, 300.0))
+            .map_err(|e| e.to_string())?;
+    }
+    CHAT_OPEN.store(on, Ordering::Relaxed);
+    layout(&app);
+    let _ = app.emit_to(EventTarget::webview(BAR), "ytb-chat-state", serde_json::json!({ "open": on }));
+    if on {
+        let _ = app.emit_to(EventTarget::webview_window("main"), "ytb-chat-request", ());
+    }
+    Ok(on)
+}
+
+/// Панель чата просит историю — главное окно ответит ytb_chat_history.
+#[tauri::command]
+pub async fn ytb_chat_request(app: AppHandle) -> Result<(), String> {
+    app.emit_to(EventTarget::webview_window("main"), "ytb-chat-request", ()).map_err(|e| e.to_string())
+}
+
+/// История чата звонка от главного окна — в панель чата.
+#[tauri::command]
+pub async fn ytb_chat_history(app: AppHandle, data: serde_json::Value) -> Result<(), String> {
+    if app.get_webview(CHAT).is_none() {
+        return Ok(());
+    }
+    app.emit_to(EventTarget::webview(CHAT), "ytb-chat-history", data).map_err(|e| e.to_string())
 }
 
 /// Ответ главного окна для панели (например, «сначала начните звонок»).

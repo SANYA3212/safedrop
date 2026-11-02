@@ -5072,6 +5072,7 @@ async function wtChatSend(text) {
       : await invoke("send_chat", { peerIp: key, ...payload });
     if (pushMsg(m)) { if (key === curKey()) renderChat(); }
     wtRenderChat();
+    if (!isDemo) invoke("ytb_chat_show", { from: "Ты", text, mine: true }).catch(() => {});
     return true;
   } catch (e) { toast("Не отправлено: " + e, true); return false; }
 }
@@ -5079,7 +5080,22 @@ function wtChatIncoming(m, key) {
   if (!m || m.from_me || key !== wtChatKey()) return;
   if (wtChatOpen()) wtRenderChat();
   else if (wtIsWatching() && !wtState.bg) { wtChatUnread++; wtChatBadge(); }
-  if (!isDemo) invoke("ytb_chat_show", { from: m.from_nick || "", text: m.text || "🖼 картинка" }).catch(() => {});
+  if (!isDemo) invoke("ytb_chat_show", { from: m.from_nick || "", text: m.text || "🖼 картинка", mine: false }).catch(() => {});
+}
+// Панель чата в окне браузера просит историю текущего звонка.
+async function wtChatSendHistory() {
+  const key = wtChatKey();
+  let title = "нет звонка", messages = [];
+  if (key) {
+    await wtChatEnsure(key);
+    if (groupCall) title = groupCall.name || groups.find((g) => g.id === groupCall.id)?.name || "Группа";
+    else { const p = callPeerByIp(currentCall); title = p ? dispName(p) : currentCall; }
+    messages = (chats[key] || []).slice(-80).map((m) => ({
+      from: m.from_nick || "", mine: !!m.from_me, ts: m.ts || "",
+      text: m.text || ((m.images && m.images.length) || m.image ? "🖼 картинка" : m.audio ? "🎵 аудио" : ""),
+    }));
+  }
+  invoke("ytb_chat_history", { data: { inCall: !!key, title, messages } }).catch(() => {});
 }
 
 // ---------- очередь видео ----------
@@ -5560,9 +5576,10 @@ if (typeof listen === "function") {
   listen("ytb-url", (e) => { try { webOnLocalUrl(e.payload || {}); } catch (err) { console.error("ytb-url", err); } }).catch(() => {});
   listen("ytb-share", (e) => { try { webOnShare(!!(e.payload && e.payload.on)); } catch (err) { console.error("ytb-share", err); } }).catch(() => {});
   listen("ytb-media", (e) => { try { webOnLocalMedia(e.payload || {}); } catch (err) { console.error("ytb-media", err); } }).catch(() => {});
+  listen("ytb-chat-request", () => { wtChatSendHistory().catch(() => {}); }).catch(() => {});
   listen("ytb-chat-send", (e) => {
     const text = e.payload && e.payload.text;
-    wtChatSend(text).then((ok) => invoke("ytb_notify", { text: ok ? "Отправлено в чат звонка" : "Не отправлено: нужен звонок", ok }).catch(() => {}));
+    wtChatSend(text).then((ok) => { if (!ok) invoke("ytb_notify", { text: "Не отправлено: нужен звонок", ok: false }).catch(() => {}); });
   }).catch(() => {});
   listen("ytb-closed", () => { webState.share = false; webState.lastSent = ""; }).catch(() => {});
   listen("safedrop-web", (e) => { try { webOnRemote(e.payload || {}); } catch (err) { console.error("safedrop-web", err); } }).catch(() => {});

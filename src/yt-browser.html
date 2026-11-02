@@ -24,6 +24,7 @@
   .share:hover { background: var(--btn); }
   .share.on { border-color: #3fbf6f; background: rgba(63,191,111,.16); color: #b9f5cf; }
   .hidden { display: none !important; }
+  .badge { min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: #ff5c6c; color: #fff; font-size: 10px; line-height: 16px; text-align: center; }
   .chat { flex: 0 1 260px; min-width: 140px; display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px; background: rgba(0,0,0,.35); }
   .chat:focus-within { border-color: var(--accent2); }
   .chat svg { flex: none; width: 15px; height: 15px; fill: var(--muted); }
@@ -49,10 +50,10 @@
     <input id="addr" placeholder="Адрес сайта (reddit.com) или поиск в Google" spellcheck="false" />
   </label>
   <span class="title" id="title"></span>
-  <label class="chat" title="Сообщение в чат звонка">
+  <button class="share" id="b-chat" title="Чат звонка — панель справа">
     <svg viewBox="0 0 24 24"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>
-    <input id="chat" placeholder="Написать в звонок…" maxlength="2000" spellcheck="true" />
-  </label>
+    Чат<span id="chat-badge" class="badge hidden">0</span>
+  </button>
   <button class="share" id="b-share" title="Друзья в звонке видят, что вы открываете, и могут листать вместе с вами">
     <svg viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11A2.99 2.99 0 1 0 15 5c0 .24.04.47.09.7L8.04 9.81a3 3 0 1 0 0 4.38l7.12 4.16c-.05.21-.08.43-.08.65A2.92 2.92 0 1 0 18 16.08z"/></svg>
     <span id="share-text">Листать вместе</span>
@@ -92,7 +93,7 @@
   }
   function applyState(s) {
     const url = (s && s.url) || "";
-    const start = url.startsWith("data:");
+    const start = /^(https?|tauri):\/\/[^/]*localhost\/start\.html/i.test(url);
     if (!editing) addr.value = start ? "" : url;
     titleEl.textContent = start ? "Начальная страница" : (s && s.title) || "";
     titleEl.title = titleEl.textContent;
@@ -125,12 +126,9 @@
     watchBtn.disabled = true;
     invoke("ytb_watch").catch((e) => { notice(String(e)); watchBtn.disabled = false; });
   };
-  const chat = $("chat");
-  chat.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && chat.value.trim()) {
-      invoke("ytb_chat_send", { text: chat.value.trim() }).then(() => { chat.value = ""; }).catch((err) => notice(String(err)));
-    } else if (e.key === "Escape") chat.blur();
-  });
+  let chatOpen = false, unread = 0;
+  function setBadge() { const b = $("chat-badge"); b.textContent = String(unread); b.classList.toggle("hidden", !unread); }
+  $("b-chat").onclick = () => invoke("ytb_chat_toggle", {}).catch((e) => notice(String(e)));
   let msgTimer = null;
   function showMsg(from, text) {
     $("msg-from").textContent = from ? from + ":" : "";
@@ -148,7 +146,16 @@
   if (T && T.event) {
     T.event.listen("ytb-url", (e) => applyState(e.payload));
     T.event.listen("ytb-share", (e) => applyShare(e.payload && e.payload.on));
-    T.event.listen("ytb-chat", (e) => { const p = e.payload || {}; showMsg(String(p.from || ""), String(p.text || "")); });
+    T.event.listen("ytb-chat", (e) => {
+      const p = e.payload || {};
+      showMsg(String(p.from || ""), String(p.text || ""));
+      if (!chatOpen) { unread++; setBadge(); }
+    });
+    T.event.listen("ytb-chat-state", (e) => {
+      chatOpen = !!(e.payload && e.payload.open);
+      $("b-chat").classList.toggle("on", chatOpen);
+      if (chatOpen) { unread = 0; setBadge(); }
+    });
     T.event.listen("ytb-notice", (e) => {
       const p = e.payload || {};
       notice(p.text || "", p.ok);

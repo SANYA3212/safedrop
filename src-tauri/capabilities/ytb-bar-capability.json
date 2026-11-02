@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "ytb-bar-capability",
-  "description": "Панель окна YouTube (локальный yt-browser.html). Сам youtube.com (webview ytb-view) намеренно не получает никаких прав.",
-  "webviews": ["ytb-bar"],
+  "description": "Панель окна браузера (yt-browser.html) и панель чата (yt-chat.html). Сайты (webview ytb-view) намеренно не получают никаких прав.",
+  "webviews": ["ytb-bar", "ytb-chat"],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten"

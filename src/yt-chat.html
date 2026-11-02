@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>Чат звонка — SafeDrop</title>
+<style>
+  :root { --bg: #11151f; --panel: #171c28; --accent: #5b8cff; --accent2: #9b59ff; --text: #eef1f8; --muted: #9aa3b8; --line: rgba(255,255,255,.08); }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font: 13px "Segoe UI", system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; border-left: 1px solid var(--line); }
+  .head { flex: none; display: flex; align-items: center; gap: 8px; padding: 10px 10px 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .head .t { flex: 1; min-width: 0; }
+  .head b { display: block; font-size: 14px; }
+  .head small { display: block; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .x { width: 30px; height: 30px; border: 0; border-radius: 8px; background: transparent; color: var(--text); cursor: pointer; font-size: 16px; }
+  .x:hover { background: rgba(255,255,255,.08); }
+  .list { flex: 1; min-height: 0; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .m { max-width: 92%; padding: 7px 10px; border-radius: 12px; background: #222a3a; align-self: flex-start; word-break: break-word; }
+  .m.me { align-self: flex-end; background: linear-gradient(135deg, #34508f, #5a3f8f); }
+  .m b { display: block; font-size: 11px; color: #9fb7ff; margin-bottom: 2px; }
+  .m.me b { color: #d9ccff; }
+  .m small { display: block; text-align: right; font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .empty { margin: auto; color: var(--muted); text-align: center; padding: 20px; line-height: 1.5; }
+  .row { flex: none; display: flex; gap: 8px; padding: 10px; border-top: 1px solid var(--line); background: var(--panel); }
+  .row textarea { flex: 1; min-width: 0; height: 40px; max-height: 120px; resize: none; background: rgba(0,0,0,.35); border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; color: var(--text); font: inherit; outline: 0; }
+  .row textarea:focus { border-color: var(--accent); }
+  .send { flex: none; width: 40px; border: 0; border-radius: 10px; cursor: pointer; color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent2)); display: inline-flex; align-items: center; justify-content: center; }
+  .send svg { width: 18px; height: 18px; fill: currentColor; }
+  .err { color: #ff9ba0; font-size: 11px; padding: 0 12px 8px; background: var(--panel); }
+</style>
+</head>
+<body>
+<div class="head">
+  <div class="t"><b>Чат звонка</b><small id="who">загрузка…</small></div>
+  <button class="x" id="close" title="Закрыть чат">✕</button>
+</div>
+<div class="list" id="list"><div class="empty">Загрузка…</div></div>
+<div class="err" id="err" hidden></div>
+<div class="row">
+  <textarea id="input" placeholder="Сообщение… (Enter — отправить, Shift+Enter — новая строка)" maxlength="2000"></textarea>
+  <button class="send" id="send" title="Отправить"><svg viewBox="0 0 24 24"><path d="M2 21l21-9L2 3v7l15 2-15 2z"/></svg></button>
+</div>
+<script>
+  const T = window.__TAURI__;
+  const invoke = (cmd, args) => (T && T.core ? T.core.invoke(cmd, args || {}) : Promise.reject("нет Tauri"));
+  const $ = (id) => document.getElementById(id);
+  const list = $("list"), input = $("input");
+
+  function item(m) {
+    const d = document.createElement("div");
+    d.className = "m" + (m.mine ? " me" : "");
+    const b = document.createElement("b"); b.textContent = m.mine ? "Ты" : (m.from || "?");
+    const t = document.createElement("div"); t.textContent = m.text || "";
+    d.append(b, t);
+    if (m.ts) { const s = document.createElement("small"); s.textContent = m.ts; d.append(s); }
+    return d;
+  }
+  function atBottom() { return list.scrollHeight - list.scrollTop - list.clientHeight < 60; }
+  function render(data) {
+    $("who").textContent = data.title || "";
+    list.innerHTML = "";
+    const msgs = Array.isArray(data.messages) ? data.messages : [];
+    if (!data.inCall) {
+      list.innerHTML = '<div class="empty">Чат работает во время звонка.<br>Начните звонок в SafeDrop.</div>';
+      return;
+    }
+    if (!msgs.length) list.innerHTML = '<div class="empty">Сообщений пока нет — напишите первым.</div>';
+    for (const m of msgs) list.append(item(m));
+    list.scrollTop = list.scrollHeight;
+  }
+  function add(m) {
+    const stick = atBottom();
+    list.querySelector(".empty")?.remove();
+    list.append(item(m));
+    if (stick || m.mine) list.scrollTop = list.scrollHeight;
+  }
+  function showErr(text) {
+    const e = $("err");
+    e.textContent = text; e.hidden = !text;
+    if (text) setTimeout(() => { e.hidden = true; }, 4000);
+  }
+  async function send() {
+    const text = input.value.trim();
+    if (!text) return;
+    try { await invoke("ytb_chat_send", { text }); input.value = ""; }
+    catch (e) { showErr(String(e)); }
+  }
+  $("send").onclick = send;
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  $("close").onclick = () => invoke("ytb_chat_toggle", { open: false }).catch(() => {});
+
+  if (T && T.event) {
+    T.event.listen("ytb-chat-history", (e) => render(e.payload || {}));
+    T.event.listen("ytb-chat", (e) => add(e.payload || {}));
+    T.event.listen("ytb-notice", (e) => { const p = e.payload || {}; if (!p.ok) showErr(p.text || ""); });
+    invoke("ytb_chat_request").catch(() => {});
+    // вернулись в панель — подтянуть сообщения, отправленные из главного окна
+    window.addEventListener("focus", () => invoke("ytb_chat_request").catch(() => {}));
+    setTimeout(() => input.focus(), 100);
+  } else {
+    render({ inCall: true, title: "демо", messages: [{ from: "Alex", text: "Привет!" }, { mine: true, text: "Смотрим вместе?" }] });
+  }
+</script>
+</body>
+</html>
