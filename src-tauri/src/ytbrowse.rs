@@ -10,11 +10,14 @@
 //! главное окно отправляет переходы участникам звонка, а чужие переходы
 //! применяет через `ytb_remote_nav`. Чтобы не было эха, адрес, открытый по
 //! команде участника, помечается в событии как `remote`.
+//!
+//! Крестик окно не уничтожает, а прячет (`shut`): повторное открытие —
+//! мгновенное, без создания нового WebView2.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
-use tauri::webview::{NewWindowResponse, WebviewBuilder};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::webview::{NewWindowResponse, PageLoadEvent, Webview, WebviewBuilder};
 use tauri::window::WindowBuilder;
 use tauri::{
     AppHandle, Emitter, EventTarget, LogicalPosition, LogicalSize, Manager, PhysicalPosition,
@@ -30,15 +33,35 @@ const CHAT_W: f64 = 340.0;
 /// Открыта ли панель чата справа.
 static CHAT_OPEN: AtomicBool = AtomicBool::new(false);
 /// Сколько после перехода по команде участника считать изменения адреса
-/// (редиректы сайта) чужими и не отправлять обратно.
-const REMOTE_QUIET: Duration = Duration::from_millis(2500);
+/// (редиректы сайта) чужими и не отправлять обратно — если пользователь
+/// за это время ничего не нажимал на странице.
+const REMOTE_QUIET: Duration = Duration::from_secs(6);
+/// Окно браузера показано (спрятанное крестиком считается закрытым).
+static OPEN: AtomicBool = AtomicBool::new(false);
+/// Пользователь сам выключил «Листать вместе»: чужие переходы не подхватываем.
+static OPT_OUT: AtomicBool = AtomicBool::new(false);
+/// Время последнего клика/нажатия клавиши на странице (мс, как Date.now()).
+static LAST_INPUT: AtomicU64 = AtomicU64::new(0);
 
 /// Последний заголовок страницы (приходит из on_document_title_changed).
 static TITLE: Mutex<String> = Mutex::new(String::new());
 /// Режим «Листать вместе».
 static SHARE: AtomicBool = AtomicBool::new(false);
-/// Последний адрес, открытый по команде участника, и когда.
-static REMOTE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+/// Последний адрес, открытый по команде участника, и когда (Instant и мс).
+static REMOTE: Mutex<Option<(String, Instant, u64)>> = Mutex::new(None);
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Страница сайта, если окно браузера открыто.
+fn open_view(app: &AppHandle) -> Option<Webview> {
+    if OPEN.load(Ordering::Relaxed) {
+        app.get_webview(VIEW)
+    } else {
+        None
+    }
+}
 
 fn web_url(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
@@ -97,13 +120,21 @@ fn current_title() -> String {
     TITLE.lock().map(|t| t.clone()).unwrap_or_default()
 }
 
+/// Адрес открыт по команде участника (или это редирект после неё)? После
+/// любого клика пользователя на странице — уже нет: это его собственный переход.
 fn is_remote(url: &str) -> bool {
     REMOTE
         .lock()
         .ok()
         .and_then(|r| r.clone())
-        .map(|(u, at)| u == url || at.elapsed() < REMOTE_QUIET)
+        .map(|(u, at, ms)| LAST_INPUT.load(Ordering::Relaxed) <= ms && (u == url || at.elapsed() < REMOTE_QUIET))
         .unwrap_or(false)
+}
+
+fn clear_remote() {
+    if let Ok(mut r) = REMOTE.lock() {
+        *r = None;
+    }
 }
 
 fn state_json(url: &str) -> serde_json::Value {
@@ -128,7 +159,7 @@ fn emit_current(app: &AppHandle) {
 
 fn mark_remote(url: &Url) {
     if let Ok(mut r) = REMOTE.lock() {
-        *r = Some((url.to_string(), Instant::now()));
+        *r = Some((url.to_string(), Instant::now(), now_ms()));
     }
 }
 
@@ -174,6 +205,11 @@ fn spawn_url_watch(app: AppHandle) {
         loop {
             tokio::time::sleep(Duration::from_millis(600)).await;
             let Some(view) = app.get_webview(VIEW) else { break };
+            if SHARE.load(Ordering::Relaxed) {
+                // в режиме «вместе» адрес отслеживает spawn_agent_watch
+                last.clear();
+                continue;
+            }
             let url = match view.url() {
                 Ok(u) => u.to_string(),
                 Err(_) => continue,
@@ -210,8 +246,15 @@ fn build_window(app: &AppHandle, start: Url) -> Result<(), String> {
 
     let app_title = app.clone();
     let app_popup = app.clone();
+    let app_load = app.clone();
     let view_url = if is_start_page(&start) { WebviewUrl::App("start.html".into()) } else { WebviewUrl::External(start) };
     let view = WebviewBuilder::new(VIEW, view_url)
+        .initialization_script(AGENT_JS)
+        .on_page_load(move |_, p| {
+            // полоска загрузки в панели
+            let on = matches!(p.event(), PageLoadEvent::Started);
+            let _ = app_load.emit_to(EventTarget::webview(BAR), "ytb-loading", serde_json::json!({ "on": on }));
+        })
         .on_navigation(|u| {
             // обычные сайты — здесь; служебные адреса приложения — нельзя;
             // mailto:, tel: и прочие схемы — системе
@@ -256,12 +299,60 @@ fn build_window(app: &AppHandle, start: Url) -> Result<(), String> {
     let app_ev = app.clone();
     win.on_window_event(move |e| match e {
         WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => layout(&app_ev),
+        WindowEvent::CloseRequested { api, .. } => {
+            // не уничтожаем: следующее открытие будет мгновенным
+            api.prevent_close();
+            shut(&app_ev);
+        }
         _ => {}
     });
+    OPEN.store(true, Ordering::Relaxed);
     layout(app);
     spawn_url_watch(app.clone());
     spawn_media_watch(app.clone());
+    spawn_agent_watch(app.clone());
     Ok(())
+}
+
+/// «Закрыть» окно браузера: спрятать, остановить страницу (уходим на
+/// стартовую — звук и видео замолкают), выключить «вместе» и чат.
+fn shut(app: &AppHandle) {
+    OPEN.store(false, Ordering::Relaxed);
+    SHARE.store(false, Ordering::Relaxed);
+    CHAT_OPEN.store(false, Ordering::Relaxed);
+    OPT_OUT.store(false, Ordering::Relaxed);
+    clear_remote();
+    if let Ok(mut m) = MEDIA.lock() {
+        *m = MediaSync::default();
+    }
+    if let Some(w) = app.get_window(WIN) {
+        let _ = w.hide();
+    }
+    if let Some(v) = app.get_webview(VIEW) {
+        let _ = v.navigate(start_url());
+    }
+    layout(app);
+    let _ = app.emit_to(EventTarget::webview(BAR), "ytb-share", serde_json::json!({ "on": false }));
+    let _ = app.emit_to(EventTarget::webview(BAR), "ytb-chat-state", serde_json::json!({ "open": false }));
+    let _ = app.emit_to(EventTarget::webview(BAR), "ytb-people", serde_json::json!([]));
+    let _ = app.emit_to(EventTarget::webview_window("main"), "ytb-closed", ());
+}
+
+/// Закрыть окно браузера (кнопка «Закрыть у всех» у участника звонка).
+/// Возвращает, было ли окно открыто.
+#[tauri::command]
+pub async fn ytb_close(app: AppHandle) -> Result<bool, String> {
+    let was = OPEN.load(Ordering::Relaxed);
+    if app.get_window(WIN).is_some() {
+        shut(&app);
+    }
+    Ok(was)
+}
+
+/// Кнопка панели «Закрыть у всех»: главное окно разошлёт команду и закроет наше.
+#[tauri::command]
+pub async fn ytb_close_all(app: AppHandle) -> Result<(), String> {
+    app.emit_to(EventTarget::webview_window("main"), "ytb-close-all", ()).map_err(|e| e.to_string())
 }
 
 /// Открыть окно (или показать уже открытое). `remote`: адрес пришёл от
@@ -282,6 +373,8 @@ pub async fn ytb_open(app: AppHandle, url: Option<String>, remote: Option<bool>)
         if let (Some(u), Some(view)) = (target, app.get_webview(VIEW)) {
             view.navigate(u).map_err(|e| e.to_string())?;
         }
+        OPEN.store(true, Ordering::Relaxed);
+        layout(&app);
         let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
@@ -298,6 +391,7 @@ pub async fn ytb_go(app: AppHandle, input: String) -> Result<(), String> {
     if !nav_allowed(&u) {
         return Err("этот адрес нельзя открыть".into());
     }
+    clear_remote();
     view.navigate(u).map_err(|e| e.to_string())
 }
 
@@ -306,6 +400,7 @@ pub async fn ytb_go(app: AppHandle, input: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn ytb_nav(app: AppHandle, action: String) -> Result<(), String> {
     let view = app.get_webview(VIEW).ok_or("окно браузера закрыто")?;
+    clear_remote();
     match action.as_str() {
         "back" => view.eval("history.back()"),
         "forward" => view.eval("history.forward()"),
@@ -369,8 +464,12 @@ pub async fn ytb_pause_media(app: AppHandle) -> Result<(), String> {
 
 /// Включить/выключить «Листать вместе». Главное окно получает `ytb-share`
 /// и заново текущий адрес, чтобы сразу показать участникам эту страницу.
+/// `manual` — кнопка в панели: выключил сам — чужие переходы не подхватываем.
 #[tauri::command]
-pub async fn ytb_set_share(app: AppHandle, on: bool) -> Result<(), String> {
+pub async fn ytb_set_share(app: AppHandle, on: bool, manual: Option<bool>) -> Result<(), String> {
+    if manual.unwrap_or(false) {
+        OPT_OUT.store(!on, Ordering::Relaxed);
+    }
     SHARE.store(on, Ordering::Relaxed);
     let _ = app.emit_to(EventTarget::webview_window("main"), "ytb-share", serde_json::json!({ "on": on }));
     let _ = app.emit_to(EventTarget::webview(BAR), "ytb-share", serde_json::json!({ "on": on }));
@@ -380,29 +479,38 @@ pub async fn ytb_set_share(app: AppHandle, on: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Переход по команде участника. Возвращает false, если окно закрыто или
-/// «Листать вместе» выключено — тогда главное окно предлагает присоединиться.
+/// Переход по команде участника. Окно открыто, а «Листать вместе» выключено
+/// не вручную (друг открыл браузер сам) — включаем и присоединяемся.
+/// Возвращает false, если окно закрыто или пользователь сам выключил режим —
+/// тогда главное окно предлагает присоединиться.
 #[tauri::command]
 pub async fn ytb_remote_nav(app: AppHandle, url: String, by: String) -> Result<bool, String> {
-    if !SHARE.load(Ordering::Relaxed) {
-        return Ok(false);
-    }
-    let Some(view) = app.get_webview(VIEW) else { return Ok(false) };
+    let Some(view) = open_view(&app) else { return Ok(false) };
     let u = Url::parse(&url).map_err(|e| e.to_string())?;
     if !nav_allowed(&u) {
         return Err("неподдерживаемый адрес".into());
     }
-    if view.url().map(|cur| cur == u).unwrap_or(false) {
-        return Ok(true);
+    let joined = !SHARE.load(Ordering::Relaxed);
+    if joined {
+        if OPT_OUT.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        SHARE.store(true, Ordering::Relaxed);
+        // auto: главное окно не рассылает в ответ свою старую страницу
+        let on = serde_json::json!({ "on": true, "auto": true });
+        let _ = app.emit_to(EventTarget::webview_window("main"), "ytb-share", on.clone());
+        let _ = app.emit_to(EventTarget::webview(BAR), "ytb-share", on);
     }
-    mark_remote(&u);
-    view.navigate(u).map_err(|e| e.to_string())?;
     let who = if by.trim().is_empty() { "Участник".to_string() } else { by };
-    let _ = app.emit_to(
-        EventTarget::webview(BAR),
-        "ytb-notice",
-        serde_json::json!({ "text": format!("{who} открыл страницу"), "ok": true }),
-    );
+    let same = view.url().map(|cur| cur == u).unwrap_or(false);
+    if !same {
+        mark_remote(&u);
+        view.navigate(u).map_err(|e| e.to_string())?;
+    }
+    if joined || !same {
+        let text = if joined { format!("{who} листает — вы присоединились") } else { format!("{who} открыл страницу") };
+        let _ = app.emit_to(EventTarget::webview(BAR), "ytb-notice", serde_json::json!({ "text": text, "ok": true }));
+    }
     Ok(true)
 }
 
@@ -438,7 +546,7 @@ pub async fn ytb_chat_send(app: AppHandle, text: String) -> Result<(), String> {
 /// Новое сообщение звонка: в открытую панель чата, иначе — всплывашка в панели браузера.
 #[tauri::command]
 pub async fn ytb_chat_show(app: AppHandle, from: String, text: String, mine: Option<bool>) -> Result<(), String> {
-    if app.get_webview(BAR).is_none() {
+    if !OPEN.load(Ordering::Relaxed) || app.get_webview(BAR).is_none() {
         return Ok(());
     }
     let payload = serde_json::json!({ "from": from, "text": text, "mine": mine.unwrap_or(false) });
@@ -626,7 +734,7 @@ pub async fn ytb_media_apply(app: AppHandle, action: String, t: f64, url: String
     if !SHARE.load(Ordering::Relaxed) {
         return Ok(false);
     }
-    let view = app.get_webview(VIEW).ok_or("окно браузера закрыто")?;
+    let Some(view) = open_view(&app) else { return Ok(false) };
     let cur = view.url().map_err(|e| e.to_string())?.to_string();
     if url_no_fragment(&cur) != url_no_fragment(&url) {
         return Ok(false);
@@ -657,4 +765,250 @@ pub async fn ytb_media_apply(app: AppHandle, action: String, t: f64, url: String
         let _ = app.emit_to(EventTarget::webview(BAR), "ytb-notice", serde_json::json!({ "text": format!("{who} {what}"), "ok": true }));
     }
     Ok(true)
+}
+
+// ---------- «Листать вместе»: курсоры и прокрутка ----------
+//
+// В каждую страницу окна встраивается маленький скрипт (AGENT_JS): он
+// запоминает положение мыши, прокрутку и время последнего клика, а также
+// рисует курсоры участников. IPC у страницы нет — Rust сам читает её
+// состояние (spawn_agent_watch) и отдаёт главному окну `ytb-cursor` /
+// `ytb-scroll`; чужие курсоры и прокрутку применяют ytb_remote_cursor /
+// ytb_remote_scroll. Имена участников в страницу не попадают — только
+// цвет; кто какого цвета, видно в панели браузера.
+
+/// Цвета курсоров (тот же список — WEB_COLORS в app.js и в yt-browser.html).
+const PALETTE: [&str; 8] = ["#3fbf6f", "#ff5c6c", "#ffd23f", "#4aa8ff", "#b36bff", "#ff9f43", "#ff6bcb", "#2ee6d6"];
+const AGENT_TICK: Duration = Duration::from_millis(120);
+const CURSOR_EVERY: Duration = Duration::from_millis(150);
+const SCROLL_EVERY: Duration = Duration::from_millis(200);
+
+/// Скрипт страницы. Без innerHTML (YouTube запрещает его через Trusted Types),
+/// курсоры — в закрытом shadow root поверх страницы, мышь сквозь них проходит.
+const AGENT_JS: &str = r#"(function(){
+if (window.top !== window || window.__sdA) return;
+var st = {i:0, x:-1, y:-1, t:0, u:0, d:false, ap:0, ws:0};
+var now = function(){ return Date.now(); };
+var opt = {capture:true, passive:true};
+var se = function(){ return document.scrollingElement || document.documentElement; };
+addEventListener('pointerdown', function(){ st.i = now(); st.d = true; }, opt);
+addEventListener('pointerup', function(){ st.d = false; }, opt);
+addEventListener('keydown', function(){ st.i = now(); st.ws = now(); }, opt);
+addEventListener('wheel', function(){ st.ws = now(); }, opt);
+addEventListener('touchmove', function(){ st.ws = now(); }, opt);
+addEventListener('mousemove', function(e){ st.x = e.clientX; st.y = e.clientY; st.t = now(); }, opt);
+addEventListener('mouseout', function(e){ if (!e.relatedTarget) { st.x = -1; st.t = now(); } }, opt);
+var host = null, root = null, curs = {};
+function place(el){ var e = se(), sh = e ? e.scrollHeight : innerHeight; el.style.transform = 'translate(' + (el._x * innerWidth) + 'px,' + (el._y * sh - scrollY) + 'px)'; }
+addEventListener('scroll', function(){
+  var n = now();
+  for (var k in curs) place(curs[k]);
+  if (n - st.ap < 300) return;
+  if (st.d || n - st.ws < 800) st.u = n;
+}, opt);
+function ensure(){
+  if (host && host.isConnected) return true;
+  var d = document.documentElement; if (!d) return false;
+  host = document.createElement('div');
+  host.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;overflow:visible;z-index:2147483647;pointer-events:none';
+  root = host.attachShadow({mode:'closed'});
+  curs = {};
+  d.appendChild(host);
+  return true;
+}
+function arrow(c){
+  var ns = 'http://www.w3.org/2000/svg', el = document.createElement('div');
+  el.style.cssText = 'position:fixed;left:0;top:0;width:22px;height:22px;pointer-events:none;transition:transform .16s linear;will-change:transform;filter:drop-shadow(0 1px 2px rgba(0,0,0,.55))';
+  var svg = document.createElementNS(ns, 'svg'); svg.setAttribute('width', '22'); svg.setAttribute('height', '22'); svg.setAttribute('viewBox', '0 0 24 24');
+  var p = document.createElementNS(ns, 'path'); p.setAttribute('d', 'M4 2l16 9-7 2-3 7z'); p.setAttribute('fill', c); p.setAttribute('stroke', '#fff'); p.setAttribute('stroke-width', '1.6'); p.setAttribute('stroke-linejoin', 'round');
+  svg.appendChild(p); el.appendChild(svg); return el;
+}
+function def(n, f){ try { Object.defineProperty(window, n, {value: f}); } catch (e) {} }
+def('__sdA', function(){ var e = se(); return {i:st.i, x:st.x, y:st.y, t:st.t, u:st.u, sy:scrollY, sh:e ? e.scrollHeight : 0, vw:innerWidth, vh:innerHeight}; });
+def('__sdCur', function(id, c, fx, fy){
+  if (!ensure()) return;
+  var el = curs[id];
+  if (fx < 0) { if (el) { el.remove(); delete curs[id]; } return; }
+  if (!el) { el = arrow(c); root.appendChild(el); curs[id] = el; }
+  el._x = fx; el._y = fy; el._t = now(); place(el);
+});
+def('__sdScroll', function(y, h){
+  var e = se(); if (!e) return;
+  var sh = e.scrollHeight, top = (h > 0 && Math.abs(sh - h) / h > 0.1) ? y / h * sh : y;
+  st.ap = now();
+  scrollTo({top: top, behavior: 'instant'});
+});
+setInterval(function(){ var n = now(); for (var k in curs) { if (n - curs[k]._t > 6000) { curs[k].remove(); delete curs[k]; } } }, 2000);
+})();"#;
+
+const AGENT_READ_JS: &str = "(window.__sdA?window.__sdA():null)";
+
+struct AgentRead {
+    input: f64,
+    x: f64,
+    y: f64,
+    t: f64,
+    user_scroll: f64,
+    sy: f64,
+    sh: f64,
+    vw: f64,
+}
+
+/// Ответ страницы: берём только числа и проверяем их.
+fn parse_agent(raw: &str) -> Option<AgentRead> {
+    let mut v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if let serde_json::Value::String(s) = &v {
+        v = serde_json::from_str(s).ok()?;
+    }
+    let n = |k: &str| v.get(k).and_then(|x| x.as_f64()).filter(|x| x.is_finite());
+    Some(AgentRead {
+        input: n("i")?,
+        x: n("x")?,
+        y: n("y")?,
+        t: n("t")?,
+        user_scroll: n("u")?,
+        sy: n("sy")?.max(0.0),
+        sh: n("sh")?.max(0.0),
+        vw: n("vw")?,
+    })
+}
+
+#[derive(Default)]
+struct AgentState {
+    url: String,
+    t: f64,
+    cursor_on: bool,
+    cursor_at: Option<Instant>,
+    sy: f64,
+    scroll_at: Option<Instant>,
+}
+
+fn agent_step(app: &AppHandle, s: &mut AgentState, url: &str, a: Option<AgentRead>) {
+    if let Some(a) = &a {
+        if a.input > 0.0 {
+            LAST_INPUT.fetch_max(a.input as u64, Ordering::Relaxed);
+        }
+    }
+    // адрес — уже после отметки клика: переход по ссылке не сочтём чужим
+    if url != s.url {
+        s.url = url.to_string();
+        s.cursor_on = false;
+        emit_state(app, url);
+    }
+    let Some(a) = a else { return };
+    if !url.starts_with("http") {
+        return;
+    }
+    let now = Instant::now();
+    let main = EventTarget::webview_window("main");
+    if a.t != s.t && s.cursor_at.map(|t| now.duration_since(t) >= CURSOR_EVERY).unwrap_or(true) {
+        s.t = a.t;
+        let inside = a.x >= 0.0 && a.vw > 0.0 && a.sh > 0.0;
+        if inside || s.cursor_on {
+            let (x, y) = if inside { ((a.x / a.vw).clamp(0.0, 1.0), ((a.y + a.sy) / a.sh).clamp(0.0, 1.0)) } else { (-1.0, -1.0) };
+            s.cursor_on = inside;
+            s.cursor_at = Some(now);
+            let _ = app.emit_to(main.clone(), "ytb-cursor", serde_json::json!({ "x": x, "y": y, "url": url }));
+        }
+    }
+    let user_recent = a.user_scroll > 0.0 && (now_ms() as f64 - a.user_scroll) < 1500.0;
+    if user_recent && (a.sy - s.sy).abs() >= 4.0 && s.scroll_at.map(|t| now.duration_since(t) >= SCROLL_EVERY).unwrap_or(true) {
+        s.sy = a.sy;
+        s.scroll_at = Some(now);
+        let _ = app.emit_to(main, "ytb-scroll", serde_json::json!({ "y": a.sy, "h": a.sh, "url": url }));
+    }
+}
+
+/// В режиме «вместе» 8 раз в секунду читаем страницу: адрес, мышь, прокрутку.
+fn spawn_agent_watch(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut s = AgentState::default();
+        loop {
+            tokio::time::sleep(AGENT_TICK).await;
+            let Some(view) = app.get_webview(VIEW) else { break };
+            if !SHARE.load(Ordering::Relaxed) || !OPEN.load(Ordering::Relaxed) {
+                s = AgentState::default();
+                continue;
+            }
+            while rx.try_recv().is_ok() {} // запоздавшие ответы
+            let reply = tx.clone();
+            if view.eval_with_callback(AGENT_READ_JS, move |raw| { let _ = reply.send(raw); }).is_err() {
+                continue;
+            }
+            let raw = match tokio::time::timeout(Duration::from_millis(600), rx.recv()).await {
+                Ok(Some(r)) => r,
+                _ => continue,
+            };
+            let Ok(url) = view.url().map(|u| u.to_string()) else { continue };
+            agent_step(&app, &mut s, &url, parse_agent(&raw));
+        }
+    });
+}
+
+fn same_page(view: &Webview, url: &str) -> bool {
+    view.url().map(|u| url_no_fragment(u.as_str()) == url_no_fragment(url)).unwrap_or(false)
+}
+
+/// Курсор участника (`slot` — номер цвета). x < 0 — убрать курсор.
+#[tauri::command]
+pub async fn ytb_remote_cursor(app: AppHandle, slot: usize, x: f64, y: f64, url: String) -> Result<(), String> {
+    if !SHARE.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let Some(view) = open_view(&app) else { return Ok(()) };
+    let color = PALETTE.get(slot).ok_or("bad slot")?;
+    if !x.is_finite() || !y.is_finite() {
+        return Err("bad position".into());
+    }
+    // на другой странице курсор не показываем
+    let (x, y) = if x >= 0.0 && same_page(&view, &url) { (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)) } else { (-1.0, -1.0) };
+    view.eval(format!("window.__sdCur&&window.__sdCur({slot},'{color}',{x},{y})")).map_err(|e| e.to_string())
+}
+
+/// Прокрутка участника: y — отступ сверху, h — высота его страницы.
+#[tauri::command]
+pub async fn ytb_remote_scroll(app: AppHandle, y: f64, h: f64, url: String) -> Result<(), String> {
+    if !SHARE.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let Some(view) = open_view(&app) else { return Ok(()) };
+    let ok = |v: f64| v.is_finite() && (0.0..=50_000_000.0).contains(&v);
+    if !ok(y) || !ok(h) {
+        return Err("bad scroll".into());
+    }
+    if !same_page(&view, &url) {
+        return Ok(());
+    }
+    view.eval(format!("window.__sdScroll&&window.__sdScroll({y},{h})")).map_err(|e| e.to_string())
+}
+
+/// Кто листает вместе и каким цветом — для панели браузера.
+#[tauri::command]
+pub async fn ytb_people(app: AppHandle, data: serde_json::Value) -> Result<(), String> {
+    if app.get_webview(BAR).is_none() {
+        return Ok(());
+    }
+    app.emit_to(EventTarget::webview(BAR), "ytb-people", data).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_reply_is_validated() {
+        let ok = r#"{"i":1,"x":10,"y":20,"t":3,"u":0,"sy":100,"sh":2000,"vw":800,"vh":600}"#;
+        let a = parse_agent(ok).expect("parsed");
+        assert_eq!(a.sy, 100.0);
+        assert!(parse_agent("null").is_none());
+        assert!(parse_agent(r#"{"i":"x"}"#).is_none());
+    }
+
+    #[test]
+    fn app_hosts_are_blocked() {
+        assert!(!nav_allowed(&Url::parse("http://ipc.localhost/x").unwrap()));
+        assert!(nav_allowed(&Url::parse("https://www.youtube.com/").unwrap()));
+        assert!(nav_allowed(&start_url()));
+    }
 }

@@ -91,10 +91,10 @@ pub(crate) enum Frame {
     #[serde(rename = "chat-typing")]
     ChatTyping { from: String, nickname: String, #[serde(default)] to_group: Option<String> },
     #[serde(rename = "yt-sync")]
-    YtSync { from: String, #[serde(default)] ip: String, #[serde(default)] nickname: String, #[serde(default)] action: String, #[serde(default)] video: String, #[serde(default)] pos: f64, #[serde(default)] paused: bool, #[serde(default)] at: i64, #[serde(default)] seq: i64, #[serde(default)] title: String, #[serde(default)] by: String, #[serde(default)] watching: bool, #[serde(default)] vertical: bool, #[serde(default)] queue: serde_json::Value, #[serde(default)] qv: i64, #[serde(default)] to_group: Option<String> },
+    YtSync { from: String, #[serde(default)] ip: String, #[serde(default)] nickname: String, #[serde(default)] action: String, #[serde(default)] video: String, #[serde(default)] pos: f64, #[serde(default)] paused: bool, #[serde(default)] at: i64, #[serde(default)] seq: i64, #[serde(default)] title: String, #[serde(default)] by: String, #[serde(default)] watching: bool, #[serde(default)] vertical: bool, #[serde(default)] queue: serde_json::Value, #[serde(default)] qv: i64, #[serde(default, rename = "loop")] repeat: String, #[serde(default)] lv: i64, #[serde(default)] to_group: Option<String> },
     /// «Листать вместе»: участник открыл страницу в окне браузера.
     #[serde(rename = "web-sync")]
-    WebSync { from: String, #[serde(default)] action: String, #[serde(default)] url: String, #[serde(default)] title: String, #[serde(default)] at: i64, #[serde(default)] media: String, #[serde(default)] t: f64, #[serde(default)] to_group: Option<String> },
+    WebSync { from: String, #[serde(default)] action: String, #[serde(default)] url: String, #[serde(default)] title: String, #[serde(default)] at: i64, #[serde(default)] media: String, #[serde(default)] t: f64, #[serde(default)] x: f64, #[serde(default)] y: f64, #[serde(default)] h: f64, #[serde(default)] v: i64, #[serde(default)] seq: i64, #[serde(default)] to_group: Option<String> },
     #[serde(other)]
     Unknown,
 }
@@ -848,7 +848,7 @@ pub(crate) async fn process_frame(
             }));
         }
 
-        Frame::YtSync { from, nickname, action, video, pos, paused, at, seq, title, by, watching, vertical, queue, qv, .. } => {
+        Frame::YtSync { from, nickname, action, video, pos, paused, at, seq, title, by, watching, vertical, queue, qv, repeat, lv, .. } => {
             let nm = if nickname.is_empty() { from.clone() } else { nickname.clone() };
             let payload = serde_json::json!({
                 "kind":"yt-sync",
@@ -866,16 +866,19 @@ pub(crate) async fn process_frame(
                 "vertical": vertical,
                 "queue": queue,
                 "qv": qv,
+                "loop": repeat,
+                "lv": lv,
             });
             let _ = app.emit("safedrop-watch", serde_json::json!({"ip": ip, "payload": payload}));
         }
 
-        Frame::WebSync { from, action, url, title, at, media, t, .. } => {
+        Frame::WebSync { from, action, url, title, at, media, t, x, y, h, v, seq, .. } => {
             // «Листать вместе»: только главному окну, решение о переходе — там
             let payload = serde_json::json!({
                 "kind": "web-sync", "from": from, "ip": ip,
                 "action": action, "url": url, "title": title, "at": at,
                 "media": media, "t": t,
+                "x": x, "y": y, "h": h, "v": v, "seq": seq,
             });
             let _ = app.emit_to("main", "safedrop-web", payload);
         }

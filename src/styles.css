@@ -591,6 +591,11 @@ details.set-sec > .card:first-of-type { border-top: 0; }
 .wt-queue-empty { color: var(--muted); font-size: 12px; padding: 6px; }
 .wt-qitem { display: flex; align-items: center; gap: 8px; padding: 4px; border-radius: 8px; }
 .wt-qitem:hover { background: var(--hover); }
+.wt-qitem.cur { background: rgba(91,140,255,.18); box-shadow: inset 3px 0 0 var(--accent); }
+.wt-controls .wt-loop { position: relative; opacity: .55; }
+.wt-controls .wt-loop.on { opacity: 1; color: var(--accent); }
+.wt-loop .wt-loop1 { display: none; position: absolute; right: 3px; bottom: 3px; font-size: 9px; font-weight: 700; line-height: 1; }
+.wt-loop.one .wt-loop1 { display: block; }
 .wt-qitem img { width: 64px; height: 36px; object-fit: cover; border-radius: 6px; background: #000; flex: none; }
 .wt-qitem .wt-qtext { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .wt-qitem .wt-qtext b { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

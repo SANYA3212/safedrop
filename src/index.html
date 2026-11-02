@@ -427,7 +427,7 @@
       <button id="wt-change-cancel">Отмена</button>
     </div>
     <div id="wt-queue" class="wt-menu wt-queue hidden">
-      <div class="wt-queue-head"><b>Очередь</b><small>следующее включится само</small></div>
+      <div class="wt-queue-head"><b>Плейлист</b><small id="wt-queue-mode">следующее включится само</small></div>
       <div id="wt-queue-list"></div>
       <div id="wt-queue-empty" class="wt-queue-empty">Пусто. Добавьте видео ссылкой или кнопкой «В очередь» в браузере.</div>
       <button id="wt-queue-add-link">+ Добавить ссылку</button>
@@ -464,6 +464,7 @@
         <button id="wt-toggle" title="Плей / пауза"><svg class="ic" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></button>
         <button id="wt-back10" title="Назад 10 секунд">−10</button>
         <button id="wt-fwd10" title="Вперёд 10 секунд">+10</button>
+        <button id="wt-loop" class="wt-loop" title="Повтор выключен — нажмите, чтобы сменить"><svg class="ic" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2z"/></svg><span class="wt-loop1">1</span></button>
         <input id="wt-seek" class="wt-seek" type="range" min="0" max="1" step="0.1" value="0" />
         <span id="wt-time" class="wt-time">0:00 / 0:00</span>
         <button id="wt-mute" title="Звук"><svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><path d="M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z"/></svg></button>

@@ -4453,6 +4453,8 @@ const wtState = {
   viewers: {},
   // общая очередь: список видео и её версия (счётчик Лэмпорта, без часов)
   queue: [], qv: 0, advancedAt: 0,
+  // повтор: "off" | "all" (плейлист по кругу) | "one" (это видео); lv — версия
+  loop: "off", lv: 0,
 };
 window.__wtId = window.__wtId || null;
 let wtUiSig = "";
@@ -4511,6 +4513,7 @@ function wtSetSession(videoId, title, by, vertical) {
   wtQ("watch-together")?.classList.toggle("wt-vert", !!vertical);
   // размытая обложка по бокам вертикального видео (id только [A-Za-z0-9_-])
   wtQ("wt-stage")?.style.setProperty("--wt-bg", `url("https://i.ytimg.com/vi/${videoId}/hqdefault.jpg")`);
+  wtRenderQueue();
   wtRefreshUI();
 }
 
@@ -4519,7 +4522,8 @@ function wtClearSession() {
   wtState.vertical = false; wtState.pending = null;
   wtState.remotePos = 0; wtState.remotePaused = true; wtState.viewers = {};
   wtState.queue = []; wtState.qv = 0;
-  wtRenderQueue();
+  wtState.loop = "off"; wtState.lv = 0;
+  wtRenderQueue(); wtRenderLoop();
   window.__wtId = null;
   wtQ("watch-together")?.classList.remove("wt-vert");
   wtQ("wt-stage")?.style.removeProperty("--wt-bg");
@@ -4549,6 +4553,8 @@ function wtSend(payload, directIp) {
     watching: wtIsWatching(),
     queue: wtState.queue,
     qv: wtState.qv,
+    loop: wtState.loop,
+    lv: wtState.lv,
   }, payload || {});
   for (const ip of targets) invoke("sig_send", { peerIp: ip, payload: msg }).catch(() => {});
 }
@@ -5159,22 +5165,82 @@ async function wtQueueAdd(url, title) {
 function wtQueuePlay(index) {
   const it = wtState.queue[index];
   if (!it) return;
-  wtQueueSet(wtState.queue.filter((_, i) => i !== index), false);
   wtLoadVideo((it.v ? "https://youtube.com/shorts/" : "https://youtu.be/") + it.id, it.title);
 }
 function wtQueueRemove(index) {
   if (!wtState.queue[index]) return;
   wtQueueSet(wtState.queue.filter((_, i) => i !== index), true);
 }
+// Видео закончилось: повтор, следующее в плейлисте или (по кругу) первое.
+// Плейлист не убывает — сыгранные видео остаются в списке.
 function wtQueueNext() {
-  if (!wtHasSession() || !wtIsWatching() || !wtState.queue.length) return;
+  if (!wtHasSession() || !wtIsWatching()) return;
   try {
     const vid = wtState.player?.getVideoData?.()?.video_id;
     if (vid && vid !== wtState.videoId) return; // кончилась реклама, а не видео
   } catch {}
   if (Date.now() - wtState.advancedAt < 3000) return;
+  const q = wtState.queue;
+  const i = q.findIndex((it) => it.id === wtState.videoId);
+  if (wtState.loop === "one" || (wtState.loop === "all" && (!q.length || (q.length === 1 && i === 0)))) {
+    wtState.advancedAt = Date.now();
+    wtReplay();
+    return;
+  }
+  if (!q.length) return;
+  let next = i < 0 ? 0 : i + 1;
+  if (next >= q.length) {
+    if (wtState.loop !== "all") return;
+    next = 0;
+  }
   wtState.advancedAt = Date.now();
-  wtQueuePlay(0);
+  wtQueuePlay(next);
+}
+// То же видео с начала — у всех.
+function wtReplay() {
+  const p = wtState.player;
+  if (!p || !wtState.playerReady) return;
+  try { wtState.applyingUntil = Date.now() + 900; p.seekTo(0, true); p.playVideo(); } catch {}
+  wtSend({ action: "seek", pos: 0, paused: false });
+  wtSend({ action: "play", pos: 0, paused: false });
+  wtStatus("Повтор: видео сначала");
+  setTimeout(wtUpdateControls, 150);
+}
+const WT_LOOP_NEXT = { off: "all", all: "one", one: "off" };
+const WT_LOOP_TITLE = {
+  off: "Повтор выключен",
+  all: "Повтор плейлиста: после последнего видео — снова первое",
+  one: "Повтор этого видео",
+};
+function wtSetLoop(mode, announce) {
+  if (!WT_LOOP_TITLE[mode]) return;
+  wtState.loop = mode;
+  wtState.lv += 1;
+  wtRenderLoop();
+  if (announce && wtHasSession()) {
+    wtSend({ action: "loop" });
+    wtStatus(myNick() + ": " + WT_LOOP_TITLE[mode].toLowerCase());
+  }
+}
+function wtAdoptLoop(p) {
+  const lv = Number(p.lv);
+  if (!WT_LOOP_TITLE[p.loop] || !isFinite(lv) || lv <= 0) return;
+  const newer = lv > wtState.lv || (lv === wtState.lv && String(p.ip || "") > String(myIp || ""));
+  if (!newer) return;
+  const changed = p.loop !== wtState.loop;
+  wtState.loop = p.loop; wtState.lv = lv;
+  wtRenderLoop();
+  if (changed && p.action === "loop") wtStatus(wtNick(p.ip || "", p.from) + ": " + WT_LOOP_TITLE[p.loop].toLowerCase());
+}
+function wtRenderLoop() {
+  const b = wtQ("wt-loop");
+  if (b) {
+    b.classList.toggle("on", wtState.loop !== "off");
+    b.classList.toggle("one", wtState.loop === "one");
+    b.title = WT_LOOP_TITLE[wtState.loop] + " — нажмите, чтобы сменить";
+  }
+  const h = wtQ("wt-queue-mode");
+  if (h) h.textContent = wtState.loop === "all" ? "по кругу" : wtState.loop === "one" ? "повтор видео" : "следующее включится само";
 }
 function wtRenderQueue() {
   const n = wtState.queue.length;
@@ -5183,8 +5249,11 @@ function wtRenderQueue() {
   const list = wtQ("wt-queue-list");
   if (!list) return;
   wtQ("wt-queue-empty")?.classList.toggle("hidden", n > 0);
+  const sig = JSON.stringify([wtState.queue, wtState.videoId]);
+  if (list.dataset.sig === sig) return;
+  list.dataset.sig = sig;
   list.innerHTML = wtState.queue.map((it, i) =>
-    `<div class="wt-qitem" data-i="${i}"><img src="https://i.ytimg.com/vi/${it.id}/default.jpg" alt="">` +
+    `<div class="wt-qitem${it.id === wtState.videoId ? " cur" : ""}" data-i="${i}"><img src="https://i.ytimg.com/vi/${it.id}/default.jpg" alt="">` +
     `<div class="wt-qtext"><b title="${esc(it.title)}">${esc(it.title)}</b><small>${it.by ? esc(it.by) : ""}</small></div>` +
     `<button data-act="play" title="Включить сейчас">▶</button><button data-act="del" title="Убрать из очереди">✕</button></div>`).join("");
 }
@@ -5353,36 +5422,88 @@ function wtEndCall() {
 // Включено в окне браузера кнопкой «Листать вместе»: каждый свой переход
 // уходит участникам звонка (web-sync), чужие переходы открываются у нас.
 // Переход, открытый по команде участника, Rust помечает remote — его не шлём.
-const webState = { share: false, lastSent: "", pending: null };
+// Переходы нумеруются (navV, счётчик Лэмпорта): старое и повторное не
+// применяется, а тот, кто открыл страницу последним, раз в 5 с повторяет её —
+// потерянное сообщение не оставляет участников на разных страницах.
+// Ещё уходят курсор (цвет — место в звонке) и прокрутка страницы.
+const webState = {
+  share: false, pending: null,
+  navV: 0, navUrl: "", navTitle: "", leader: false,
+  seq: Date.now(), seen: {}, hb: null, people: "",
+};
 const webIsUrl = (u) => /^https?:\/\//i.test(String(u || ""));
+// те же цвета, что PALETTE в ytbrowse.rs и COLORS в yt-browser.html
+const WEB_COLORS = ["#3fbf6f", "#ff5c6c", "#ffd23f", "#4aa8ff", "#b36bff", "#ff9f43", "#ff6bcb", "#2ee6d6"];
 
+function webMembers() {
+  if (currentCall) return [currentCall];
+  if (groupCall && Array.isArray(groupCall.members)) return groupCall.members.slice();
+  return typeof gpc !== "undefined" ? Object.keys(gpc) : [];
+}
+// Цвет участника — его место в отсортированном списке звонка (вместе с нами):
+// у всех участников получается одинаковым.
+function webSlot(ip) {
+  const all = [...new Set([myIp, ...webMembers()])].filter(Boolean).sort();
+  const i = all.indexOf(ip);
+  return (i < 0 ? 0 : i) % WEB_COLORS.length;
+}
 function webSend(payload) {
   const targets = wtTargets();
-  const msg = Object.assign({ kind: "web-sync", from: myNick(), at: Date.now() }, payload);
+  const msg = Object.assign({ kind: "web-sync", from: myNick(), at: Date.now(), seq: ++webState.seq }, payload);
   for (const ip of targets) invoke("sig_send", { peerIp: ip, payload: msg }).catch(() => {});
   return targets.length;
 }
 const webNotify = (text, ok) => invoke("ytb_notify", { text, ok }).catch(() => {});
-function webOnShare(on) {
-  if (on && typeof inVoice === "function" && !inVoice()) {
+// Кто листает вместе и каким цветом — в панель браузера.
+function webPeople() {
+  if (isDemo) return;
+  const list = webState.share && inVoice()
+    ? [{ nick: "Вы", slot: webSlot(myIp), me: true }].concat(wtTargets().map((ip) => ({ nick: wtNick(ip), slot: webSlot(ip) })))
+    : [];
+  const sig = JSON.stringify(list);
+  if (sig === webState.people) return;
+  webState.people = sig;
+  invoke("ytb_people", { data: list }).catch(() => {});
+}
+function webStartHb() {
+  if (webState.hb) return;
+  webState.hb = setInterval(() => {
+    if (!webState.share || !inVoice()) return;
+    webPeople();
+    if (webState.leader && webIsUrl(webState.navUrl)) {
+      webSend({ action: "nav", url: webState.navUrl, title: webState.navTitle, v: webState.navV, hb: true });
+    }
+  }, 5000);
+}
+// auto — режим включился сам (друг листает, а у нас открыт браузер):
+// свою прежнюю страницу участникам не рассылаем.
+function webOnShare(on, auto) {
+  if (on && !inVoice()) {
     invoke("ytb_notify", { text: "«Листать вместе» работает во время звонка", ok: false }).catch(() => {});
     invoke("ytb_set_share", { on: false }).catch(() => {});
     return;
   }
   webState.share = on;
-  webState.lastSent = "";
   webState.sentOnce = false;
   if (on) {
     webHideJoin();
-    webNotify("Листаем вместе: участники звонка увидят страницы, которые вы открываете", true);
+    webStartHb();
+    if (!auto) {
+      webNotify("Листаем вместе: участники звонка увидят страницы, которые вы открываете", true);
+    }
+  } else {
+    webState.leader = false;
   }
+  webPeople();
 }
 function webOnLocalUrl(p) {
   if (!webState.share || p.remote || !webIsUrl(p.url)) return;
-  if (typeof inVoice === "function" && !inVoice()) return;
-  if (p.url === webState.lastSent) return;
-  webState.lastSent = p.url;
-  const n = webSend({ action: "nav", url: p.url, title: p.title || "" });
+  if (!inVoice()) return;
+  // после включения текущая страница уходит участникам даже без перехода
+  if (p.url === webState.navUrl && webState.sentOnce) { if (p.title) webState.navTitle = p.title; return; }
+  webState.navV += 1;
+  webState.navUrl = p.url; webState.navTitle = p.title || ""; webState.leader = true;
+  const n = webSend({ action: "nav", url: p.url, title: p.title || "", v: webState.navV });
   // первая отправка после включения — показать, дошло ли до кого-то
   if (!webState.sentOnce) {
     webState.sentOnce = true;
@@ -5390,9 +5511,23 @@ function webOnLocalUrl(p) {
   }
 }
 function webOnRemote(p) {
-  if (!p || !webIsUrl(p.url)) return;
+  if (!p) return;
   if (p.ip && myIp && p.ip === myIp) return;
   const who = wtNick(p.ip || "", p.from);
+  if (p.action === "close") { webRemoteClose(who); return; }
+  if (!webIsUrl(p.url)) return;
+  if (p.action === "cursor" || p.action === "scroll") {
+    if (!webState.share) return;
+    // сообщения идут разными соединениями — старое не должно перебить новое
+    const key = (p.ip || p.from || "") + ":" + p.action, seq = Number(p.seq) || 0;
+    if (seq && seq <= (webState.seen[key] || 0)) return;
+    if (seq) webState.seen[key] = seq;
+    const x = Number(p.x), y = Number(p.y), h = Number(p.h);
+    if (!isFinite(x) || !isFinite(y)) return;
+    if (p.action === "cursor") invoke("ytb_remote_cursor", { slot: webSlot(p.ip || ""), x, y, url: p.url }).catch(() => {});
+    else if (isFinite(h)) invoke("ytb_remote_scroll", { y, h, url: p.url }).catch(() => {});
+    return;
+  }
   if (p.action === "media") {
     // пауза/плей/перемотка видео на той же странице (Rust сверит адрес)
     const t = Number(p.t);
@@ -5401,17 +5536,49 @@ function webOnRemote(p) {
     return;
   }
   if (p.action !== "nav") return;
+  const v = Number(p.v) || 0; // 0 — старая версия SafeDrop без номеров
+  if (v > 0 && v < webState.navV) return;
+  if (v > 0 && v === webState.navV) {
+    // одновременные переходы: у всех побеждает участник с большим IP
+    if (p.url !== webState.navUrl && String(p.ip || "") < String(myIp || "")) return;
+    // повтор уже открытой страницы; но если мы не листаем — пробуем присоединить
+    if (p.url === webState.navUrl && webState.share) return;
+  }
+  if (v > 0) webState.navV = v;
+  webState.navUrl = p.url; webState.navTitle = p.title || ""; webState.leader = false;
   webState.pending = { url: p.url, title: p.title || "", who };
+  webPeople();
   invoke("ytb_remote_nav", { url: p.url, by: who }).then((applied) => {
-    if (applied) { webState.lastSent = p.url; webHideJoin(); }
+    if (applied) webHideJoin();
     else webShowJoin();
   }).catch(() => webShowJoin());
 }
 // Наше действие с видео на странице (заметил Rust) — участникам.
 function webOnLocalMedia(p) {
   if (!webState.share || !webIsUrl(p.url)) return;
-  if (typeof inVoice === "function" && !inVoice()) return;
+  if (!inVoice()) return;
   webSend({ action: "media", media: p.action, t: Number(p.t) || 0, url: p.url });
+}
+// Наш курсор и прокрутка (Rust уже проредил их) — участникам.
+function webOnLocalPointer(action, p) {
+  if (!webState.share || !inVoice() || !webIsUrl(p.url)) return;
+  const x = Number(p.x), y = Number(p.y), h = Number(p.h);
+  if (action === "cursor" && isFinite(x) && isFinite(y)) webSend({ action, x, y, url: p.url });
+  if (action === "scroll" && isFinite(y) && isFinite(h)) webSend({ action, y, h, url: p.url });
+}
+// «Закрыть у всех» из панели браузера.
+function webCloseAll() {
+  const n = inVoice() ? webSend({ action: "close", url: "" }) : 0;
+  webState.leader = false; webState.pending = null;
+  webHideJoin();
+  invoke("ytb_close").catch(() => {});
+  if (n) toast("Браузер закрыт у всех в звонке");
+}
+function webRemoteClose(who) {
+  webHideJoin();
+  webState.pending = null; webState.leader = false;
+  if (isDemo) return;
+  invoke("ytb_close").then((was) => { if (was) toast(who + " закрыл браузер у всех"); }).catch(() => {});
 }
 function webShowJoin() {
   const p = webState.pending;
@@ -5433,16 +5600,18 @@ function webJoin() {
   const p = webState.pending;
   if (!p) return webHideJoin();
   webHideJoin();
-  webState.lastSent = p.url;
+  webState.navUrl = p.url;
   invoke("ytb_open", { url: p.url, remote: true })
-    .then(() => invoke("ytb_set_share", { on: true }))
+    .then(() => invoke("ytb_set_share", { on: true, manual: true }))
     .catch((e) => toast("Браузер: " + e, true));
 }
 function webReset() {
   webHideJoin();
   webState.pending = null;
   if (webState.share && !isDemo) invoke("ytb_set_share", { on: false }).catch(() => {});
-  webState.share = false; webState.lastSent = "";
+  webState.share = false; webState.leader = false;
+  webState.navV = 0; webState.navUrl = ""; webState.navTitle = ""; webState.seen = {};
+  webPeople();
 }
 
 // ---------- мини-окно: перетаскивание и размер ----------
@@ -5557,7 +5726,8 @@ if (typeof listen === "function") {
       }
       if (!wtAccept(p)) return;
       wtAdoptQueue(p);
-      if (p.action === "queue") { wtRefreshUI(); return; }
+      wtAdoptLoop(p);
+      if (p.action === "queue" || p.action === "loop") { wtRefreshUI(); return; }
       if (p.action === "state") {
         // Состояние от участника, который сам не смотрит, не применяем:
         // он мог закрыть окно и поставить видео на паузу только у себя.
@@ -5574,14 +5744,17 @@ if (typeof listen === "function") {
     try { wtFromBrowser(e.payload || {}); } catch (err) { console.error("ytb-watch", err); }
   }).catch((err) => console.error("ytb listen", err));
   listen("ytb-url", (e) => { try { webOnLocalUrl(e.payload || {}); } catch (err) { console.error("ytb-url", err); } }).catch(() => {});
-  listen("ytb-share", (e) => { try { webOnShare(!!(e.payload && e.payload.on)); } catch (err) { console.error("ytb-share", err); } }).catch(() => {});
+  listen("ytb-share", (e) => { try { webOnShare(!!(e.payload && e.payload.on), !!(e.payload && e.payload.auto)); } catch (err) { console.error("ytb-share", err); } }).catch(() => {});
+  listen("ytb-cursor", (e) => { try { webOnLocalPointer("cursor", e.payload || {}); } catch {} }).catch(() => {});
+  listen("ytb-scroll", (e) => { try { webOnLocalPointer("scroll", e.payload || {}); } catch {} }).catch(() => {});
+  listen("ytb-close-all", () => { try { webCloseAll(); } catch (err) { console.error("ytb-close-all", err); } }).catch(() => {});
   listen("ytb-media", (e) => { try { webOnLocalMedia(e.payload || {}); } catch (err) { console.error("ytb-media", err); } }).catch(() => {});
   listen("ytb-chat-request", () => { wtChatSendHistory().catch(() => {}); }).catch(() => {});
   listen("ytb-chat-send", (e) => {
     const text = e.payload && e.payload.text;
     wtChatSend(text).then((ok) => { if (!ok) invoke("ytb_notify", { text: "Не отправлено: нужен звонок", ok: false }).catch(() => {}); });
   }).catch(() => {});
-  listen("ytb-closed", () => { webState.share = false; webState.lastSent = ""; }).catch(() => {});
+  listen("ytb-closed", () => { webState.share = false; webState.leader = false; webPeople(); }).catch(() => {});
   listen("safedrop-web", (e) => { try { webOnRemote(e.payload || {}); } catch (err) { console.error("safedrop-web", err); } }).catch(() => {});
 }
 
@@ -5631,6 +5804,7 @@ wtOn("wt-queue-list", "click", (e) => {
 });
 wtOn("wt-url", "keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); wtSubmitChange(); } });
 wtOn("wt-toggle", "click", () => wtTogglePlay());
+wtOn("wt-loop", "click", () => wtSetLoop(WT_LOOP_NEXT[wtState.loop] || "off", true));
 wtOn("wt-back10", "click", () => wtSeekBy(-10));
 wtOn("wt-fwd10", "click", () => wtSeekBy(10));
 wtOn("wt-fs", "click", () => wtToggleFull());

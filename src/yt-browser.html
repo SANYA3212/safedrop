@@ -11,7 +11,7 @@
   .ib { flex: none; width: 32px; height: 32px; border: 0; border-radius: 8px; background: transparent; color: var(--text); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
   .ib:hover { background: var(--btn); }
   .ib svg { width: 18px; height: 18px; fill: currentColor; }
-  .addr { flex: 1; min-width: 120px; display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px; background: rgba(0,0,0,.35); }
+  .addr { flex: 1; min-width: 200px; display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px; background: rgba(0,0,0,.35); }
   .addr:focus-within { border-color: var(--accent); }
   .addr svg { flex: none; width: 15px; height: 15px; fill: var(--muted); }
   .addr input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; user-select: text; }
@@ -35,7 +35,16 @@
   .notice { position: fixed; right: 10px; top: 6px; max-width: 60%; padding: 6px 12px; border-radius: 10px; background: #2a2140; border: 1px solid var(--accent2); font-size: 12px; opacity: 0; transform: translateY(-6px); transition: .2s; pointer-events: none; }
   .notice.show { opacity: 1; transform: none; }
   .notice.ok { background: #1d2d22; border-color: #3fbf6f; }
-  @media (max-width: 820px) { .title { display: none; } }
+  .people { flex: none; display: inline-flex; gap: 4px; align-items: center; }
+  .people span { display: inline-flex; align-items: center; gap: 5px; max-width: 120px; height: 24px; padding: 0 8px 0 7px; border-radius: 12px; background: var(--btn); font-size: 11px; }
+  .people i { flex: none; width: 10px; height: 10px; border-radius: 50%; box-shadow: 0 0 0 2px rgba(255,255,255,.25); }
+  .people b { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ib.danger:hover { background: rgba(255,92,108,.18); color: #ffb3bb; }
+  .load { position: fixed; left: -30%; bottom: 0; width: 30%; height: 2px; background: linear-gradient(90deg, var(--accent), var(--accent2)); opacity: 0; pointer-events: none; }
+  .load.on { opacity: 1; animation: load 1.1s ease-in-out infinite; }
+  @keyframes load { from { left: -30%; } to { left: 100%; } }
+  @media (max-width: 1400px) { .people b { display: none; } .people span { padding: 0 7px; } }
+  @media (max-width: 1050px) { .title { display: none; } }
   @media (max-width: 680px) { .chat { display: none; } }
 </style>
 </head>
@@ -50,6 +59,7 @@
     <input id="addr" placeholder="Адрес сайта (reddit.com) или поиск в Google" spellcheck="false" />
   </label>
   <span class="title" id="title"></span>
+  <span class="people hidden" id="people" title="Цвета курсоров участников"></span>
   <button class="share" id="b-chat" title="Чат звонка — панель справа">
     <svg viewBox="0 0 24 24"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg>
     Чат<span id="chat-badge" class="badge hidden">0</span>
@@ -58,12 +68,16 @@
     <svg viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11A2.99 2.99 0 1 0 15 5c0 .24.04.47.09.7L8.04 9.81a3 3 0 1 0 0 4.38l7.12 4.16c-.05.21-.08.43-.08.65A2.92 2.92 0 1 0 18 16.08z"/></svg>
     <span id="share-text">Листать вместе</span>
   </button>
+  <button class="ib danger" id="b-close-all" title="Закрыть браузер у всех в звонке">
+    <svg viewBox="0 0 24 24"><path d="M13 3h-2v10h2zm4.83 2.17-1.42 1.42A6.92 6.92 0 0 1 19 12a7 7 0 1 1-11.42-5.42L6.17 5.17A8.93 8.93 0 0 0 3 12a9 9 0 0 0 18 0c0-2.74-1.23-5.18-3.17-6.83z"/></svg>
+  </button>
   <button class="share hidden" id="b-queue" title="Добавить это видео в очередь «Смотреть вместе»">+ В очередь</button>
   <button class="watch hidden" id="b-watch" title="Открыть это видео в синхронном плеере звонка">
     <svg viewBox="0 0 24 24"><path d="M16 11a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm-8 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5C15 14.17 10.33 13 8 13zm8 0c-.29 0-.62.02-.97.05A4.22 4.22 0 0 1 17 16.5V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
     Смотреть вместе
   </button>
 </div>
+<div class="load" id="load"></div>
 <div class="notice" id="notice"></div>
 <div class="msg" id="msg"><b id="msg-from"></b> <span id="msg-text"></span></div>
 <script>
@@ -104,7 +118,29 @@
     watchBtn.disabled = false;
     if (s && "share" in s) applyShare(s.share);
   }
-  $("b-share").onclick = () => invoke("ytb_set_share", { on: !shareOn }).catch((e) => notice(String(e)));
+  $("b-share").onclick = () => invoke("ytb_set_share", { on: !shareOn, manual: true }).catch((e) => notice(String(e)));
+  $("b-close-all").onclick = () => invoke("ytb_close_all").catch((e) => notice(String(e)));
+  // те же цвета, что PALETTE в ytbrowse.rs
+  const COLORS = ["#3fbf6f", "#ff5c6c", "#ffd23f", "#4aa8ff", "#b36bff", "#ff9f43", "#ff6bcb", "#2ee6d6"];
+  function renderPeople(list) {
+    const el = $("people");
+    el.textContent = "";
+    for (const p of Array.isArray(list) ? list : []) {
+      const s = document.createElement("span"), dot = document.createElement("i"), b = document.createElement("b");
+      dot.style.background = COLORS[(Number(p.slot) || 0) % COLORS.length];
+      b.textContent = String(p.nick || "");
+      s.title = p.me ? "Ваш курсор у друзей" : "Курсор: " + b.textContent;
+      s.append(dot, b);
+      el.append(s);
+    }
+    el.classList.toggle("hidden", !el.childElementCount);
+  }
+  let loadTimer = null;
+  function setLoading(on) {
+    $("load").classList.toggle("on", !!on);
+    clearTimeout(loadTimer);
+    if (on) loadTimer = setTimeout(() => $("load").classList.remove("on"), 20000);
+  }
 
   const nav = (action) => invoke("ytb_nav", { action }).catch((e) => notice(String(e)));
   $("b-back").onclick = () => nav("back");
@@ -146,6 +182,8 @@
   if (T && T.event) {
     T.event.listen("ytb-url", (e) => applyState(e.payload));
     T.event.listen("ytb-share", (e) => applyShare(e.payload && e.payload.on));
+    T.event.listen("ytb-people", (e) => renderPeople(e.payload));
+    T.event.listen("ytb-loading", (e) => setLoading(e.payload && e.payload.on));
     T.event.listen("ytb-chat", (e) => {
       const p = e.payload || {};
       showMsg(String(p.from || ""), String(p.text || ""));
