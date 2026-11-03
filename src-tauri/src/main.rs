@@ -2102,11 +2102,22 @@ fn main() {
             #[cfg(target_os = "linux")]
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.with_webview(|wv| {
-                    use webkit2gtk::{SettingsExt, WebViewExt};
-                    if let Some(s) = wv.inner().settings() {
+                    use webkit2gtk::{glib::prelude::*, DeviceInfoPermissionRequest, PermissionRequestExt, SettingsExt, WebViewExt};
+                    let view = wv.inner();
+                    if let Some(s) = view.settings() {
                         s.set_enable_webrtc(true);
                         s.set_enable_media_stream(true);
                     }
+                    // Без этого WebKit отдаёт enumerateDevices без названий и с пустыми
+                    // deviceId: в списке «Микрофон 1», выбор устройства не сохраняется.
+                    // Обработчик wry вызывается раньше и такие запросы не решает.
+                    view.connect_permission_request(|_, req| {
+                        if req.is::<DeviceInfoPermissionRequest>() {
+                            req.allow();
+                            return true;
+                        }
+                        false
+                    });
                 });
             }
             // tray: left click toggles window, menu has Show/Quit

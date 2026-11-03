@@ -59,7 +59,7 @@ function showHelp(title, html, actionLabel, actionFn) {
   if (ab) ab.remove();
   if (actionLabel) {
     ab = document.createElement("button");
-    ab.id = "help-act"; ab.className = "danger big"; ab.textContent = actionLabel;
+    ab.id = "help-act"; ab.className = "danger big"; ab.innerHTML = actionLabel; // подпись из нашего кода, с иконкой
     ab.onclick = actionFn;
     nb.after(ab);
   }
@@ -225,6 +225,7 @@ function bindCallUiControls() {
 bindCallUiControls();
 
 // ---------- load ----------
+let hostOs = "windows"; // из get_build_info; на Linux другие подсказки и нет «сброса запрета»
 async function loadAll() {
   settings = await invoke("get_settings");
   try { profile = await invoke("get_profile"); } catch { profile = { nickname: "", avatar: "" }; }
@@ -329,6 +330,7 @@ async function loadAll() {
     $("#build-info").textContent = `Сборка v${b.version} от ${dt}`;
     console.log("[SafeDrop] running:", b.exe);
     // меню Проводника, Firewall и страницы «Параметров» есть только в Windows
+    hostOs = b.os || "windows";
     if (b.os && b.os !== "windows") {
       for (const sel of ["#btn-firewall", "#btn-notif-win", "#btn-mic-win"]) $(sel)?.style.setProperty("display", "none");
       $("#set-ctxmenu")?.closest("label")?.style.setProperty("display", "none");
@@ -1314,6 +1316,34 @@ function setMicState(st) {
   el.className = "mic-state" + (st === "ok" ? " ok" : st === "no" ? " no" : "");
   el.textContent = st === "ok" ? "микрофон OK" : st === "no" ? "заблокирован" : "проверка…";
 }
+const MIC_HELP_LINUX = `<ol>
+<li>Проверь, что микрофон не выключен в настройках звука системы (PipeWire / PulseAudio, например pavucontrol).</li>
+<li>Закрой программы, которые могут держать микрофон (Discord, OBS).</li>
+<li>Выбери микрофон заново в «Звонки и звук» и нажми «Запросить доступ».</li>
+</ol>`;
+// Ошибка микрофона: запрет — окно с подсказкой, всё остальное (нет устройства,
+// устройство пропало, занято) — короткое сообщение с причиной, а не «заблокирован».
+function micFailed(e) {
+  const name = e?.name || "";
+  if (name !== "NotAllowedError" && name !== "SecurityError") return toast("Микрофон: " + (e?.message || e), true);
+  if (hostOs !== "windows") return showHelp("Микрофон заблокирован", MIC_HELP_LINUX);
+  showHelp("Микрофон заблокирован", MIC_HELP, "<svg class='ic' viewBox='0 0 24 24'><path d='M20,11A8,8,0,0,0,5.64,6.64L4,8.29V4H8.29l1.59,1.59A10,10,0,0,1,22,13Z'/><path d='M4,13A8,8,0,0,0,18.36,17.36L20,15.71V20H15.71l-1.59-1.59A10,10,0,0,1,2,11Z'/></svg> Сбросить запрет (перезапуск)", async () => { toast("Перезапускаю для сброса…"); await invoke("fix_mic_blocked").catch((x) => toast("" + x, true)); });
+}
+// getUserMedia с запасными вариантами: сохранённый deviceId может устареть (в WebKit
+// идентификаторы устройств меняются между запусками), а жёсткие пределы камеры —
+// не совпасть с её режимами. Тогда WebKit отвечает OverconstrainedError
+// «Invalid constraint», и без запасного варианта камера/микрофон не включались вовсе.
+async function gumFallback(variants) {
+  let err;
+  for (const c of variants) {
+    try { return await navigator.mediaDevices.getUserMedia(c); }
+    catch (e) {
+      err = e;
+      if (e?.name === "NotAllowedError" || e?.name === "SecurityError") throw e; // запрет не обойти
+    }
+  }
+  throw err;
+}
 const MIC_HELP = `<ol>
 <li>Микрофон в SafeDrop <b>разрешён автоматически</b> — отдельного окна может вообще не быть, это нормально.</li>
 <li>Нажми «Запросить доступ»: если всё хорошо — статус станет «микрофон OK».</li>
@@ -1388,13 +1418,14 @@ function stopCameraPreview() {
 }
 async function cameraStream(width = 1280, height = 720, fps = 30, deviceId = "") {
   const base = { width: { max: width }, height: { max: height }, frameRate: { max: fps } };
+  const soft = { width: { ideal: width }, height: { ideal: height }, frameRate: { ideal: fps } };
   const id = deviceId || settings?.camera_id;
-  try {
-    return await navigator.mediaDevices.getUserMedia({ video: id ? { ...base, deviceId: { exact: id } } : base, audio: false });
-  } catch (e) {
-    if (!id) throw e;
-    return await navigator.mediaDevices.getUserMedia({ video: base, audio: false });
-  }
+  return gumFallback([
+    ...(id ? [{ video: { ...base, deviceId: { exact: id } }, audio: false }, { video: { ...soft, deviceId: { ideal: id } }, audio: false }] : []),
+    { video: base, audio: false },
+    { video: soft, audio: false },
+    { video: true, audio: false },
+  ]);
 }
 async function previewCamera() {
   const v = $("#cam-preview"); if (!v) return;
@@ -1473,12 +1504,17 @@ async function startMicNow() {
     try { if (micCtx) micCtx.close(); } catch {}
     micCtx = micGain = micDest = gateNode = rnnoiseNode = rnnoiseWetGain = rnnoiseDryGain = micCompressor = null;
     const noiseEngine = settings.noise_filter || "rnnoise";
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: {
-      ...(settings.mic_id ? { deviceId: { exact: settings.mic_id } } : {}),
+    const proc = {
       echoCancellation: { ideal: settings.echo_cancellation !== false },
       noiseSuppression: { ideal: noiseEngine === "webrtc" },
       autoGainControl: { ideal: settings.auto_gain_control !== false },
-    } });
+    };
+    const id = settings.mic_id;
+    localStream = await gumFallback([
+      ...(id ? [{ audio: { ...proc, deviceId: { exact: id } } }, { audio: { ...proc, deviceId: { ideal: id } } }] : []),
+      { audio: proc },
+      { audio: true },
+    ]);
     setMicState("ok");
     localStream.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
     // Local audio chain: RNNoise (optional), level, and a soft expander gate.
@@ -1684,11 +1720,7 @@ function armMicIdleStop() {
 }
 async function requestMic() {
     try { await startMic(); if (!inVoice()) armMicIdleStop(); toast("Микрофон работает <svg class='ic' viewBox='0 0 24 24'><path d='M9,16.17,4.83,12l-1.42,1.41L9,19,21,7l-1.41-1.41Z'/></svg>"); }
-    catch (e) {
-    const name = e?.name || "";
-    if (name === "NotAllowedError" || name === "SecurityError") showHelp("Микрофон заблокирован", MIC_HELP, "<svg class='ic' viewBox='0 0 24 24'><path d='M20,11A8,8,0,0,0,5.64,6.64L4,8.29V4H8.29l1.59,1.59A10,10,0,0,1,22,13Z'/><path d='M4,13A8,8,0,0,0,18.36,17.36L20,15.71V20H15.71l-1.59-1.59A10,10,0,0,1,2,11Z'/></svg> Сбросить запрет (перезапуск)", async () => { toast("Перезапускаю для сброса…"); await invoke("fix_mic_blocked").catch((x) => toast("" + x, true)); });
-    else toast("Микрофон: " + (e?.message || e), true);
-  }
+    catch (e) { micFailed(e); }
 }
 let gateGen = 0;
 function gateMeter() {
@@ -2007,7 +2039,7 @@ async function startCall(peerIp) {
   if (noRtc()) return;
   if (currentCall || groupCall || pendingOffer || callSetupPeer) return toast("Сначала заверши текущий звонок или ответь на приглашение", true);
   callSetupPeer = peerIp;
-  try { await startMic(); } catch { callSetupPeer = null; showHelp("Микрофон заблокирован", MIC_HELP, "<svg class='ic' viewBox='0 0 24 24'><path d='M20,11A8,8,0,0,0,5.64,6.64L4,8.29V4H8.29l1.59,1.59A10,10,0,0,1,22,13Z'/><path d='M4,13A8,8,0,0,0,18.36,17.36L20,15.71V20H15.71l-1.59-1.59A10,10,0,0,1,2,11Z'/></svg> Сбросить запрет (перезапуск)", async () => invoke("fix_mic_blocked").catch((x) => toast("" + x, true))); return; }
+  try { await startMic(); } catch (e) { callSetupPeer = null; micFailed(e); return; }
   try {
     ensurePC(peerIp);
     const offer = await pc.createOffer();
@@ -2734,7 +2766,11 @@ async function startScreen() {
   let stream, withAudio = false, audioMode = "off";
   const picker = (audio) => navigator.mediaDevices.getDisplayMedia({ video: videoC, audio });
   try {
-    if (navigator.mediaDevices.getSupportedConstraints?.().restrictOwnAudio) {
+    if (hostOs !== "windows") {
+      // WebKitGTK не захватывает системный звук — сразу без звука, без вопроса про WebView2
+      stream = await picker(false);
+      audioMode = "no-audio-linux";
+    } else if (navigator.mediaDevices.getSupportedConstraints?.().restrictOwnAudio) {
       stream = await picker({ restrictOwnAudio: true });
       withAudio = stream.getAudioTracks().length > 0;
       audioMode = withAudio ? "restrict-own" : "no-audio-checked";
