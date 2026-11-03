@@ -1127,7 +1127,10 @@ fn notify_impl(title: &str, body: &str, icon: Option<String>) {
     } else {
         n.auto_icon();
     }
+    #[cfg(windows)]
     n.app_id("com.safedrop.app");
+    #[cfg(not(windows))]
+    n.appname("SafeDrop");
     // Keep Windows toasts silent: the frontend plays the user's selected
     // notification sound, including while the window is minimized.
     if let Err(e) = n.show() {

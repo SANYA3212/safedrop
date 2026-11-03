@@ -328,6 +328,11 @@ async function loadAll() {
     const dt = b.build_time && b.build_time !== "?" ? new Date(Number(b.build_time) * 1000).toLocaleString("ru-RU") : "?";
     $("#build-info").textContent = `Сборка v${b.version} от ${dt}`;
     console.log("[SafeDrop] running:", b.exe);
+    // меню Проводника, Firewall и страницы «Параметров» есть только в Windows
+    if (b.os && b.os !== "windows") {
+      for (const sel of ["#btn-firewall", "#btn-notif-win", "#btn-mic-win"]) $(sel)?.style.setProperty("display", "none");
+      $("#set-ctxmenu")?.closest("label")?.style.setProperty("display", "none");
+    }
   } catch {}
 }
 function renderMyAvatar() {

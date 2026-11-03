@@ -777,7 +777,13 @@ fn zip_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        anyhow::bail!("directory send supported on Windows v1 (zip it manually)");
+        let st = std::process::Command::new("zip")
+            .arg("-qr").arg(dst).arg(".")
+            .current_dir(src)
+            .status()
+            .map_err(|_| anyhow::anyhow!("для отправки папок нужна утилита zip (sudo pacman -S zip)"))?;
+        if st.success() { return Ok(()); }
+        anyhow::bail!("zip failed");
     }
 }
 

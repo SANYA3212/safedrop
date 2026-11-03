@@ -498,14 +498,22 @@ async fn clear_chat(
     Ok(())
 }
 
-/// Open Windows microphone privacy settings page.
-#[tauri::command]
-async fn open_mic_settings() -> Result<(), String> {
+/// Open a Windows Settings page (ms-settings:...).
+fn open_ms_settings(page: &str) -> Result<(), String> {
+    if cfg!(not(windows)) {
+        return Err("Эта настройка есть только в Windows — открой параметры своей системы".into());
+    }
     std::process::Command::new("cmd")
-        .args(["/C", "start", "", "ms-settings:privacy-microphone"])
+        .args(["/C", "start", "", page])
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Open Windows microphone privacy settings page.
+#[tauri::command]
+async fn open_mic_settings() -> Result<(), String> {
+    open_ms_settings("ms-settings:privacy-microphone")
 }
 
 // ---------- groups ----------
@@ -1028,6 +1036,9 @@ async fn apply_update(state: tauri::State<'_, AppState>, path: String, version: 
     if version.is_empty() || !version.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())) {
         return Err("некорректная версия установщика".into());
     }
+    if cfg!(not(windows)) {
+        return Err("Обновление через SafeDrop работает только в Windows — поставь новую версию пакетом".into());
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().map(|p| p.to_path_buf()).ok_or("no exe dir")?;
     let script_path = std::env::temp_dir().join("safedrop-update.ps1");
@@ -1085,8 +1096,13 @@ try {{
     std::process::exit(0);
 }
 
+/// Linux: notifications are named by the desktop file, nothing to set up.
+#[cfg(not(windows))]
+fn ensure_notif_shortcut() {}
+
 /// Ensure Start Menu shortcut with our AppUserModelID so Windows toasts
 /// show as SafeDrop (not PowerShell). Idempotent, per-user, no admin.
+#[cfg(windows)]
 fn ensure_notif_shortcut() {
     // NOTE: plain thread (NOT tokio::spawn_blocking): setup() runs before
     // the Tokio runtime context exists, which would panic.
@@ -1197,11 +1213,7 @@ async fn open_url(url: String) -> Result<(), String> {
 /// Open Windows notification settings page.
 #[tauri::command]
 async fn open_notif_settings() -> Result<(), String> {
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", "ms-settings:notifications"])
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    open_ms_settings("ms-settings:notifications")
 }
 
 // ---------- native dialogs (real paths for Tauri WebView) ----------
@@ -1356,8 +1368,10 @@ async fn factory_reset(
         let _ = std::fs::remove_file(f);
     }
     let _ = std::fs::remove_dir_all(state.app_dir.join("avatars"));
-    let _ = reg(&["delete", ctx_base(), "/f"]);
-    let _ = reg(&["delete", &clsid_key(), "/f"]);
+    if cfg!(windows) {
+        let _ = reg(&["delete", ctx_base(), "/f"]);
+        let _ = reg(&["delete", &clsid_key(), "/f"]);
+    }
     let _ = settings::apply_autostart(false);
     let fresh = Settings::default();
     let _ = std::fs::create_dir_all(&fresh.loaddrop_dir);
@@ -1381,6 +1395,12 @@ async fn open_firewall(state: tauri::State<'_, AppState>) -> Result<String, Stri
         let s = state.settings.lock().await;
         (s.tcp_port, s.sig_port, s.udp_enabled, s.udp_port)
     };
+    if cfg!(not(windows)) {
+        let udp = if udp_on { format!(" и {udp_port}/udp") } else { String::new() };
+        return Err(format!(
+            "На Linux открой порты сам: {tcp}/tcp, {sig}/tcp{udp} (например, sudo ufw allow {tcp}/tcp)"
+        ));
+    }
     let out = tokio::task::spawn_blocking(move || {
         let mut log = String::new();
         let mut rules: Vec<(&str, u16, &str)> = vec![
@@ -1503,6 +1523,9 @@ async fn set_ctx_menu(
         state.settings.lock().await.ctx_menu = enabled;
     }
     settings::persist_settings(&state);
+    if cfg!(not(windows)) {
+        return if enabled { Err("Меню «Отправить в SafeDrop» есть только в Проводнике Windows".into()) } else { Ok(()) };
+    }
     if !enabled {
         let _ = reg(&["delete", ctx_base(), "/f"]);
         let _ = reg(&["delete", &clsid_key(), "/f"]);
@@ -1559,7 +1582,17 @@ async fn win_drag(app: tauri::AppHandle) -> Result<(), String> {
     main_window(&app)?.start_dragging().map_err(|e| e.to_string())
 }
 
+/// Linux: ask the window manager to highlight the window.
+#[cfg(not(windows))]
+#[tauri::command]
+async fn flash_window(app: tauri::AppHandle) -> Result<(), String> {
+    let w = app.get_webview_window("main").ok_or("no window")?;
+    w.request_user_attention(Some(tauri::UserAttentionType::Informational))
+        .map_err(|e| e.to_string())
+}
+
 /// Flash taskbar icon when something arrives while window is hidden/minimized.
+#[cfg(windows)]
 #[tauri::command]
 async fn flash_window(app: tauri::AppHandle) -> Result<(), String> {
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -1602,6 +1635,9 @@ async fn get_pending_send(state: tauri::State<'_, AppState>) -> Result<Option<Pe
 /// (WebView2 remembers Allow/Deny per profile and skips future prompts.)
 #[tauri::command]
 async fn fix_mic_blocked(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if cfg!(not(windows)) {
+        return Err("На Linux проверь, что микрофон не выключен в настройках звука системы".into());
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let bat_path = std::env::temp_dir().join("safedrop-fix-mic.bat");
     let bat = format!(
@@ -1682,6 +1718,11 @@ async fn clear_cache(state: tauri::State<'_, AppState>) -> Result<String, String
             freed += rm_tree(&web.join(sub));
         }
     }
+    // WebKitGTK держит дисковый кэш в ~/.cache/<identifier>
+    #[cfg(not(windows))]
+    if let Some(cache) = dirs::cache_dir() {
+        freed += rm_tree(&cache.join("com.safedrop.app"));
+    }
     Ok(format!("Кэш очищен ({}), освобождено ~{}", parts.join(", "), fmt_mb(freed)))
 }
 
@@ -1758,7 +1799,10 @@ async fn test_notify(state: tauri::State<'_, AppState>) -> Result<String, String
             n.body("Тест с аватаркой.");
             n.icon(&ic);
             n.sound_name("Default");
+            #[cfg(windows)]
             n.app_id("com.safedrop.app");
+            #[cfg(not(windows))]
+            n.appname("SafeDrop");
             match n.show() {
                 Ok(_) => return Ok("show() OK с аватаркой — тост передан Windows.".into()),
                 Err(e1) => {
@@ -1768,7 +1812,10 @@ async fn test_notify(state: tauri::State<'_, AppState>) -> Result<String, String
                     n2.body("Тест без аватарки.");
                     n2.auto_icon();
                     n2.sound_name("Default");
+                    #[cfg(windows)]
                     n2.app_id("com.safedrop.app");
+                    #[cfg(not(windows))]
+                    n2.appname("SafeDrop");
                     match n2.show() {
                         Ok(_) => return Ok(format!("Без иконки — OK. С иконкой ошибка (аватарка битая?): {e1:?}. Смени аватарку.")),
                         Err(e2) => return Err(format!("с иконкой: {e1:?} | без иконки: {e2:?}")),
@@ -1781,7 +1828,10 @@ async fn test_notify(state: tauri::State<'_, AppState>) -> Result<String, String
     n.summary(&format!("{nick} (проверка)"));
     n.body("Так выглядят уведомления SafeDrop. Видишь это — всё работает.");
     n.auto_icon();
+    #[cfg(windows)]
     n.app_id("com.safedrop.app");
+    #[cfg(not(windows))]
+    n.appname("SafeDrop");
     n.sound_name("Default");
     match n.show() {
         Ok(_) => Ok("show() OK — тост передан Windows. Если его НЕ видно: Параметры → Система → Уведомления (общий тумблер, «Не беспокоить», правила фокусировки — особенно «при дублировании экрана»).".into()),
@@ -1846,6 +1896,7 @@ async fn get_build_info() -> Result<serde_json::Value, String> {
         "version": app_version(),
         "build_time": option_env!("BUILD_TIME").unwrap_or("?"),
         "exe": exe,
+        "os": std::env::consts::OS,
     }))
 }
 
@@ -2087,7 +2138,7 @@ fn main() {
             // DLL that Explorer may still have loaded from an earlier release.
             let ctx_menu_enabled = app.state::<AppState>()
                 .settings.try_lock().map(|s| s.ctx_menu).unwrap_or(false);
-            if ctx_menu_enabled {
+            if ctx_menu_enabled && cfg!(windows) {
                 let _ = write_ctx_menu(app.handle());
             }
             // launched from Explorer context menu: bring window forward

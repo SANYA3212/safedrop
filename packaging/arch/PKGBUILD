@@ -1,0 +1,25 @@
+# Пакет для Arch Linux из готового .deb (собирается `cargo tauri build` в src-tauri).
+# Положи SafeDrop_<версия>_amd64.deb рядом с этим файлом и выполни: makepkg -si
+pkgname=safedrop-bin
+pkgver=0.3.30
+pkgrel=1
+pkgdesc="SafeDrop — P2P обмен файлами, чаты и звонки по локальной сети и Radmin VPN"
+arch=('x86_64')
+url="https://github.com/SANYA3212/safedrop"
+license=('LicenseRef-MIT-CommonsClause')
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'gst-plugins-base' 'gst-plugins-good')
+optdepends=(
+  'gst-plugins-bad: звонки и демонстрация экрана (WebRTC)'
+  'gst-libav: видео в «Смотреть вместе»'
+  'zip: отправка папок'
+)
+provides=('safedrop')
+conflicts=('safedrop')
+options=('!strip' '!debug')
+source=("SafeDrop_${pkgver}_amd64.deb" "LICENSE")
+sha256sums=('SKIP' 'SKIP')
+
+package() {
+  bsdtar -xf data.tar.* -C "$pkgdir"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

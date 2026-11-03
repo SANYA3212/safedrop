@@ -126,8 +126,31 @@ pub fn persist_peers(state: &AppState) {
     }
 }
 
+/// Linux autostart: ~/.config/autostart/safedrop.desktop (XDG).
+#[cfg(not(windows))]
+pub fn apply_autostart(enabled: bool) -> Result<(), String> {
+    let dir = dirs::config_dir().ok_or("no config dir")?.join("autostart");
+    let file = dir.join("safedrop.desktop");
+    if enabled {
+        // AppImage: current_exe — временная точка монтирования, запускать надо сам образ
+        let exe = std::env::var_os("APPIMAGE")
+            .map(std::path::PathBuf::from)
+            .map_or_else(|| std::env::current_exe().map_err(|e| e.to_string()), Ok)?;
+        let exec = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let content = format!(
+            "[Desktop Entry]\nType=Application\nName=SafeDrop\nExec=\"{exec}\"\nIcon=safedrop\nX-GNOME-Autostart-enabled=true\n"
+        );
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(&file, content).map_err(|e| e.to_string())?;
+    } else if file.exists() {
+        let _ = std::fs::remove_file(&file);
+    }
+    Ok(())
+}
+
 /// Autostart via Startup folder shortcut (stub v1: .bat launcher).
 /// Creates/removes %APPDATA%/Microsoft/Windows/Start Menu/Programs/Startup/SafeDrop.bat
+#[cfg(windows)]
 pub fn apply_autostart(enabled: bool) -> Result<(), String> {
     let startup = dirs::config_dir()
         .map(|p| {

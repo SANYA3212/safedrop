@@ -1,0 +1,3 @@
+# Linux build files must keep LF even with core.autocrlf on Windows
+*.sh text eol=lf
+PKGBUILD text eol=lf
