@@ -6,6 +6,10 @@
 
 ## [Не выпущено]
 
+## [0.3.30-linux] — 2026-11-04
+
+Сборка 0.3.30 для Linux (ветка `linux`), для Windows ничего не меняется.
+
 ### Добавлено
 - Сборка под Linux (ветка `linux`): `build-linux.sh` собирает `.deb` и AppImage, а `packaging/arch/PKGBUILD` делает из `.deb` пакет для Arch (`makepkg -si`).
 - Автозапуск на Linux через `~/.config/autostart/safedrop.desktop`, отправка папок через `zip`, мигание окна через оконный менеджер.
