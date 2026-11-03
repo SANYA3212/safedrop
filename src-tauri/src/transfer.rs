@@ -87,11 +87,44 @@ fn partial_path(drop_dir: &str, peer_ip: &str, fkey: &str) -> PathBuf {
     partial_dir(drop_dir).join(format!("{who}_{fkey}.part"))
 }
 
+/// Рядом с частью: какой файл (имя, размер) пользователь принял под этим ключом.
+fn partial_meta_path(part: &Path) -> PathBuf {
+    let mut s = part.as_os_str().to_owned();
+    s.push(".json");
+    PathBuf::from(s)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PartMeta {
+    name: String,
+    size: u64,
+}
+
+/// Докачка без вопроса — только того же файла, что был принят.
+fn part_meta_matches(raw: &[u8], name: &str, size: u64) -> bool {
+    serde_json::from_slice::<PartMeta>(raw)
+        .map(|m| m.name == name && m.size == size)
+        .unwrap_or(false)
+}
+
+async fn write_part_meta(part: &Path, name: &str, size: u64) {
+    let meta = PartMeta { name: name.to_string(), size };
+    if let Ok(raw) = serde_json::to_vec(&meta) {
+        let _ = tokio::fs::write(partial_meta_path(part), raw).await;
+    }
+}
+
+/// Часть и её описание удаляются вместе.
+async fn remove_partial(part: &Path) {
+    let _ = tokio::fs::remove_file(part).await;
+    let _ = tokio::fs::remove_file(partial_meta_path(part)).await;
+}
+
 /// Сколько уже скачано; часть больше файла (другой файл с тем же ключом) удаляется.
 async fn partial_len(path: &Path, total: u64) -> u64 {
     match tokio::fs::metadata(path).await {
         Ok(m) if m.len() <= total => m.len(),
-        Ok(_) => { let _ = tokio::fs::remove_file(path).await; 0 }
+        Ok(_) => { remove_partial(path).await; 0 }
         Err(_) => 0,
     }
 }
@@ -100,11 +133,19 @@ async fn partial_len(path: &Path, total: u64) -> u64 {
 async fn clean_old_partials(drop_dir: &str) {
     let Ok(mut rd) = tokio::fs::read_dir(partial_dir(drop_dir)).await else { return };
     while let Ok(Some(e)) = rd.next_entry().await {
+        let path = e.path();
+        // описание живёт, пока жива его часть
+        if let Some(part) = path.to_str().and_then(|s| s.strip_suffix(".part.json")) {
+            if tokio::fs::metadata(format!("{part}.part")).await.is_err() {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+            continue;
+        }
         let old = e.metadata().await.ok().and_then(|m| m.modified().ok())
             .and_then(|t| t.elapsed().ok())
             .map(|d| d.as_secs() > 7 * 24 * 3600)
             .unwrap_or(false);
-        if old { let _ = tokio::fs::remove_file(e.path()).await; }
+        if old { remove_partial(&path).await; }
     }
 }
 
@@ -207,7 +248,19 @@ async fn handle_conn(
     let resume = if offer.resume && offer.kind != "update" && valid_fkey(&offer.fkey) {
         clean_old_partials(&drop_dir).await;
         let p = partial_path(&drop_dir, &peer_ip, &offer.fkey);
-        let have = partial_len(&p, offer.size).await;
+        let mut have = partial_len(&p, offer.size).await;
+        if have > 0 {
+            // тот же ключ, но другое имя/размер (или старая часть без описания) —
+            // это новый файл: часть выбрасываем и спрашиваем как обычно
+            let same = match tokio::fs::read(partial_meta_path(&p)).await {
+                Ok(raw) => part_meta_matches(&raw, &offer.name, offer.size),
+                Err(_) => false,
+            };
+            if !same {
+                remove_partial(&p).await;
+                have = 0;
+            }
+        }
         Some((p, have))
     } else {
         None
@@ -347,7 +400,11 @@ pub(crate) async fn receive_stream(
             Err(e) => Err(e),
         }
     } else {
-        File::create(&part_path).await
+        // старое описание не должно пережить новую часть
+        if resumable { let _ = tokio::fs::remove_file(partial_meta_path(&part_path)).await; }
+        let f = File::create(&part_path).await;
+        if resumable && f.is_ok() { write_part_meta(&part_path, &offer.name, total).await; }
+        f
     };
     let mut out = match opened {
         Ok(f) => f,
@@ -432,7 +489,7 @@ pub(crate) async fn receive_stream(
             cancelled_parts().lock().unwrap_or_else(|e| e.into_inner())
                 .insert((peer_ip.clone(), offer.fkey.clone()), Instant::now());
         }
-        let _ = tokio::fs::remove_file(&part_path).await;
+        remove_partial(&part_path).await;
         set_transfer_status(&app, &id, "cancelled").await;
         let _ = app.emit("safedrop-cancelled", serde_json::json!({
             "filename": safe_name, "peer": peer_ip, "direction": "down",
@@ -447,11 +504,12 @@ pub(crate) async fn receive_stream(
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
             let msg = format!("can't move into place: {e}");
-            let _ = tokio::fs::remove_file(&part_path).await;
+            remove_partial(&part_path).await;
             set_transfer_error(&app, &id, &msg).await;
             return Err(anyhow::anyhow!(msg));
         }
     }
+    if resumable { let _ = tokio::fs::remove_file(partial_meta_path(&part_path)).await; }
     let hash = hex::encode(hasher.finalize());
     println!("received {} ({} bytes, sha256 {})", final_path.display(), done, hash);
     finish_transfer(&app, &id).await;
@@ -640,6 +698,8 @@ pub(crate) async fn pump_upload(
             return Err(SendErr::Fatal(msg));
         }
     }
+    // шлём ровно заявленный размер, даже если файл дописывается во время отправки
+    let mut f = f.take(total.saturating_sub(offset));
     let mut buf = vec![0u8; CHUNK];
     let mut done: u64 = offset;
     let start = Instant::now();
@@ -800,7 +860,25 @@ mod hex {
 
 #[cfg(test)]
 mod resume_tests {
-    use super::{parse_ver, partial_path, valid_fkey, RESUME_SINCE};
+    use super::{parse_ver, part_meta_matches, partial_meta_path, partial_path, valid_fkey, RESUME_SINCE};
+
+    #[test]
+    fn resume_only_for_the_same_accepted_file() {
+        let raw = br#"{"name":"movie.mkv","size":1000}"#;
+        assert!(part_meta_matches(raw, "movie.mkv", 1000));
+        assert!(!part_meta_matches(raw, "evil.exe", 1000));
+        assert!(!part_meta_matches(raw, "movie.mkv", 2000));
+        assert!(!part_meta_matches(b"", "movie.mkv", 1000));
+        assert!(!part_meta_matches(b"garbage", "movie.mkv", 1000));
+    }
+
+    #[test]
+    fn part_meta_sits_next_to_the_part() {
+        let p = partial_path("C:/LoadDrop", "26.1.2.3", "0123456789abcdef0123456789abcdef");
+        let m = partial_meta_path(&p);
+        assert_eq!(m.parent(), p.parent());
+        assert!(m.to_string_lossy().ends_with("_0123456789abcdef0123456789abcdef.part.json"));
+    }
 
     #[test]
     fn versions_gate_resume() {

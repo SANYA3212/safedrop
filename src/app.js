@@ -424,7 +424,7 @@ function renderPeerCard() {
   $("#rc-trust").title = "Доверенный";
   $("#rc-trust").onclick = toggleTrustSel;
   const p = sel();
-  if (!p) { $("#rc-nick").textContent = "—"; $("#rc-sub").textContent = "Выбери контакт слева"; return; }
+  if (!p) { $("#rc-nick").textContent = "—"; $("#rc-sub").textContent = "Выбери контакт слева"; $("#rc-ping").textContent = "—"; $("#rc-avatar").outerHTML = '<span id="rc-avatar" class="ava lg"><span>?</span></span>'; return; } // сброс аватарки/счётчика от прежней группы
   $("#rc-nick").textContent = dispName(p);
   $("#rc-sub").textContent = p.nickname ? `ник: ${p.nickname} · ${p.ip}` : p.ip;
   $("#rc-ping").innerHTML = p.online ? `<span style="color:#3ddc84">●</span> в сети · ${p.ping_ms ?? "?"} мс` : `<span style="color:#666">●</span> не в сети`;
@@ -864,18 +864,24 @@ $("#chat-search-input").addEventListener("input", runChatSearch);
 
 // ---------- глобальный поиск во всех чатах ----------
 let allChatsCache = null; // { key: rows }
-async function loadAllChats(force = false) {
-  if (allChatsCache && !force) return allChatsCache;
-  const out = {};
-  for (const p of peers) {
-    try { out[p.ip] = await invoke("get_chat", { peerIp: p.ip }); } catch { out[p.ip] = []; }
-  }
-  for (const g of groups) {
-    const key = `g:${g.id}`;
-    try { out[key] = await invoke("get_chat", { peerIp: key }); } catch { out[key] = []; }
-  }
-  allChatsCache = out;
-  return out;
+let allChatsLoading = null; // общий промис загрузки — параллельные вызовы ждут его, а не грузят заново
+function loadAllChats(force = false) {
+  if (allChatsCache && !force) return Promise.resolve(allChatsCache);
+  if (allChatsLoading && !force) return allChatsLoading;
+  const job = (async () => {
+    const out = {};
+    for (const p of peers) {
+      try { out[p.ip] = await invoke("get_chat", { peerIp: p.ip }); } catch { out[p.ip] = []; }
+    }
+    for (const g of groups) {
+      const key = `g:${g.id}`;
+      try { out[key] = await invoke("get_chat", { peerIp: key }); } catch { out[key] = []; }
+    }
+    if (allChatsLoading === job) { allChatsCache = out; allChatsLoading = null; } // кэш сбросили во время загрузки — не пишем устаревшее
+    return out;
+  })();
+  allChatsLoading = job;
+  return job;
 }
 function chatTitle(key) {
   if (key.startsWith("g:")) {
@@ -892,7 +898,7 @@ $("#btn-search-global").onclick = () => {
   $("#search-all-input").value = "";
   $("#search-all-results").innerHTML = "";
   $("#search-all-input")?.focus();
-  allChatsCache = null; // при открытии — свежие данные, без устаревшего кэша
+  allChatsCache = null; allChatsLoading = null; // при открытии — свежие данные, без устаревшего кэша
 };
 function closeSearchModal() {
   $("#search-modal")?.classList.add("hidden");
@@ -909,13 +915,14 @@ async function runGlobalSearch() {
   if (!q) { host.innerHTML = ""; return; }
   host.innerHTML = `<div class="csr-empty">Ищу…</div>`;
   const data = await loadAllChats();
+  if ((($("#search-all-input").value || "").trim().toLowerCase()) !== q) return; // пока грузили, запрос сменился — рисует новый вызов
   const hits = [];
   for (const [key, rows] of Object.entries(data)) {
     for (const m of rows) {
       if ((m.text || "").toLowerCase().includes(q)) hits.push({ key, m });
     }
   }
-  hits.sort((a, b) => Number(b.m.ts?.split(":").join("") || 0) - Number(a.m.ts?.split(":").join("") || 0));
+  hits.sort((a, b) => (Number(b.m.sent_at) || 0) - (Number(a.m.sent_at) || 0)); // новые сверху; ts "ЧЧ:ММ" ломается между днями
   if (!hits.length) { host.innerHTML = `<div class="csr-empty">Ничего не найдено</div>`; return; }
   host.innerHTML = hits.slice(0, 60).map(({ key, m }) => {
     const src = m.from_me ? (profile.nickname || settings?.device_name || "Я") : (m.from_nick || chatTitle(key));
@@ -1319,9 +1326,9 @@ async function initDevices() {
   devs.filter((d) => d.kind === "audiooutput").forEach((d, i) => { const o = document.createElement("option"); o.value = d.deviceId; o.textContent = d.label || `Динамики ${i + 1}`; ss.appendChild(o); });
   if (settings.mic_id) ms.value = settings.mic_id;
   if (settings.speaker_id) ss.value = settings.speaker_id;
-  ms.onchange = async () => { settings.mic_id = ms.value; await invoke("save_settings", { settings }); toast("Микрофон сохранён"); if (localStream) await startMic().catch(() => {}); };
+  ms.onchange = async () => { settings.mic_id = ms.value; try { await invoke("save_settings", { settings }); } catch (e) { return toast("Не сохранилось: " + e, true); } toast("Микрофон сохранён"); if (localStream) await startMic().catch(() => {}); };
   ss.onchange = async () => {
-    settings.speaker_id = ss.value; await invoke("save_settings", { settings }); toast("Динамики сохранены");
+    settings.speaker_id = ss.value; try { await invoke("save_settings", { settings }); } catch (e) { return toast("Не сохранилось: " + e, true); } toast("Динамики сохранены");
     try { await $("#remote-audio").setSinkId(ss.value); } catch {}
     try { if (ampCtx && typeof ampCtx.setSinkId === "function") await ampCtx.setSinkId(ss.value); } catch {}
   };
@@ -1659,8 +1666,19 @@ async function setPeerVol(ip, v) {
   ampSet("v:" + ip, (deafened || v === 0) ? 0 : v);
   renderCallPanel();
 }
+// Проверка микрофона вне звонка: через 15 с отпускаем его, чтобы погас значок микрофона Windows.
+let micIdleTimer = null;
+function armMicIdleStop() {
+  clearTimeout(micIdleTimer);
+  micIdleTimer = setTimeout(() => {
+    micIdleTimer = null;
+    if (inVoice() || callSetupPeer) return;
+    if (micMonitorNode) return armMicIdleStop(); // слушает себя — ждём, пока выключит мониторинг
+    stopMic();
+  }, 15000);
+}
 async function requestMic() {
-    try { await startMic(); toast("Микрофон работает <svg class='ic' viewBox='0 0 24 24'><path d='M9,16.17,4.83,12l-1.42,1.41L9,19,21,7l-1.41-1.41Z'/></svg>"); }
+    try { await startMic(); if (!inVoice()) armMicIdleStop(); toast("Микрофон работает <svg class='ic' viewBox='0 0 24 24'><path d='M9,16.17,4.83,12l-1.42,1.41L9,19,21,7l-1.41-1.41Z'/></svg>"); }
     catch (e) {
     const name = e?.name || "";
     if (name === "NotAllowedError" || name === "SecurityError") showHelp("Микрофон заблокирован", MIC_HELP, "<svg class='ic' viewBox='0 0 24 24'><path d='M20,11A8,8,0,0,0,5.64,6.64L4,8.29V4H8.29l1.59,1.59A10,10,0,0,1,22,13Z'/><path d='M4,13A8,8,0,0,0,18.36,17.36L20,15.71V20H15.71l-1.59-1.59A10,10,0,0,1,2,11Z'/></svg> Сбросить запрет (перезапуск)", async () => { toast("Перезапускаю для сброса…"); await invoke("fix_mic_blocked").catch((x) => toast("" + x, true)); });
@@ -3401,7 +3419,7 @@ $("#btn-ringback-test").onclick = () => {
 $("#btn-ringback-clear").onclick = async () => {
   settings.ringback_melody = "default";
   settings.ringback_file = "";
-  await invoke("save_settings", { settings });
+  try { await invoke("save_settings", { settings }); } catch (e) { return toast("Не сохранилось: " + e, true); }
   $("#ringback-name").textContent = "Стандартный гудок";
   document.querySelectorAll("[data-ringback]").forEach((b) => b.classList.toggle("active", b.dataset.ringback === "default"));
 };
@@ -3423,7 +3441,7 @@ document.querySelectorAll("[data-ringback]").forEach((b) => {
     }
     settings.ringback_melody = m;
     settings.ringback_file = "";
-    await invoke("save_settings", { settings });
+    try { await invoke("save_settings", { settings }); } catch (e) { return toast("Не сохранилось: " + e, true); }
     $("#ringback-name").textContent = b.textContent;
     document.querySelectorAll("[data-ringback]").forEach((x) => x.classList.toggle("active", x.dataset.ringback === m));
     playRingMelody(m);
@@ -3554,7 +3572,7 @@ $("#btn-msg-pick").onclick = async () => {
 };
 $("#btn-msg-test").onclick = () => playMsgSound();
 $("#btn-msg-clear").onclick = async () => {
-  settings.message_sound = ""; await invoke("save_settings", { settings });
+  settings.message_sound = ""; try { await invoke("save_settings", { settings }); } catch (e) { return toast("Не сохранилось: " + e, true); }
   $("#msg-name").textContent = "Стандартный «блуп»"; toast("Стандартный звук");
 };
 $("#btn-snd-file-pick").onclick = async () => {
@@ -3569,7 +3587,7 @@ $("#btn-snd-file-pick").onclick = async () => {
 };
 $("#btn-snd-file-test").onclick = () => playFileSound();
 $("#btn-snd-file-clear").onclick = async () => {
-  settings.file_sound = ""; await invoke("save_settings", { settings });
+  settings.file_sound = ""; try { await invoke("save_settings", { settings }); } catch (e) { return toast("Не сохранилось: " + e, true); }
   $("#snd-file-name").textContent = "Стандартный сигнал"; toast("Стандартный звук");
 };
 $("#btn-clear-history").onclick = async () => {
@@ -3641,7 +3659,7 @@ $("#btn-bg-pick").onclick = async () => {
 };
 $("#btn-bg-clear").onclick = async () => {
   settings.theme = { ...collectTheme(), bg_mode: "gradient", bg_image: "" };
-  applyTheme(); await invoke("save_settings", { settings }); toast("Фон убран");
+  applyTheme(); try { await invoke("save_settings", { settings }); } catch (e) { return toast("Не сохранилось: " + e, true); } toast("Фон убран");
 };
 $("#btn-theme-save").onclick = async () => {
   settings.theme = collectTheme();
@@ -3673,6 +3691,20 @@ function themeFromFile(obj) {
   if (out.bg_image && /^(\\\\|\/\/)|:\/\//.test(out.bg_image)) delete out.bg_image;
   return out;
 }
+// Опасное в CSS темы: @import, url() на внешний адрес (сеть/UNC — маячок-трекер), expression(), экранирования.
+const THEME_REMOTE_URL = /url\(\s*['"]?\s*(?:(?!data:)[a-z][a-z0-9+.-]*:|\/\/|\\)[^)]*\)?/gi; // любая схема кроме data:, //host, \\UNC
+function themeRisks(v) {
+  const r = [];
+  if (/@import/i.test(v)) r.push("@import (подгрузка чужих стилей)");
+  if (new RegExp(THEME_REMOTE_URL.source, "i").test(v)) r.push("url() на внешний адрес (тот сервер узнает твой IP и когда ты открыл программу)");
+  if (/image-set\([^)]*['"]\s*(?:[a-z][a-z0-9+.-]*:|\/\/|\\)/i.test(v)) r.push("image-set() с внешним адресом");
+  if (/expression\s*\(/i.test(v)) r.push("expression()");
+  if (/\\/.test(v)) r.push("экранированные символы (могут прятать ссылки)");
+  return r;
+}
+function themeStripRemote(v) {
+  return v.replace(/@import\b[^;]*;?/gi, "").replace(THEME_REMOTE_URL, "none").replace(/expression\s*\(/gi, "none(");
+}
 $("#btn-theme-import").onclick = () => $("#theme-import-file").click();
 $("#theme-import-file").onchange = async (e) => {
   const file = e.target.files && e.target.files[0];
@@ -3681,6 +3713,22 @@ $("#theme-import-file").onchange = async (e) => {
   try {
     if (file.size > 1_000_000) throw new Error("файл слишком большой для темы");
     const imported = themeFromFile(JSON.parse(await file.text()));
+    const risky = {}; // поле -> что нашли (bg_image уже проверен в themeFromFile)
+    for (const [k, v] of Object.entries(imported)) if (typeof v === "string" && k !== "bg_image" && k !== "bg_mode") { const r = themeRisks(v); if (r.length) risky[k] = r; }
+    if (Object.keys(risky).length) {
+      const found = [...new Set(Object.values(risky).flat())].join("; ");
+      const ok = await askConfirm("В теме есть внешние ссылки или код",
+        `Нашлось: ${found}. Поля: ${Object.keys(risky).join(", ")}. Такая тема может обращаться к чужим серверам (они увидят твой IP и время запуска) или прятать/подменять кнопки. «Применить как есть» — если доверяешь автору темы. «Отмена» — эти куски вырежутся, остальное оформление импортируется.`,
+        "Применить как есть");
+      if (!ok) {
+        const dropped = [];
+        for (const k of Object.keys(risky)) {
+          const v = themeStripRemote(imported[k]);
+          if (themeRisks(v).length) { delete imported[k]; dropped.push(k); } else imported[k] = v; // не вычистилось (экранирования и т.п.) — поле целиком не берём
+        }
+        if (dropped.length) toast("Не импортировано (не удалось очистить): " + dropped.join(", "));
+      }
+    }
     const keepImage = !imported.bg_image && settings.theme && settings.theme.bg_image;
     settings.theme = Object.assign({}, settings.theme, imported);
     if (keepImage) settings.theme.bg_image = keepImage;
@@ -3904,7 +3952,7 @@ $("#del-all").onclick = async () => {
   } catch (e) { toast("" + e, true); }
 };
 $("#btn-clear-chat").onclick = () => { if (curKey()) openDel({ mode: "clear" }); };
-$("#btn-mic-test").onclick = () => startMic().then(() => toast("Говори — полоска должна двигаться")).catch(() => {});
+$("#btn-mic-test").onclick = () => startMic().then(() => { if (!inVoice()) armMicIdleStop(); toast("Говори — полоска должна двигаться"); }).catch(() => {});
 let micMonitorNode = null;
 $("#btn-mic-monitor").onclick = () => {
   if (micMonitorNode) {

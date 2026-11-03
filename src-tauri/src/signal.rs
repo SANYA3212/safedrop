@@ -190,15 +190,86 @@ async fn persist_group_sync(state: &AppState) {
     }
 }
 
+/// Who sent a frame: every address of that contact (LAN, Radmin, ...) and its
+/// nickname from hello. An unknown host gets just the connection IP.
+async fn sender_identity(state: &AppState, ip: &str) -> (Vec<String>, String) {
+    let peers = state.peers.lock().await;
+    let mut addrs = vec![ip.to_string()];
+    let mut nick = peers.get(ip).map(|p| p.nickname.trim().to_string()).unwrap_or_default();
+    for p in peers.values().filter(|p| p.ip == ip || p.ips.iter().any(|x| x == ip)) {
+        addrs.push(p.ip.clone());
+        addrs.extend(p.ips.iter().cloned());
+        if nick.is_empty() { nick = p.nickname.trim().to_string(); }
+    }
+    addrs.retain(|a| !a.is_empty());
+    addrs.sort();
+    addrs.dedup();
+    (addrs, nick)
+}
+
+/// Chats a peer may edit/react in: its direct chat (stored under any of its
+/// addresses) and the groups it is a member of. For groups the value lists
+/// the nicknames of the other members (messages carry no sender IP).
+async fn sender_chats(state: &AppState, addrs: &[String]) -> Vec<(String, Vec<String>)> {
+    let groups: Vec<Group> = state.groups.lock().await.clone();
+    let peers = state.peers.lock().await;
+    let mut out: Vec<(String, Vec<String>)> = addrs.iter().map(|a| (a.clone(), Vec::new())).collect();
+    for g in groups.iter().filter(|g| g.members.iter().any(|m| addrs.contains(m))) {
+        let others = g.members.iter()
+            .filter(|m| !addrs.contains(m))
+            .filter_map(|m| peers.get(m).or_else(|| peers.values().find(|p| p.ips.iter().any(|x| x == m))))
+            .map(|p| p.nickname.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        out.push((format!("g:{}", g.id), others));
+    }
+    out
+}
+
+/// Group id seen anywhere locally (group list or sync records).
+fn group_known(gid: &str, groups: &[Group], sync: &GroupSyncState) -> bool {
+    groups.iter().any(|g| g.id == gid)
+        || sync.deleted.iter().any(|d| d.id == gid)
+        || sync.departures.iter().any(|d| d.group_id == gid)
+        || sync.rejoins.iter().any(|r| r.group_id == gid)
+        || sync.metas.iter().any(|m| m.id == gid)
+}
+
+/// The source is (or was) a member of the group as far as we know.
+fn source_in_group(gid: &str, src: &[String], groups: &[Group], sync: &GroupSyncState) -> bool {
+    let has = |list: &Vec<String>| list.iter().any(|m| src.contains(m));
+    groups.iter().any(|g| g.id == gid && has(&g.members))
+        || sync.deleted.iter().any(|d| d.id == gid && has(&d.members))
+        || sync.departures.iter().any(|d| d.group_id == gid && (src.contains(&d.member_ip) || has(&d.members)))
+        || sync.rejoins.iter().any(|r| r.group_id == gid && (src.contains(&r.member_ip) || has(&r.members)))
+}
+
 /// Merge group deletions, departures and re-joins, then relay newly learned
 /// records to the other participants so offline peers converge as well.
+/// Records from a remote host (`source_ip`) are accepted only from members of
+/// that group; local commands (`None`) are trusted.
 pub async fn merge_group_sync(app: &AppHandle, incoming: GroupSyncState, source_ip: Option<&str>) {
     let state: tauri::State<'_, AppState> = app.state();
     let mut forwarded = GroupSyncState::default();
+    let src_addrs: Option<Vec<String>> = match source_ip {
+        Some(ip) => Some(sender_identity(&state, ip).await.0),
+        None => None,
+    };
+    let local_groups: Vec<Group> = if src_addrs.is_some() { state.groups.lock().await.clone() } else { Vec::new() };
     {
         let mut local = state.group_sync.lock().await;
+        // checked against the live records: a rejoin accepted earlier in this
+        // batch makes its member trusted for the records that follow
+        let trusted = |gid: &str, local: &GroupSyncState| match &src_addrs {
+            None => true,
+            Some(src) => source_in_group(gid, src, &local_groups, local),
+        };
+        let unknown = |gid: &str, local: &GroupSyncState| !group_known(gid, &local_groups, local);
+        let is_source = |ip: &str| src_addrs.as_ref().map_or(false, |src| src.iter().any(|a| a == ip));
         for mut deletion in incoming.deleted {
             if deletion.id.is_empty() { continue; }
+            // unknown group: nothing to delete, keep the record so it propagates
+            if !trusted(&deletion.id, &local) && !unknown(&deletion.id, &local) { continue; }
             deletion.members.sort();
             deletion.members.dedup();
             if let Some(current) = local.deleted.iter_mut().find(|x| x.id == deletion.id) {
@@ -215,6 +286,8 @@ pub async fn merge_group_sync(app: &AppHandle, incoming: GroupSyncState, source_
         }
         for mut departure in incoming.departures {
             if departure.group_id.is_empty() || departure.member_ip.is_empty() { continue; }
+            // a member leaves itself, or a member removes someone
+            if !is_source(&departure.member_ip) && !trusted(&departure.group_id, &local) { continue; }
             if local.rejoins.iter().any(|r| r.group_id == departure.group_id && r.member_ip == departure.member_ip && r.joined_at >= departure.left_at) { continue; }
             departure.members.sort();
             departure.members.dedup();
@@ -236,6 +309,8 @@ pub async fn merge_group_sync(app: &AppHandle, incoming: GroupSyncState, source_
         }
         for mut rejoin in incoming.rejoins {
             if rejoin.group_id.is_empty() || rejoin.member_ip.is_empty() { continue; }
+            // added by a member, own rejoin, or an invite to a group we never saw
+            if !is_source(&rejoin.member_ip) && !trusted(&rejoin.group_id, &local) && !unknown(&rejoin.group_id, &local) { continue; }
             if local.departures.iter().any(|d| d.group_id == rejoin.group_id && d.member_ip == rejoin.member_ip && d.left_at >= rejoin.joined_at) { continue; }
             let rejoin_group_id = rejoin.group_id.clone();
             let rejoin_member_ip = rejoin.member_ip.clone();
@@ -260,6 +335,8 @@ pub async fn merge_group_sync(app: &AppHandle, incoming: GroupSyncState, source_
         }
         for mut meta in incoming.metas {
             if meta.id.is_empty() { continue; }
+            // rename/avatar only from members (or for a group new to us)
+            if !trusted(&meta.id, &local) && !unknown(&meta.id, &local) { continue; }
             meta.avatar = trim_avatar(&meta.avatar);
             meta.name = meta.name.chars().take(40).collect();
             if let Some(current) = local.metas.iter_mut().find(|x| x.id == meta.id) {
@@ -607,12 +684,15 @@ pub(crate) async fn process_frame(
                 let mut chats = state.chats.lock().await;
                 for mut msg in messages {
                     msg.sent_at = normalize_sent_at(msg.sent_at);
-                    msg.images.retain(|s| !s.is_empty() && s.len() <= 700_000);
+                    msg.edited_at = normalize_sent_at(msg.edited_at);
+                    msg.text = msg.text.chars().take(2000).collect();
+                    // same rules as a live chat frame: only plain image data URLs
+                    msg.images.retain(|s| s.len() <= 700_000 && is_data_image(s));
                     msg.images.truncate(10);
-                    if msg.images.is_empty() && !msg.image.is_empty() && msg.image.len() <= 700_000 {
+                    if msg.images.is_empty() && msg.image.len() <= 700_000 && is_data_image(&msg.image) {
                         msg.images.push(msg.image.clone());
                     }
-                    if !msg.images.is_empty() { msg.image = msg.images[0].clone(); }
+                    msg.image = msg.images.first().cloned().unwrap_or_default();
                     let is_group = msg.peer.starts_with("g:");
                     if is_group {
                         if !group_ids.contains(&msg.peer) { continue; }
@@ -625,8 +705,9 @@ pub(crate) async fn process_frame(
                     // Delivery state is local to the sender; never inherit it from sync.
                     msg.status.clear();
                     msg.delivered_to.clear();
-                    // Remote absolute paths are meaningless here: resolve audio from LoadDrop.
-                    if !msg.from_me && !msg.audio.is_empty() {
+                    // Remote absolute paths are meaningless here: resolve audio from
+                    // LoadDrop (for restored own messages too, never a peer's path).
+                    if !msg.audio.is_empty() {
                         msg.audio = local_audio_path(&loaddrop_dir, &msg.audio);
                     }
                     let rows = chats.entry(msg.peer.clone()).or_default();
@@ -801,19 +882,28 @@ pub(crate) async fn process_frame(
             // idempotent: applied by message id; text at most 2000 chars;
             // only the author of the message may edit it
             let text = text.trim().chars().take(2000).collect::<String>();
-            let edited_at = normalize_sent_at(edited_at);
+            // legacy clients send no time: treat the edit as made now
+            let edited_at = if edited_at <= 0 { chrono::Utc::now().timestamp_millis() } else { normalize_sent_at(edited_at) };
+            let (addrs, known_nick) = sender_identity(&state, &ip).await;
+            // nickname from hello; the frame's own `from` only for unknown hosts
+            let author = if known_nick.is_empty() { from.trim().to_string() } else { known_nick };
+            let allowed = sender_chats(&state, &addrs).await;
             let mut updated: Option<String> = None;
             {
                 let mut c = state.chats.lock().await;
-                for (key, rows) in c.iter_mut() {
-                    if let Some(m) = rows.iter_mut().find(|m| m.id == id && !m.from_me && m.from_nick == from) {
-                        if m.text != text || m.edited_at < edited_at {
-                            m.text = text.clone();
-                            m.edited_at = edited_at;
-                            updated = Some(key.clone());
-                        }
-                        break;
+                for (key, others) in &allowed {
+                    let Some(rows) = c.get_mut(key) else { continue };
+                    let Some(m) = rows.iter_mut().find(|m| m.id == id && !m.from_me) else { continue };
+                    // direct chat: every message not ours is theirs (survives a
+                    // rename); group: by nickname, not one another member holds
+                    let theirs = !key.starts_with("g:") || (m.from_nick == author && !others.contains(&author));
+                    // a stale resend must not undo a newer edit
+                    if theirs && edited_at >= m.edited_at && (m.text != text || m.edited_at < edited_at) {
+                        m.text = text.clone();
+                        m.edited_at = edited_at;
+                        updated = Some(key.clone());
                     }
+                    break;
                 }
             }
             if let Some(peer) = updated {
@@ -822,12 +912,25 @@ pub(crate) async fn process_frame(
             }
         }
         Frame::ChatReact { from, nickname, id, emoji, remove } => {
+            if emoji.is_empty() || emoji.chars().count() > 8 { return Ok(()); }
+            let (addrs, known_nick) = sender_identity(&state, &ip).await;
+            // reactions are keyed by nickname: a peer adds/removes only its own
+            // (nickname from hello; the frame's one only for unknown hosts)
+            let who = if !known_nick.is_empty() {
+                known_nick
+            } else if nickname.trim().is_empty() {
+                from.trim().to_string()
+            } else {
+                nickname.trim().to_string()
+            };
+            let allowed = sender_chats(&state, &addrs).await;
             let mut updated: Option<String> = None;
             {
                 let mut c = state.chats.lock().await;
-                for (key, rows) in c.iter_mut() {
+                for (key, _) in &allowed {
+                    let Some(rows) = c.get_mut(key) else { continue };
                     if let Some(m) = rows.iter_mut().find(|m| m.id == id) {
-                        let who = if nickname.trim().is_empty() { from.clone() } else { nickname.trim().to_string() };
+                        let who = who.clone();
                         let entry = m.reactions.iter_mut().find(|r| r.emoji == emoji);
                         match (entry, remove) {
                             (Some(r), false) => {
@@ -923,11 +1026,7 @@ fn local_audio_path(dir: &str, remote: &str) -> String {
 }
 
 async fn persist_chats(state: &AppState) {
-    let g = state.chats.lock().await;
-    let _ = std::fs::create_dir_all(&state.app_dir);
-    if let Ok(data) = serde_json::to_string_pretty(&*g) {
-        let _ = std::fs::write(state.chats_path(), data);
-    }
+    crate::settings::save_chats_soon(state);
 }
 
 pub async fn persist_groups(state: &AppState) {
@@ -1095,6 +1194,17 @@ fn audio_name(path: &str) -> String {
         .to_string()
 }
 
+/// Edits/reactions re-sent on hello: only this recent, at most this many per hello.
+const EXTRAS_WINDOW_MS: i64 = 7 * 24 * 3600 * 1000;
+const EXTRAS_MAX: usize = 30;
+
+/// Edits/reactions already re-sent in this session (peer ip -> marks): every
+/// hello (~30 s) used to re-send all of them again.
+fn extras_sent() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>> {
+    static SENT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>> = std::sync::OnceLock::new();
+    SENT.get_or_init(Default::default)
+}
+
 /// Re-send chat messages that are still "sent" to online peers. Called
 /// periodically as well as on hello: a lost ack must not leave one tick
 /// forever. Extras (edits/reactions) are only flushed on hello to avoid
@@ -1112,6 +1222,7 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
         .map(|g| (format!("g:{}", g.id), g.name.clone(), g.members.clone()))
         .collect();
     let mut jobs: Vec<serde_json::Value> = Vec::new();
+    let mut extras: Vec<(String, serde_json::Value)> = Vec::new();
     {
         let chats = state.chats.lock().await;
         for (key, rows) in chats.iter() {
@@ -1137,21 +1248,36 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
                 }
             }
             // offline catch-up for edits and own reactions (idempotent on the
-            // receiving side: keyed by message id / (emoji, nickname) pair)
+            // receiving side: keyed by message id / (emoji, nickname) pair).
+            // Only recent ones, each at most once per session and peer.
             if include_extras && (is_direct || group.is_some()) {
+                let since = chrono::Utc::now().timestamp_millis() - EXTRAS_WINDOW_MS;
+                let mut sent = extras_sent().lock().unwrap_or_else(|e| e.into_inner());
+                let done = sent.entry(peer_ip.to_string()).or_default();
+                if done.len() > 20_000 { done.clear(); }
                 for m in rows.iter().rev().take(200) {
-                    if m.from_me && m.edited_at > 0 {
-                        jobs.push(serde_json::json!({
-                            "kind": "chat-edit", "from": nick, "id": m.id,
-                            "text": m.text, "edited_at": m.edited_at,
-                        }));
+                    if extras.len() >= EXTRAS_MAX { break; }
+                    if m.from_me && m.edited_at > since {
+                        let mark = format!("e|{key}|{}|{}", m.id, m.edited_at);
+                        if done.insert(mark.clone()) {
+                            extras.push((mark, serde_json::json!({
+                                "kind": "chat-edit", "from": nick, "id": m.id,
+                                "text": m.text, "edited_at": m.edited_at,
+                            })));
+                        }
                     }
+                    // reactions carry no time: use the message's age instead
+                    if m.sent_at <= since { continue; }
                     for r in &m.reactions {
+                        if extras.len() >= EXTRAS_MAX { break; }
                         if r.by.iter().any(|b| b == &nick) {
-                            jobs.push(serde_json::json!({
-                                "kind": "chat-react", "from": nick, "nickname": nick,
-                                "id": m.id, "emoji": r.emoji, "remove": false,
-                            }));
+                            let mark = format!("r|{key}|{}|{}", m.id, r.emoji);
+                            if done.insert(mark.clone()) {
+                                extras.push((mark, serde_json::json!({
+                                    "kind": "chat-react", "from": nick, "nickname": nick,
+                                    "id": m.id, "emoji": r.emoji, "remove": false,
+                                })));
+                            }
                         }
                     }
                 }
@@ -1165,6 +1291,23 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
             let _ = crate::quic::send_frame_dual(&app2, &target, port, v, false).await;
         });
     }
+    if extras.is_empty() { return; }
+    // one connection after another instead of a burst of parallel ones;
+    // stop at the first failure and let the next hello retry the rest
+    let app2 = app.clone();
+    let target = peer_ip.to_string();
+    tokio::spawn(async move {
+        for i in 0..extras.len() {
+            let v = extras[i].1.clone();
+            if crate::quic::send_frame_dual(&app2, &target, port, v, false).await.is_err() {
+                let mut sent = extras_sent().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(done) = sent.get_mut(&target) {
+                    for (mark, _) in &extras[i..] { done.remove(mark); }
+                }
+                break;
+            }
+        }
+    });
 }
 
 /// Periodically re-send still-unacknowledged messages to online peers. Only

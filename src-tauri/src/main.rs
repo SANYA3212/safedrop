@@ -425,14 +425,7 @@ async fn send_chat(
         rows.push(msg.clone());
         rows.sort_by(|a, b| a.sent_at.cmp(&b.sent_at).then_with(|| a.id.cmp(&b.id)));
     }
-    // persist
-    {
-        let g = state.chats.lock().await;
-        let _ = std::fs::create_dir_all(&state.app_dir);
-        if let Ok(data) = serde_json::to_string_pretty(&*g) {
-            let _ = std::fs::write(state.chats_path(), data);
-        }
-    }
+    settings::save_chats_soon(&state);
     let _ = app.emit("safedrop-chat", msg.clone());
     // Deliver in the background: an offline peer must not block the composer.
     // The message stays in chats.json with status "sent" and is flushed when
@@ -449,12 +442,7 @@ async fn send_chat(
 // ---------- chat delete / clear ----------
 
 fn persist_chats(state: &tauri::State<'_, AppState>) {
-    if let Some(g) = settings::try_lock_briefly(&state.chats) {
-        let _ = std::fs::create_dir_all(&state.app_dir);
-        if let Ok(data) = serde_json::to_string_pretty(&*g) {
-            let _ = std::fs::write(state.chats_path(), data);
-        }
-    }
+    settings::save_chats_soon(state);
 }
 
 #[tauri::command]
@@ -781,13 +769,7 @@ async fn send_group_chat(
         rows.push(msg.clone());
         rows.sort_by(|a, b| a.sent_at.cmp(&b.sent_at).then_with(|| a.id.cmp(&b.id)));
     }
-    {
-        let g = state.chats.lock().await;
-        let _ = std::fs::create_dir_all(&state.app_dir);
-        if let Ok(data) = serde_json::to_string_pretty(&*g) {
-            let _ = std::fs::write(state.chats_path(), data);
-        }
-    }
+    settings::save_chats_soon(&state);
     let _ = app.emit("safedrop-chat", msg.clone());
     // Fan out in parallel; unreachable members keep the message queued ("sent")
     // until the next hello and are deduplicated by id on the receiving side.
@@ -843,13 +825,7 @@ async fn chat_edit(
             m.edited_at = edited_at;
         }
     }
-    {
-        let g = state.chats.lock().await;
-        let _ = std::fs::create_dir_all(&state.app_dir);
-        if let Ok(data) = serde_json::to_string_pretty(&*g) {
-            let _ = std::fs::write(state.chats_path(), data);
-        }
-    }
+    settings::save_chats_soon(&state);
     let _ = app.emit("safedrop-chat-changed", serde_json::json!({"peer": peer_ip}));
     // fan-out to the direct peer or to every group member
     let members: Option<Vec<String>> = if let Some(gid) = peer_ip.strip_prefix("g:") {
@@ -918,13 +894,7 @@ async fn chat_react(
             }
         }
     }
-    {
-        let g = state.chats.lock().await;
-        let _ = std::fs::create_dir_all(&state.app_dir);
-        if let Ok(data) = serde_json::to_string_pretty(&*g) {
-            let _ = std::fs::write(state.chats_path(), data);
-        }
-    }
+    settings::save_chats_soon(&state);
     let _ = app.emit("safedrop-chat-changed", serde_json::json!({"peer": peer_ip}));
     let members: Option<Vec<String>> = if let Some(gid) = peer_ip.strip_prefix("g:") {
         let g = state.groups.lock().await;
@@ -1051,7 +1021,7 @@ async fn send_update(
 
 /// Apply a downloaded update: run the installer exe directly.
 #[tauri::command]
-async fn apply_update(_state: tauri::State<'_, AppState>, path: String, version: String) -> Result<(), String> {
+async fn apply_update(state: tauri::State<'_, AppState>, path: String, version: String) -> Result<(), String> {
     if !std::path::Path::new(&path).exists() {
         return Err("файл обновления не найден (уже удалён?)".into());
     }
@@ -1110,6 +1080,7 @@ try {{
         .arg(&script_path)
         .spawn()
         .map_err(|e| e.to_string())?;
+    settings::save_chats_now(&state); // история пишется с задержкой
     std::thread::sleep(std::time::Duration::from_millis(250));
     std::process::exit(0);
 }
@@ -1576,6 +1547,8 @@ async fn win_hide(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn win_quit(app: tauri::AppHandle) -> Result<(), String> {
+    // история пишется на диск с задержкой — перед выходом дописать
+    settings::save_chats_now(&app.state::<AppState>());
     app.exit(0);
     Ok(())
 }
@@ -1628,7 +1601,7 @@ async fn get_pending_send(state: tauri::State<'_, AppState>) -> Result<Option<Pe
 /// kills the app, wipes the WebView2 profile dir, restarts.
 /// (WebView2 remembers Allow/Deny per profile and skips future prompts.)
 #[tauri::command]
-async fn fix_mic_blocked() -> Result<(), String> {
+async fn fix_mic_blocked(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let bat_path = std::env::temp_dir().join("safedrop-fix-mic.bat");
     let bat = format!(
@@ -1640,6 +1613,7 @@ async fn fix_mic_blocked() -> Result<(), String> {
         .args(["/C", &bat_path.to_string_lossy()])
         .spawn()
         .map_err(|e| e.to_string())?;
+    settings::save_chats_now(&state); // история пишется с задержкой
     // give the bat a moment to start, then exit so it can wipe the profile
     std::thread::sleep(std::time::Duration::from_millis(500));
     std::process::exit(0);
@@ -1667,39 +1641,56 @@ async fn clear_cache(state: tauri::State<'_, AppState>) -> Result<String, String
     if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("safedrop") || name.ends_with(".safedrop-part") {
+            if (name.starts_with("safedrop") || name.ends_with(".safedrop-part")) && !recently_written(&e) {
                 if let Ok(m) = e.metadata() {
-                    freed += m.len();
+                    if std::fs::remove_file(e.path()).is_ok() { freed += m.len(); }
                 }
-                let _ = std::fs::remove_file(e.path());
             }
         }
     }
     parts.push("временные файлы".to_string());
-    if let Ok(dir) = state.settings.try_lock().map(|s| s.loaddrop_dir.clone()) {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            let mut n = 0u32;
-            for e in rd.flatten() {
-                if e.path().extension().and_then(|x| x.to_str()) == Some("safedrop-part") {
-                    if let Ok(m) = e.metadata() {
-                        freed += m.len();
-                    }
-                    if std::fs::remove_file(e.path()).is_ok() {
-                        n += 1;
-                    }
+    let dir = state.settings.lock().await.loaddrop_dir.clone();
+    // Недокачанное: временные файлы приёма и части для докачки. Файл, в который
+    // сейчас пишет передача, свежий — его не трогаем, иначе приём сорвётся.
+    let mut n = 0u32;
+    for d in [std::path::PathBuf::from(&dir), std::path::Path::new(&dir).join(".safedrop-partial")] {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let ext = e.path().extension().and_then(|x| x.to_str()).map(|x| x.to_string());
+            let is_part = matches!(ext.as_deref(), Some("safedrop-part") | Some("part"))
+                || e.file_name().to_string_lossy().ends_with(".part.json");
+            if !is_part || recently_written(&e) { continue; }
+            if let Ok(m) = e.metadata() {
+                if m.is_file() && std::fs::remove_file(e.path()).is_ok() {
+                    freed += m.len();
+                    if ext.as_deref() != Some("json") { n += 1; }
                 }
-            }
-            if n > 0 {
-                parts.push(format!("недокачанных: {n}"));
             }
         }
     }
+    if n > 0 {
+        parts.push(format!("недокачанных: {n}"));
+    }
+    // Tauri 2 хранит данные WebView2 в EBWebView\Default; занятые файлы
+    // просто пропускаются
     if let Some(local) = dirs::data_local_dir() {
-        for sub in ["Cache", "Code Cache", "GPUCache", "Service Worker"] {
-            freed += rm_tree(&local.join("com.safedrop.app").join(sub));
+        let web = local.join("com.safedrop.app").join("EBWebView");
+        for sub in ["Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache"] {
+            freed += rm_tree(&web.join("Default").join(sub));
+        }
+        for sub in ["ShaderCache", "GrShaderCache", "GPUPersistentCache"] {
+            freed += rm_tree(&web.join(sub));
         }
     }
     Ok(format!("Кэш очищен ({}), освобождено ~{}", parts.join(", "), fmt_mb(freed)))
+}
+
+/// Файл менялся последние 2 минуты — скорее всего, в него сейчас пишут.
+fn recently_written(e: &std::fs::DirEntry) -> bool {
+    e.metadata().and_then(|m| m.modified()).ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age < std::time::Duration::from_secs(120))
+        .unwrap_or(true)
 }
 
 fn rm_tree(p: &std::path::Path) -> u64 {
@@ -1709,8 +1700,8 @@ fn rm_tree(p: &std::path::Path) -> u64 {
             if e.path().is_dir() {
                 size += rm_tree(&e.path());
             } else if let Ok(m) = e.metadata() {
-                size += m.len();
-                let _ = std::fs::remove_file(e.path());
+                // считаем только то, что действительно удалилось
+                if std::fs::remove_file(e.path()).is_ok() { size += m.len(); }
             }
         }
     }
@@ -2050,6 +2041,7 @@ fn main() {
             _ => PermissionResponse::Default,
         })
         .setup(|app| {
+            settings::init_chat_saver(app.handle());
             // tray: left click toggles window, menu has Show/Quit
             {
                 use tauri::{

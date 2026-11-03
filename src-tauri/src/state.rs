@@ -165,9 +165,10 @@ pub struct Settings {
     pub auto_accept_limit_mb: u64,
     #[serde(default = "def_true")]
     pub minimize_to_tray: bool,
-    #[serde(default = "def_true")]
-    pub autostart: bool,
+    // значения для отсутствующих в файле полей совпадают с Settings::default()
     #[serde(default)]
+    pub autostart: bool,
+    #[serde(default = "def_true")]
     pub sound: bool,
     #[serde(default)]
     pub theme: ThemeConfig,
@@ -331,7 +332,8 @@ pub struct Peer {
     pub avatar: String, // synced avatar dataURL from peer
     #[serde(default)]
     pub custom_avatar: String, // local override avatar (you assign)
-    #[serde(default = "def_true")]
+    // неизвестный контакт не получает автоприём файлов
+    #[serde(default)]
     pub trusted: bool,
     #[serde(default)]
     pub supports_file_confirm: bool,
