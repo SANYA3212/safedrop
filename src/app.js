@@ -462,7 +462,7 @@ function renderGroups() {
   const box = $("#group-list"); if (!box) return; box.innerHTML = "";
   const q = ($("#peer-search").value || "").toLowerCase();
   const list = groups.filter((g) => !q || g.name.toLowerCase().includes(q));
-  if (!list.length) { box.innerHTML = `<div class="empty-hint">Групп нет. Создай кнопкой ＋.</div>`; return; }
+  if (!list.length) { box.innerHTML = `<div class="empty-hint">Групп нет. Создай кнопкой +.</div>`; return; }
   for (const g of list) {
     const on = g.members.filter((m) => peers.find((p) => p.ip === m)?.online).length;
     const busy = g.members.some((m) => { const st = peers.find((p) => p.ip === m)?.state || ""; return st && st !== "idle"; });

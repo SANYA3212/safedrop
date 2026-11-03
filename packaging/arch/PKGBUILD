@@ -11,6 +11,7 @@ depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'gst-plugins-base' 'g
 optdepends=(
   'gst-plugins-bad: звонки и демонстрация экрана (WebRTC)'
   'gst-libav: видео в «Смотреть вместе»'
+  'gst-plugin-rsaudiofx: шумоподавление микрофона в звонках'
   'zip: отправка папок'
 )
 provides=('safedrop')
