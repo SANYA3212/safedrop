@@ -2087,12 +2087,28 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         // microphone is core feature: grant it outright so an accidental
         // "deny" can never silently break calls (no prompt at all)
-        .on_permission_request(|_, kind| match kind {
+        .on_permission_request(|_w, kind| match kind {
             PermissionKind::Microphone => PermissionResponse::Allow,
+            // WebKitGTK не показывает своего запроса, как WebView2, и без ответа
+            // отказывает: камеру и экран для звонков разрешаем только окну SafeDrop
+            #[cfg(target_os = "linux")]
+            PermissionKind::Camera | PermissionKind::DisplayCapture if _w.label() == "main" => PermissionResponse::Allow,
             _ => PermissionResponse::Default,
         })
         .setup(|app| {
             settings::init_chat_saver(app.handle());
+            // WebRTC в WebKitGTK выключен, пока его не включат в настройках (и есть,
+            // только если WebKit собран с ним — см. packaging/arch/webkit2gtk-4.1-webrtc)
+            #[cfg(target_os = "linux")]
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.with_webview(|wv| {
+                    use webkit2gtk::{SettingsExt, WebViewExt};
+                    if let Some(s) = wv.inner().settings() {
+                        s.set_enable_webrtc(true);
+                        s.set_enable_media_stream(true);
+                    }
+                });
+            }
             // tray: left click toggles window, menu has Show/Quit
             {
                 use tauri::{

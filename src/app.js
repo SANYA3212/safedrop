@@ -1993,8 +1993,15 @@ function hideCallUI() {
   stopMic();
   updateVoiceBar(); renderConv(); renderCallPanel(); renderCallStage(); updateBusy();
 }
+// WebKit на Linux бывает собран без WebRTC — тогда звонков и демонстраций нет вовсе.
+function noRtc() {
+  if (typeof RTCPeerConnection !== "undefined") return false;
+  toast("Звонки недоступны: WebKit в системе собран без WebRTC. На Arch поставь webkit2gtk-4.1-webrtc из packaging/arch.", true);
+  return true;
+}
 async function startCall(peerIp) {
   if (!peerIp) return toast("Сначала выбери контакт", true);
+  if (noRtc()) return;
   if (currentCall || groupCall || pendingOffer || callSetupPeer) return toast("Сначала заверши текущий звонок или ответь на приглашение", true);
   callSetupPeer = peerIp;
   try { await startMic(); } catch { callSetupPeer = null; showHelp("Микрофон заблокирован", MIC_HELP, "<svg class='ic' viewBox='0 0 24 24'><path d='M20,11A8,8,0,0,0,5.64,6.64L4,8.29V4H8.29l1.59,1.59A10,10,0,0,1,22,13Z'/><path d='M4,13A8,8,0,0,0,18.36,17.36L20,15.71V20H15.71l-1.59-1.59A10,10,0,0,1,2,11Z'/></svg> Сбросить запрет (перезапуск)", async () => invoke("fix_mic_blocked").catch((x) => toast("" + x, true))); return; }
@@ -2013,8 +2020,13 @@ async function acceptCall() {
   const { ip, sdp } = pendingOffer; pendingOffer = null;
   callSetupPeer = ip;
   $("#call-modal").classList.add("hidden"); ringbackStop();
-  try { await startMic(); }
-  catch {
+  try { if (noRtc()) throw new Error("no webrtc"); await startMic(); }
+  catch (e) {
+    if (e?.message === "no webrtc") {
+      callSetupPeer = null;
+      invoke("sig_send", { peerIp: ip, payload: { kind: "call-hangup", from: myNick() } }).catch(() => {});
+      return;
+    }
     callSetupPeer = null;
     invoke("sig_send", { peerIp: ip, payload: { kind: "call-hangup", from: myNick() } }).catch(() => {});
     requestMic();
@@ -2528,6 +2540,7 @@ async function offerTo(peerIp, group) {
 async function startGroupCall(g) {
   if (!g?.members?.length) return toast("В группе нет участников", true);
   if (currentCall || groupCall || pendingOffer || callSetupPeer) return toast("Сначала заверши текущий звонок или ответь на приглашение", true);
+  if (noRtc()) return;
   endGroupCall(true); // before the mic starts: ending a call releases the mic
   try { await startMic(); } catch { requestMic(); return; }
   groupCall = { id: g.id, name: g.name, members: [...g.members], initiator: myIp };
@@ -2568,6 +2581,10 @@ async function acceptMeshOffer(ip, sdp) {
   await invoke("sig_send", { peerIp: ip, payload: { kind: "call-answer", from: myNick(), sdp: JSON.stringify(ans) } });
 }
 async function joinGroupCall(gref, viaIp, viaSdp) {
+  if (noRtc()) {
+    invoke("sig_send", { peerIp: viaIp, payload: { kind: "call-hangup", from: myNick() } }).catch(() => {});
+    return;
+  }
   endGroupCall(true); // before the mic starts: ending a call releases the mic
   try { await startMic(); }
   catch {
@@ -2698,6 +2715,7 @@ function shareTargets() {
   return [];
 }
 async function startScreen() {
+  if (noRtc()) return;
   const screens = Object.entries(myShares).filter(([, s]) => s.kind !== "camera");
   if (screens.length) {
     if (!await askConfirm("Остановить все свои демонстрации?", "", "Остановить")) return;
@@ -2748,6 +2766,7 @@ async function startScreen() {
   await startShareStream(stream, `Экран • ${myNick()}`, withAudio, "screen", audioMode);
 }
 async function startCamera() {
+  if (noRtc()) return;
   const activeCam = Object.entries(myShares).find(([, s]) => s.kind === "camera");
   if (activeCam) { await stopShare(activeCam[0]); updateCameraBtn(); return; }
   const targets = shareTargets();
