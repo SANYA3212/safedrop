@@ -1951,7 +1951,7 @@ async function flushInIce() {
 }
 function ensurePC(peerIp) {
   if (pc) return pc;
-  pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+  pc = new RTCPeerConnection(RTC_CONFIG);
   pc.onicecandidate = (e) => {
     if (!e.candidate) return;
     if (currentCall === peerIp) sendIce(peerIp, e.candidate);
@@ -1993,6 +1993,9 @@ function hideCallUI() {
   stopMic();
   updateVoiceBar(); renderConv(); renderCallPanel(); renderCallStage(); updateBusy();
 }
+// max-bundle: весь звонок одним транспортом. WebKitGTK (GStreamer webrtcbin) не умеет
+// политику balanced по умолчанию и без этого не соединяется; Chromium/WebView2 — умеет.
+const RTC_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }], bundlePolicy: "max-bundle" };
 // WebKit на Linux бывает собран без WebRTC — тогда звонков и демонстраций нет вовсе.
 function noRtc() {
   if (typeof RTCPeerConnection !== "undefined") return false;
@@ -2510,7 +2513,7 @@ let gpc = {}, groupCall = null;
 let ginBuf = {};
 function ensureGPC(peerIp) {
   if (gpc[peerIp]?.pc) return gpc[peerIp].pc;
-  const c = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+  const c = new RTCPeerConnection(RTC_CONFIG);
   gpc[peerIp] = { pc: c };
   c.onicecandidate = (e) => {
     if (!e.candidate) return;
@@ -2800,7 +2803,7 @@ async function startShareStream(stream, label, withAudio, kind = "screen", audio
   stream.getVideoTracks()[0]?.addEventListener("ended", () => stopShare(shareId));
   for (const ip of targets) {
     try {
-      const c = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+      const c = new RTCPeerConnection(RTC_CONFIG);
       myShares[shareId].pcs[ip] = c;
       myShares[shareId].pcsAt[ip] = Date.now();
       const senders = [];
@@ -2876,7 +2879,7 @@ $("#btn-share-dbg").onclick = () => {
 };
 async function acceptScreenView({ ip, sdp, share_id, label, call_id }) {
   if (views[share_id]) return;
-  const c = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+  const c = new RTCPeerConnection(RTC_CONFIG);
   const stream = new MediaStream();
   views[share_id] = { pc: c, ip, label: label || `Экран • ${ip}`, callId: call_id || "", stream, volume: 100, muted: false, inbuf: [], createdAt: Date.now(), firstTrackAt: 0 };
   c.ontrack = (e) => {
