@@ -2,7 +2,7 @@
 # Звонкам нужен WebKit с WebRTC: сначала собери ../webkit2gtk-4.1-webrtc.
 pkgname=safedrop
 pkgver=0.3.30
-pkgrel=1
+pkgrel=2
 pkgdesc="SafeDrop — P2P обмен файлами, чаты и звонки по локальной сети и Radmin VPN"
 arch=('x86_64')
 url="https://github.com/SANYA3212/safedrop"
@@ -19,7 +19,8 @@ optdepends=(
 provides=('safedrop')
 conflicts=('safedrop-bin')
 options=('!lto')
-source=("$pkgname::git+$url.git#tag=v$pkgver-linux")
+# 0.3.30-2: исправления камеры и микрофона после тега v0.3.30-linux (версия та же)
+source=("$pkgname::git+$url.git#commit=6d809513e0936d3dea7819267494e797cb14eb8b")
 sha256sums=('SKIP')
 
 prepare() {

@@ -10,6 +10,8 @@
 
 Сборка 0.3.30 для Linux (ветка `linux`), для Windows ничего не меняется.
 
+Пакет `safedrop 0.3.30-2` (4 ноября) — та же версия с исправлениями камеры и микрофона; отчёт: `docs/linux-check-2026-11-04.md`.
+
 ### Добавлено
 - Сборка под Linux (ветка `linux`): `build-linux.sh` собирает `.deb` и AppImage, а `packaging/arch/PKGBUILD` делает из `.deb` пакет для Arch (`makepkg -si`).
 - Автозапуск на Linux через `~/.config/autostart/safedrop.desktop`, отправка папок через `zip`, мигание окна через оконный менеджер.
