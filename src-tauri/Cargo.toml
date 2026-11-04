@@ -1,6 +1,6 @@
 [package]
 name = "safedrop"
-version = "0.3.31"
+version = "0.3.32"
 description = "SafeDrop — P2P обмен файлами через Radmin VPN"
 edition = "2021"
 
