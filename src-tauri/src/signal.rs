@@ -137,6 +137,8 @@ fn normalize_sent_at(sent_at: i64) -> i64 {
     if sent_at <= 0 { 0 } else { sent_at.min(chrono::Utc::now().timestamp_millis()).max(1) }
 }
 
+const SIGNAL_SLOTS: usize = 128;
+
 pub async fn run_signal_server(app: AppHandle, port: u16) {
     let addr = format!("0.0.0.0:{port}");
     let listener = match TcpListener::bind(&addr).await {
@@ -147,13 +149,21 @@ pub async fn run_signal_server(app: AppHandle, port: u16) {
         }
     };
     println!("SafeDrop signal on {addr}");
+    // Кадр живёт секунды; столько одновременных соединений с запасом хватает
+    // на группы и звонки, а зависшие или зацикленные клиенты не съедят память.
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(SIGNAL_SLOTS));
     loop {
         let (sock, peer_addr) = match listener.accept().await {
             Ok(x) => x,
             Err(_) => continue,
         };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            eprintln!("signal: занято {SIGNAL_SLOTS} соединений, {peer_addr} отклонён");
+            continue; // сокет закрывается здесь
+        };
         let app2 = app.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let ip = peer_addr.ip().to_string();
             if let Err(e) = handle_frame(app2, sock, ip).await {
                 eprintln!("signal error: {e}");

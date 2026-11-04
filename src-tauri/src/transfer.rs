@@ -195,6 +195,8 @@ pub(crate) async fn is_cancelled(app: &AppHandle, id: &str) -> bool {
     x
 }
 
+const FILE_SLOTS: usize = 32;
+
 /// TCP file server: 1 connection = 1 JSON-line header + raw bytes.
 /// LoadDrop dir is read from settings per connection (moving folder works without restart).
 pub async fn run_server(app: AppHandle, port: u16) {
@@ -207,10 +209,16 @@ pub async fn run_server(app: AppHandle, port: u16) {
         }
     };
     println!("SafeDrop listening on {addr}");
+    // одновременных входящих передач: файл держит соединение минутами
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(FILE_SLOTS));
     loop {
         let (sock, peer_addr) = match listener.accept().await {
             Ok(x) => x,
             Err(_) => continue,
+        };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            eprintln!("files: занято {FILE_SLOTS} соединений, {peer_addr} отклонён");
+            continue;
         };
         let app2 = app.clone();
         // current LoadDrop (user may move it in settings anytime)
@@ -223,6 +231,7 @@ pub async fn run_server(app: AppHandle, port: u16) {
             .loaddrop_dir
             .clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = sock.set_nodelay(true);
             let sock = match crate::tls::accept(sock).await {
                 Ok((s, auth)) => match crate::tls::check_inbound(&peer_addr.ip().to_string(), &auth) {
