@@ -183,9 +183,10 @@ pub fn check_inbound(ip: &str, auth: &PeerAuth) -> Result<(), String> {
             Ok(())
         }
         Some(fp) => Err(key_mismatch(&mut map, ip, fp)),
-        // старая версия без своего сертификата — пока контакт ни разу его не
-        // показывал; потом без ключа (и без шифрования) от его имени не пускаем
-        None if p.mutual => Err(format!(
+        // открытый текст от контакта с ключом — никогда (ключ мы получили по TLS,
+        // значит, он умеет TLS); TLS без своего сертификата — старая версия
+        // (0.3.26–0.3.30), пока контакт ни разу его не показывал
+        None if p.mutual || !auth.tls => Err(format!(
             "{ip}: соединение {} от контакта с запомненным ключом отклонено",
             if auth.tls { "без ключа" } else { "без шифрования" }
         )),
@@ -193,13 +194,19 @@ pub fn check_inbound(ip: &str, auth: &PeerAuth) -> Result<(), String> {
     }
 }
 
-/// Пользователь подтвердил новый ключ: заменить старый на всех адресах контакта.
-pub fn trust_pending(ip: &str) -> Result<String, String> {
+/// Пользователь подтвердил новый ключ `expected` (код которого он видел):
+/// заменить старый ключ на всех адресах этого контакта (с тем же старым
+/// ключом). Другие контакты, даже если им пришёл тот же новый ключ, не меняются.
+pub fn trust_pending(ip: &str, expected: &str) -> Result<String, String> {
     let mut map = pins().lock().map_err(|_| "pins lock")?;
     let p = map.get(ip).cloned().ok_or("для этого адреса нет запомненного ключа")?;
     if p.pending.is_empty() { return Err("новый ключ не приходил".into()); }
-    for e in map.values_mut().filter(|e| e.fp == p.fp || e.pending == p.pending) {
-        *e = Pin { fp: p.pending.clone(), mutual: false, pending: String::new() };
+    if p.pending != expected {
+        return Err("пока вы решали, пришёл ещё один ключ — проверьте код заново".into());
+    }
+    for e in map.values_mut().filter(|e| e.fp == p.fp) {
+        // требование показывать ключ сохраняется: новый ключ — та же версия SafeDrop
+        *e = Pin { fp: p.pending.clone(), mutual: e.mutual, pending: String::new() };
     }
     save_pins(&map);
     Ok(p.pending)
@@ -477,25 +484,38 @@ mod tests {
         let ip = "10.9.9.1";
         let alt = "10.9.9.2"; // второй адрес того же ПК
         let none = PeerAuth { tls: false, fp: None };
+        let tls_only = PeerAuth { tls: true, fp: None };
         let key = |k: &str| PeerAuth { tls: true, fp: Some(k.into()) };
-        // первый контакт запоминает ключ; старый клиент без ключа пока проходит
+        // первый контакт запоминает ключ; старый клиент (TLS без своего ключа)
+        // пока проходит, открытый текст — нет
         check_outbound(ip, "k1").unwrap();
         check_outbound(alt, "k1").unwrap();
-        assert!(check_inbound(ip, &none).is_ok());
+        assert!(check_inbound(ip, &tls_only).is_ok());
+        assert!(check_inbound(ip, &none).is_err());
         // показал ключ — дальше без ключа нельзя
         assert!(check_inbound(ip, &key("k1")).is_ok());
         assert!(pin_of(ip).unwrap().mutual);
         assert!(check_inbound(ip, &none).is_err());
+        assert!(check_inbound(ip, &tls_only).is_err());
         // чужой ключ — отказ, ключ ждёт подтверждения
         assert!(check_inbound(ip, &key("k2")).is_err());
         assert!(check_outbound(ip, "k2").is_err());
         assert_eq!(pin_of(ip).unwrap().pending, "k2");
-        // подтверждение меняет ключ на всех адресах контакта
-        assert_eq!(trust_pending(ip).unwrap(), "k2");
+        // другой контакт с тем же новым ключом (подменщик выдаёт себя за обоих)
+        let other = "10.9.9.3";
+        check_outbound(other, "z1").unwrap();
+        assert!(check_outbound(other, "k2").is_err());
+        // подтвердить можно только тот ключ, код которого видел пользователь
+        assert!(trust_pending(ip, "k3").is_err());
+        assert_eq!(trust_pending(ip, "k2").unwrap(), "k2");
+        // ключ меняется на всех адресах этого контакта, но не у другого
         assert_eq!(pin_of(alt).unwrap().fp, "k2");
+        assert_eq!(pin_of(other).unwrap().fp, "z1");
+        assert!(pin_of(ip).unwrap().mutual);
         assert!(check_outbound(alt, "k2").is_ok());
         forget_key(ip);
         assert!(pin_of(ip).is_none() && pin_of(alt).is_none());
+        forget_key(other);
     }
 
     /// Сервер на одном порту принимает и TLS-клиента, и старого (без TLS);

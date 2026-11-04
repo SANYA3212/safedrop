@@ -796,14 +796,17 @@ pub(crate) async fn process_frame(
             let mut changed = Vec::new();
             {
                 let mut chats = state.chats.lock().await;
+                // «прочитано до этого сообщения»: открыв чат, собеседник видел
+                // и всё, что пришло раньше (старые версии отмечали только одно)
                 for addr in addrs {
                     if let Some(rows) = chats.get_mut(&addr) {
-                        if let Some(msg) = rows.iter_mut().find(|m| m.id == id && m.from_me) {
-                            if !msg.read {
-                                msg.read = true;
-                                changed.push(addr.clone());
-                            }
+                        let Some(upto) = rows.iter().find(|m| m.id == id && m.from_me).map(|m| m.sent_at) else { continue };
+                        let mut any = false;
+                        for msg in rows.iter_mut().filter(|m| m.from_me && !m.read && m.sent_at <= upto) {
+                            msg.read = true;
+                            any = true;
                         }
+                        if any { changed.push(addr.clone()); }
                     }
                 }
             }

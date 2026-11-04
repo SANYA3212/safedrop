@@ -464,25 +464,31 @@ async function renderKeyInfo(p) {
     return;
   }
   box.innerHTML = `${LOCK_ICON}Код безопасности: <b class="key-code">${esc(k.code)}</b><br>Сверьте его с другом голосом — у него должен быть такой же.`
-    + (k.pending ? `<br><span class="key-warn">Пришёл другой ключ — соединения отклоняются, пока вы не решите.</span> <button id="rc-key-trust">Доверять новому</button>` : "");
+    + (k.pending ? `<br><span class="key-warn">Пришёл другой ключ, его код: <b class="key-code">${esc(k.pending_code)}</b>. Соединения отклоняются, пока вы не решите.</span> <button id="rc-key-trust">Доверять новому</button>` : "");
   const b = $("#rc-key-trust");
-  if (b) b.onclick = () => trustNewKey(p.ip);
+  if (b) b.onclick = () => trustNewKey(p.ip, k.pending, k.pending_code);
 }
 const LOCK_ICON = "<svg class='ic' viewBox='0 0 24 24' style='vertical-align:-3px;margin-right:4px'><path d='M18,8H17V7A5,5,0,0,0,7,7V8H6a2,2,0,0,0-2,2V20a2,2,0,0,0,2,2H18a2,2,0,0,0,2-2V10A2,2,0,0,0,18,8Zm-5,8.79V17a1,1,0,0,1-2,0v-.21a2.5,2.5,0,1,1,2,0ZM15,8H9V7a3,3,0,0,1,6,0Z'/></svg>";
-async function trustNewKey(ip) {
+// fp — именно тот ключ, код которого видел пользователь: если за это время
+// пришёл ещё какой-то, Rust откажет и спросит заново
+async function trustNewKey(ip, fp, code) {
   const p = peers.find((x) => x.ip === ip || (x.ips || []).includes(ip));
-  if (!await askConfirm("Доверять новому ключу?", `Сделайте это, только если ${p ? dispName(p) : ip} переустановил SafeDrop или сменил ПК. Лучше сначала созвонитесь и сверьте код безопасности.`, "Доверять")) return;
-  try { await invoke("trust_new_key", { ip }); toast("Новый ключ принят"); }
+  if (!await askConfirm("Доверять новому ключу?", `Сделайте это, только если ${p ? dispName(p) : ip} переустановил SafeDrop или сменил ПК. Созвонитесь: у друга должен быть код ${code || "—"}.`, "Доверять")) return;
+  try { await invoke("trust_new_key", { ip, fp }); toast("Новый ключ принят"); }
   catch (e) { toast("Ключ: " + e, true); }
   $("#help-modal").classList.add("hidden");
   renderPeerCard();
 }
-function onKeyChanged({ ip }) {
+async function onKeyChanged({ ip }) {
   const p = peers.find((x) => x.ip === ip || (x.ips || []).includes(ip));
   const who = esc(p ? dispName(p) : ip);
+  let k = null;
+  try { k = await invoke("get_key_info", { ip }); } catch {}
+  if (!k?.pending) return;
   showHelp("Ключ контакта изменился", `<p><b>${who}</b> (${esc(ip)}) подключился с другим ключом. Соединения с ним отклоняются.</p>
+<p>Код нового ключа: <b class="key-code">${esc(k.pending_code)}</b></p>
 <ul><li>Если друг переустановил SafeDrop, нажал «Сбросить всё» с удалением ключа или сменил ПК — это нормально: созвонитесь, сверьте код безопасности и примите новый ключ.</li>
-<li>Если ничего такого не было — кто-то может выдавать себя за него. Не принимайте ключ.</li></ul>`, `${LOCK_ICON}Доверять новому ключу`, () => trustNewKey(ip));
+<li>Если ничего такого не было — кто-то может выдавать себя за него. Не принимайте ключ.</li></ul>`, `${LOCK_ICON}Доверять новому ключу`, () => trustNewKey(ip, k.pending, k.pending_code));
   if (p && p.ip === selectedIp) renderPeerCard();
 }
 
@@ -737,7 +743,19 @@ function togglePinned(key, msg) {
 }
 function renderPinned() {
   const host = $("#pinned-strip"); if (!host) return;
-  const rows = pinnedFor();
+  const key = curKey();
+  const list = chats[key];
+  let rows = pinnedFor(key);
+  if (Array.isArray(list)) {
+    // текст — из чата (после правки он новый); удалённые сообщения откреплены
+    const live = rows.map((pin) => [pin, list.find((x) => x.id === pin.id)]);
+    if (live.some(([, msg]) => !msg)) {
+      const all = pinnedMap();
+      all[key] = live.filter(([, msg]) => msg).map(([pin]) => pin);
+      try { localStorage.setItem(PIN_STORE, JSON.stringify(all)); } catch {}
+    }
+    rows = live.filter(([, msg]) => msg).map(([pin, msg]) => ({ ...pin, text: msgPreview(msg) }));
+  }
   host.innerHTML = "";
   host.classList.toggle("hidden", !rows.length);
   for (const pin of rows) {
@@ -798,11 +816,12 @@ function refreshRow(row, m, p, g, myLetter, myNick) {
       if (!ed && head) { ed = document.createElement("span"); ed.className = "medit"; ed.textContent = "изм."; head.insertBefore(ed, head.querySelector(".mstatus")); }
     } else if (ed) ed.remove();
     let st = row.querySelector(".mstatus");
-    if (me && (m.status === "delivered" || m.status === "sent")) {
+    if (me && (m.read || m.status === "delivered" || m.status === "sent")) {
       if (!st) { st = document.createElement("span"); st.className = "mstatus"; row.querySelector(".mhead").appendChild(st); }
-      st.textContent = m.status === "delivered" ? "✓✓" : "✓";
-      st.title = m.status === "delivered" ? "Доставлено" : "Отправлено, ждёт получателя";
-      st.classList.toggle("ok", m.status === "delivered");
+      const two = m.read || m.status === "delivered";
+      st.textContent = two ? "✓✓" : "✓";
+      st.title = m.read ? "Прочитано" : m.status === "delivered" ? "Доставлено" : "Отправлено, ждёт получателя";
+      st.classList.toggle("ok", m.status === "delivered" && !m.read);
       st.classList.toggle("read", !!m.read);
     } else if (st) st.remove();
     // реакции: перерисовать только контейнер, медиа не трогаем
@@ -1038,27 +1057,36 @@ document.addEventListener("keydown", (e) => {
 async function sendChat() {
   const inp = $("#chat-input"); const text = inp.value.trim();
   const images = pendingImages.slice();
-  const audio = pendingAudio?.path || "";
-  if (!text && !images.length && !audio) return;
+  if (!text && !images.length && !pendingAudio) return;
   if (!selectedIp && !selGroup) return toast("Сначала выбери контакт или группу", true);
+  // голосовое забираем сразу: второй Enter не отправит его ещё раз,
+  // а «Отменить» не удалит файл, пока он уходит
+  const voice = pendingAudio;
+  pendingAudio = null;
+  renderPendingAudio();
   inp.value = "";
   pendingImages = [];
   renderPendingAttachments();
   try {
-    const payload = { text, image: images[0] || "", images, audio };
-    if (replyToId) payload.replyTo = replyToId;
-    const m = selGroup
-      ? await invoke("send_group_chat", { groupId: selGroup, ...payload })
-      : await invoke("send_chat", { peerIp: selectedIp, ...payload });
-    if (pushMsg(m)) renderChat(); // событие из Rust дубль отсечёт по id
-    if (pendingAudio?.url) URL.revokeObjectURL(pendingAudio.url);
-    pendingAudio = null;
-    renderPendingAudio();
+    let m;
+    if (voice) {
+      m = await sendAudioToChat(voice.path, text);
+      if (!m) throw new Error("голосовое не доставлено");
+      if (voice.url) URL.revokeObjectURL(voice.url);
+    } else {
+      const payload = { text, image: images[0] || "", images, audio: "" };
+      if (replyToId) payload.replyTo = replyToId;
+      m = selGroup
+        ? await invoke("send_group_chat", { groupId: selGroup, ...payload })
+        : await invoke("send_chat", { peerIp: selectedIp, ...payload });
+      if (pushMsg(m)) renderChat(); // событие из Rust дубль отсечёт по id
+    }
     setReply(null);
     stopTypingLocal(); // своё сообщение = сразу снять «печатает»
   } catch (e) {
     if (!inp.value.trim()) inp.value = text;
     if (!pendingImages.length) { pendingImages = images; renderPendingAttachments(); }
+    if (voice && !pendingAudio) { pendingAudio = voice; renderPendingAudio(); }
     toast("Не отправлено: " + e, true);
   }
 }
@@ -1121,6 +1149,16 @@ function openForwardPicker(message) {
           audio: message.audio || "",
           forwardedFrom,
         };
+        if (payload.audio) {
+          // само аудио едет отдельным файлом (как при обычной отправке аудио)
+          const g = target.group ? groups.find((x) => x.id === target.key) : null;
+          const to = g ? g.members.filter((ip) => ip !== myIp && peers.find((p) => p.ip === ip)?.online) : [target.key];
+          let delivered = 0;
+          for (const ip of to) {
+            try { await invoke("send_file", { peerIp: ip, filePath: payload.audio }); delivered++; } catch {}
+          }
+          if (!delivered) throw new Error("аудио некому доставить (получатели не в сети)");
+        }
         const sent = target.group
           ? await invoke("send_group_chat", { groupId: target.key, ...payload })
           : await invoke("send_chat", { peerIp: target.key, ...payload });
@@ -1283,10 +1321,8 @@ async function shrinkChatImage(dataUrl, maxDim = 1024) {
 }
 let pendingImages = [];
 let pendingAudio = null;
-let voiceRecorder = null;
-let voiceStream = null;
-let voiceChunks = [];
-let voiceLimitTimer = null;
+let voiceRecorder = null; // идущая запись (MediaRecorder) или null
+let voiceStarting = false; // ждём микрофон: второй клик ничего не начинает
 
 function renderPendingAudio() {
   const host = $("#pending-audio");
@@ -1309,6 +1345,13 @@ function renderPendingAudio() {
 
 const VOICE_ICON_MIC = "<svg class='ic' viewBox='0 0 24 24'><path d='M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z'/><path d='M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z'/></svg>";
 const VOICE_ICON_STOP = "<svg class='ic' viewBox='0 0 24 24'><rect x='6' y='6' width='12' height='12' rx='2'/></svg>";
+// Остановить запись: при закрытии окна — сохранить как неотправленную,
+// при выходе — выбросить.
+function stopVoiceRecording(discard = false) {
+  if (voiceRecorder?.state !== "recording") return;
+  voiceRecorder.discard = discard;
+  voiceRecorder.stop();
+}
 function initVoiceRecorder() {
   const button = $("#btn-record-audio");
   if (
@@ -1323,23 +1366,28 @@ function initVoiceRecorder() {
   button.classList.remove("hidden");
   button.onclick = async () => {
     if (voiceRecorder?.state === "recording") { voiceRecorder.stop(); return; }
+    if (voiceStarting) return;
+    voiceStarting = true;
+    let stream = null;
     try {
       // выбранный в настройках микрофон; устаревший id (WebKit) — любой
-      voiceStream = await gumFallback([
+      stream = await gumFallback([
         ...(settings?.mic_id ? [{ audio: { deviceId: { exact: settings.mic_id } } }] : []),
         { audio: true },
       ]);
-      voiceChunks = [];
-      voiceRecorder = new MediaRecorder(voiceStream, { mimeType: mime });
-      voiceRecorder.ondataavailable = (event) => { if (event.data?.size) voiceChunks.push(event.data); };
-      voiceRecorder.onstop = async () => {
-        clearTimeout(voiceLimitTimer);
-        voiceStream?.getTracks().forEach((track) => track.stop());
-        voiceStream = null;
+      // поток, куски и таймер — у каждой записи свои: старая запись не мешает новой
+      const rec = new MediaRecorder(stream, { mimeType: mime });
+      const chunks = [];
+      const own = stream;
+      let limit = null;
+      rec.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
+      rec.onstop = async () => {
+        clearTimeout(limit);
+        own.getTracks().forEach((track) => track.stop());
+        if (voiceRecorder === rec) voiceRecorder = null;
         button.innerHTML = VOICE_ICON_MIC; button.classList.remove("rec");
-        const blob = new Blob(voiceChunks, { type: mime });
-        voiceChunks = [];
-        if (!blob.size) return;
+        const blob = new Blob(chunks, { type: mime });
+        if (rec.discard || !blob.size) return;
         const url = URL.createObjectURL(blob);
         try {
           const data = await new Promise((resolve, reject) => {
@@ -1350,6 +1398,10 @@ function initVoiceRecorder() {
           });
           const extension = mime.includes("ogg") ? "ogg" : "webm";
           const path = await invoke("save_voice_record", { data, extension });
+          // новая запись заменяет неотправленную старую
+          const old = pendingAudio;
+          if (old?.url) URL.revokeObjectURL(old.url);
+          if (old?.path) invoke("discard_voice_record", { path: old.path }).catch(() => {});
           pendingAudio = { path, url };
           renderPendingAudio();
         } catch (error) {
@@ -1357,13 +1409,15 @@ function initVoiceRecorder() {
           toast("Запись не сохранена: " + error, true);
         }
       };
-      voiceRecorder.start();
+      rec.start();
+      voiceRecorder = rec;
       button.innerHTML = VOICE_ICON_STOP; button.classList.add("rec");
-      voiceLimitTimer = setTimeout(() => voiceRecorder?.state === "recording" && voiceRecorder.stop(), 120000);
+      limit = setTimeout(() => rec.state === "recording" && rec.stop(), 120000);
     } catch (error) {
-      voiceStream?.getTracks().forEach((track) => track.stop());
-      voiceStream = null;
+      stream?.getTracks().forEach((track) => track.stop());
       toast("Не удалось включить микрофон: " + (error?.message || error), true);
+    } finally {
+      voiceStarting = false;
     }
   };
 }
@@ -1559,7 +1613,9 @@ async function pickPeerAvatar() {
 function bindPushToTalk() {
   const enabled = $("#set-ptt"), keyButton = $("#set-ptt-key");
   if (enabled) enabled.onchange = async () => {
-    settings.push_to_talk = enabled.checked; pttKeyDown = false; syncMicTrack(); syncVbMic(); renderCallStage();
+    settings.push_to_talk = enabled.checked; pttKeyDown = false;
+    if (enabled.checked) micMuted = false; // в режиме PTT мут — это отпущенная клавиша
+    syncMicTrack(); syncVbMic(); renderCallStage();
     try { await invoke("save_settings", { settings }); } catch (e) { toast("Не сохранилось: " + e, true); }
   };
   if (keyButton) keyButton.onclick = () => { keyButton.textContent = "Нажмите клавишу…"; keyButton.dataset.capture = "1"; };
@@ -2916,13 +2972,18 @@ function startCallTimer() {
   }, 1000);
 }
 function showGroupUI() {
-  if (!activeCallStartedAt) { activeCallStartedAt = Date.now(); activeCallDirection = groupCall?.initiator === myIp ? "outgoing" : "incoming"; }
+  if (!activeCallStartedAt) {
+    activeCallStartedAt = Date.now();
+    activeCallDirection = groupCall?.initiator === myIp ? "outgoing" : "incoming";
+    activeCallAnsweredAt = activeCallDirection === "incoming" ? activeCallStartedAt : 0;
+  }
   callScreenOpen = true;
   bindSharesToCall(screenCallId(), groupCall?.members || []);
   $("#btn-hangup").classList.remove("hidden");
   startCallTimer(); renderConv(); renderCallPanel(); renderCallStage(); updateVoiceBar(); updateBusy();
 }
 async function acceptMeshOffer(ip, sdp) {
+  if (groupCall && !activeCallAnsweredAt) activeCallAnsweredAt = Date.now(); // кто-то вошёл в звонок
   const c = ensureGPC(ip);
   await c.setRemoteDescription(JSON.parse(sdp));
   await flushGin(ip);
@@ -2954,7 +3015,11 @@ async function joinGroupCall(gref, viaIp, viaSdp) {
 }
 function endGroupCall(silent) {
   const endedGroup = groupCall;
-  if (endedGroup && activeCallStartedAt) { saveCallRecord({ direction: activeCallDirection, peer: endedGroup.name || endedGroup.id, group: true, participants: endedGroup.members, startedAt: activeCallStartedAt }); activeCallStartedAt = 0; }
+  if (endedGroup && activeCallStartedAt) {
+    const status = activeCallAnsweredAt ? "completed" : "unanswered";
+    saveCallRecord({ direction: activeCallDirection, peer: endedGroup.name || endedGroup.id, group: true, status, participants: endedGroup.members, startedAt: activeCallStartedAt, durationFrom: activeCallAnsweredAt });
+    activeCallStartedAt = activeCallAnsweredAt = 0;
+  }
   const hadCall = !!endedGroup || Object.keys(gpc).length > 0;
   ringbackStop();
   if (endedGroup) void closeScreensForCall(`group:${endedGroup.id}`, endedGroup.members);
@@ -3002,6 +3067,7 @@ async function closeAppWindow(quit = false) {
   closeInProgress = true;
   try {
     await leaveCallsBeforeClose();
+    stopVoiceRecording(quit);
     await invoke(quit ? "win_quit" : "win_hide");
     if (!quit) closeInProgress = false;
   } catch (e) {
@@ -4291,7 +4357,7 @@ setInterval(() => {
 }, 15000);
 // перезагрузка страницы = смерть звонка/показа: тормозим её во время голоса
 window.addEventListener("beforeunload", (e) => {
-  if (inVoice() || Object.keys(myShares).length) { e.preventDefault(); e.returnValue = ""; }
+  if (inVoice() || Object.keys(myShares).length || voiceRecorder?.state === "recording") { e.preventDefault(); e.returnValue = ""; }
 });
 window.addEventListener("keydown", (e) => {
   if (!inVoice() && !Object.keys(myShares).length) return;
@@ -4371,27 +4437,28 @@ document.addEventListener("play", (e) => {
     });
   }
 }, true);
-async function sendAudioToChat(path) {
-  if (!selectedIp && !selGroup) return toast("Сначала выбери контакт или группу", true);
+async function sendAudioToChat(path, captionText) {
+  if (!selectedIp && !selGroup) { toast("Сначала выбери контакт или группу", true); return null; }
   const name = fileName(path);
-  const caption = ($("#chat-input")?.value || "").trim();
+  const caption = captionText ?? ($("#chat-input")?.value || "").trim();
   const targets = selGroup
     ? (curGroup()?.members || []).filter((ip) => peers.find((p) => p.ip === ip)?.online)
     : (selectedIp ? [selectedIp] : []);
-  if (!targets.length) return toast("Нет получателей в сети", true);
+  if (!targets.length) { toast("Нет получателей в сети", true); return null; }
   toast(`Отправка аудио ${name}…`);
   let ok = 0;
   for (const t of targets) {
     try { await invoke("send_file", { peerIp: t, filePath: path }); ok++; }
     catch (e) { toast("Не отправлено: " + e, true); }
   }
-  if (!ok) return;
+  if (!ok) return null;
   const m = selGroup
     ? await invoke("send_group_chat", { groupId: selGroup, text: caption, image: "", images: [], audio: path })
     : await invoke("send_chat", { peerIp: selectedIp, text: caption, image: "", images: [], audio: path });
   if ($("#chat-input")) $("#chat-input").value = "";
   if (pushMsg(m)) renderChat();
   stopTypingLocal();
+  return m;
 }
 function dropOnChat(pos) {
   if (!pos || typeof pos.x !== "number" || typeof pos.y !== "number") return false;
@@ -4841,6 +4908,7 @@ try {
       try {
         await g.pc.setRemoteDescription(JSON.parse(t.sdp));
         await flushGin(t.ip);
+        if (groupCall && !activeCallAnsweredAt) activeCallAnsweredAt = Date.now();
         ringbackStop();
         playCallJoinSound();
       } catch {}

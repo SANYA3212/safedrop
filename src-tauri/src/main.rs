@@ -2014,14 +2014,15 @@ async fn get_key_info(ip: String) -> Result<serde_json::Value, String> {
         "fp": fp,
         "mutual": pin.as_ref().map(|p| p.mutual).unwrap_or(false),
         "pending": pin.as_ref().map(|p| p.pending.clone()).unwrap_or_default(),
+        "pending_code": pin.as_ref().map(|p| tls::safety_code(&me, &p.pending)).unwrap_or_default(),
         "code": tls::safety_code(&me, &fp),
     }))
 }
 
 /// Пользователь подтвердил смену ключа контакта (переустановил SafeDrop и т.п.).
 #[tauri::command]
-async fn trust_new_key(ip: String) -> Result<String, String> {
-    tls::trust_pending(&ip)
+async fn trust_new_key(ip: String, fp: String) -> Result<String, String> {
+    tls::trust_pending(&ip, &fp)
 }
 
 /// Забыть ключ контакта: при следующем соединении запомнится заново.
@@ -2047,8 +2048,10 @@ async fn clear_call_history(state: tauri::State<'_, AppState>) -> Result<(), Str
 async fn add_call_record(state: tauri::State<'_, AppState>, mut record: CallRecord) -> Result<(), String> {
     if !["incoming", "outgoing"].contains(&record.direction.as_str()) { return Err("invalid call direction".into()); }
     if !["completed", "missed", "unanswered"].contains(&record.status.as_str()) { return Err("invalid call status".into()); }
-    record.peer.truncate(256);
+    // по символам: String::truncate паникует посреди UTF-8 (имя группы из сети)
+    record.peer = record.peer.chars().take(128).collect();
     record.participants.truncate(64);
+    for p in record.participants.iter_mut() { *p = p.chars().take(64).collect(); }
     let mut history = state.call_history.lock().await;
     history.push(record);
     let extra = history.len().saturating_sub(300);
