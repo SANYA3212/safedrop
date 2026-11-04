@@ -55,6 +55,8 @@ pub(crate) enum Frame {
         members: Vec<String>,
         #[serde(default)]
         reply_to: String,
+        #[serde(default)]
+        forwarded_from: String,
     },
     #[serde(rename = "chat-sync-request")]
     ChatSyncRequest { #[serde(default)] known_ids: Vec<String> },
@@ -62,6 +64,8 @@ pub(crate) enum Frame {
     ChatSync { messages: Vec<ChatMsg> },
     #[serde(rename = "chat-ack")]
     ChatAck { ids: Vec<String> },
+    #[serde(rename = "chat-read")]
+    ChatRead { from: String, id: String },
     #[serde(rename = "call-offer")]
     CallOffer { from: String, sdp: String, #[serde(default)] group: Option<GroupRef> },
     #[serde(rename = "call-answer")]
@@ -543,7 +547,7 @@ pub(crate) async fn process_frame(
                 let _ = crate::quic::send_frame_dual(app, &ip, port, request, false).await;
             }
         }
-        Frame::Chat { from: _, nickname, text, ts, id, sent_at, image, images, audio, to_group, group_name, mut members, reply_to } => {
+        Frame::Chat { from: _, nickname, text, ts, id, sent_at, image, images, audio, to_group, group_name, mut members, reply_to, forwarded_from } => {
             let text = text.chars().take(2000).collect::<String>();
             let mut images: Vec<String> = images.into_iter()
                 .filter(|s| s.len() <= 700_000 && is_data_image(s))
@@ -634,8 +638,10 @@ pub(crate) async fn process_frame(
                 image,
                 images,
                 audio,
+                forwarded_from: forwarded_from.trim().chars().take(64).collect(),
                 status: String::new(),
                 delivered_to: Vec::new(),
+                read: false,
                 reply_to: reply_to.clone(),
                 edited_at: 0,
                 reactions: Vec::new(),
@@ -722,6 +728,8 @@ pub(crate) async fn process_frame(
                     msg.delivered_to.clear();
                     // история пришла от другого участника: кто автор, по ней не проверить
                     msg.from_ip.clear();
+                    msg.read = false;
+                    msg.forwarded_from = msg.forwarded_from.trim().chars().take(64).collect();
                     // Remote absolute paths are meaningless here: resolve audio from
                     // LoadDrop (for restored own messages too, never a peer's path).
                     if !msg.audio.is_empty() {
@@ -779,6 +787,31 @@ pub(crate) async fn process_frame(
                 persist_chats(&state).await;
                 let ack_ids: Vec<String> = ids.clone();
                 for peer in changed.clone() { let _ = app.emit("safedrop-chat-changed", serde_json::json!({"peer": peer})); let _ = app.emit("safedrop-chat-ack", serde_json::json!({"peer": peer, "ids": ack_ids})); }
+            }
+        }
+        Frame::ChatRead { from: _, id } => {
+            let (addrs, _) = sender_identity(&state, &ip).await;
+            let receipts_enabled = state.settings.lock().await.read_receipts;
+            if !receipts_enabled { return Ok(()); }
+            let mut changed = Vec::new();
+            {
+                let mut chats = state.chats.lock().await;
+                for addr in addrs {
+                    if let Some(rows) = chats.get_mut(&addr) {
+                        if let Some(msg) = rows.iter_mut().find(|m| m.id == id && m.from_me) {
+                            if !msg.read {
+                                msg.read = true;
+                                changed.push(addr.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed.is_empty() {
+                persist_chats(&state).await;
+                for peer in changed {
+                    let _ = app.emit("safedrop-chat-changed", serde_json::json!({"peer": peer}));
+                }
             }
         }
         Frame::CallOffer { from, sdp, group } => {
@@ -1260,7 +1293,7 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
                     jobs.push(serde_json::json!({
                         "kind": "chat", "id": m.id, "sent_at": m.sent_at, "from": nick, "nickname": nick,
                         "text": m.text, "ts": m.ts, "image": m.image, "images": m.images,
-                        "audio": audio_name(&m.audio), "reply_to": m.reply_to,
+                        "audio": audio_name(&m.audio), "reply_to": m.reply_to, "forwarded_from": m.forwarded_from,
                     }));
                 }
             } else if let Some((gid, gname, members)) = group {
@@ -1268,7 +1301,7 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
                     jobs.push(serde_json::json!({
                         "kind": "chat", "id": m.id, "sent_at": m.sent_at, "from": nick, "nickname": nick,
                         "text": m.text, "ts": m.ts, "image": m.image, "images": m.images,
-                        "audio": audio_name(&m.audio), "reply_to": m.reply_to,
+                        "audio": audio_name(&m.audio), "reply_to": m.reply_to, "forwarded_from": m.forwarded_from,
                         "to_group": gid.trim_start_matches("g:"), "group_name": gname, "members": members,
                     }));
                 }

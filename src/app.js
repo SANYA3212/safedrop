@@ -264,6 +264,8 @@ async function loadAll() {
   $("#set-ctxmenu").checked = !!settings.ctx_menu;
   const st = $("#set-show-typing");
   if (st) st.checked = settings.show_typing !== false;
+  const rr = $("#set-read-receipts");
+  if (rr) rr.checked = settings.read_receipts !== false;
   const dk = $("#set-duck"), dl = $("#set-duck-level");
   if (dk) dk.checked = settings.duck_media !== false;
   if (dl) { dl.value = String(settings.duck_level ?? 30); $("#set-duck-level-v").textContent = (settings.duck_level ?? 30) + "%"; }
@@ -384,6 +386,7 @@ async function selectPeer(ip) {
   renderContacts(); renderGroups(); renderConv(); renderPeerCard();
   try { chats[ip] = await invoke("get_chat", { peerIp: ip }); chats[ip].forEach((m) => seenIds.add(m.id)); } catch { chats[ip] = []; }
   renderChat();
+  markDirectChatRead();
 }
 function renderConv() {
   const g = curGroup();
@@ -667,6 +670,7 @@ function rowAvatar(m, p, g, myLetter) {
   return { av: "", letter: "?" };
 }
 function msgStatusHTML(m) {
+  if (m.read) return `<span class="mstatus read" title="Прочитано">✓✓</span>`;
   if (m.status === "delivered") return `<span class="mstatus ok" title="Доставлено">✓✓</span>`;
   if (m.status === "sent") return `<span class="mstatus" title="Отправлено, ждёт получателя">✓</span>`;
   return "";
@@ -757,7 +761,7 @@ function buildRow(m, p, g, myLetter, myNick) {
   const d = document.createElement("div");
   d.className = "msgrow" + (me ? " me" : "");
   d.dataset.mid = m.id;
-  d.innerHTML = `<span class="ava sm"><span>${avaInner(av, letter)}</span></span><div class="mbody"><div class="mhead"><b>${esc(me ? myNick : m.from_nick)}</b><time>${esc(msgTime(m))}</time>${editMark}${msgStatusHTML(m)}</div>${quoteHTML(quoteOf(m))}${imgsHTML}${m.audio ? `<div class="chat-audio"><audio controls preload="metadata" src="${tauriFile(m.audio)}"></audio><span>${esc(fileName(m.audio))}</span></div>` : ""}<p data-raw="${esc(m.text || "")}">${renderMsgText(m.text)}</p>${reactionsHTML(m, myNick)}</div><button class="mdel" title="Удалить"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button>`;
+  d.innerHTML = `<span class="ava sm"><span>${avaInner(av, letter)}</span></span><div class="mbody"><div class="mhead"><b>${esc(me ? myNick : m.from_nick)}</b><time>${esc(msgTime(m))}</time>${editMark}${msgStatusHTML(m)}</div>${m.forwarded_from ? `<div class="forwarded-mark">Переслано от ${esc(m.forwarded_from)}</div>` : ""}${quoteHTML(quoteOf(m))}${imgsHTML}${m.audio ? `<div class="chat-audio"><audio controls preload="metadata" src="${tauriFile(m.audio)}"></audio><span>${esc(fileName(m.audio))}</span></div>` : ""}<p data-raw="${esc(m.text || "")}">${renderMsgText(m.text)}</p>${reactionsHTML(m, myNick)}</div><button class="mdel" title="Удалить"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button>`;
   d.querySelectorAll(".chat-img").forEach((img) => { img.onclick = () => openImg(images[Number(img.dataset.i)]); });
   d.querySelector(".mdel").onclick = () => openDel({ mode: "msg", id: m.id, mine: me });
   d.oncontextmenu = (e) => { e.preventDefault(); openMsgMenu(e, m); };
@@ -799,6 +803,7 @@ function refreshRow(row, m, p, g, myLetter, myNick) {
       st.textContent = m.status === "delivered" ? "✓✓" : "✓";
       st.title = m.status === "delivered" ? "Доставлено" : "Отправлено, ждёт получателя";
       st.classList.toggle("ok", m.status === "delivered");
+      st.classList.toggle("read", !!m.read);
     } else if (st) st.remove();
     // реакции: перерисовать только контейнер, медиа не трогаем
     let rr = row.querySelector(".mreacts");
@@ -1033,18 +1038,22 @@ document.addEventListener("keydown", (e) => {
 async function sendChat() {
   const inp = $("#chat-input"); const text = inp.value.trim();
   const images = pendingImages.slice();
-  if (!text && !images.length) return;
+  const audio = pendingAudio?.path || "";
+  if (!text && !images.length && !audio) return;
   if (!selectedIp && !selGroup) return toast("Сначала выбери контакт или группу", true);
   inp.value = "";
   pendingImages = [];
   renderPendingAttachments();
   try {
-    const payload = { text, image: images[0] || "", images, audio: "" };
+    const payload = { text, image: images[0] || "", images, audio };
     if (replyToId) payload.replyTo = replyToId;
     const m = selGroup
       ? await invoke("send_group_chat", { groupId: selGroup, ...payload })
       : await invoke("send_chat", { peerIp: selectedIp, ...payload });
     if (pushMsg(m)) renderChat(); // событие из Rust дубль отсечёт по id
+    if (pendingAudio?.url) URL.revokeObjectURL(pendingAudio.url);
+    pendingAudio = null;
+    renderPendingAudio();
     setReply(null);
     stopTypingLocal(); // своё сообщение = сразу снять «печатает»
   } catch (e) {
@@ -1060,6 +1069,74 @@ let editingId = null; // id своего сообщения, которое пр
 let openMenuId = null; // для какого сообщения открыто контекстное меню
 
 function makeMyNick() { return profile.nickname || settings?.device_name || "Я"; }
+
+let lastReadSent = "";
+function markDirectChatRead() {
+  if (!selectedIp || selGroup || document.hidden || !document.hasFocus() || settings?.read_receipts === false) return;
+  const latest = [...(chats[selectedIp] || [])].reverse().find((message) => !message.from_me);
+  if (!latest || lastReadSent === `${selectedIp}:${latest.id}`) return;
+  const marker = `${selectedIp}:${latest.id}`;
+  lastReadSent = marker;
+  invoke("send_chat_read", { peerIp: selectedIp, id: latest.id }).catch(() => {
+    if (lastReadSent === marker) lastReadSent = "";
+  });
+}
+window.addEventListener("focus", markDirectChatRead);
+document.addEventListener("visibilitychange", markDirectChatRead);
+
+function openForwardPicker(message) {
+  const entries = [
+    ...peers.map((peer) => ({ key: peer.ip, label: dispName(peer), group: false })),
+    ...groups.map((group) => ({ key: group.id, label: group.name, group: true })),
+  ];
+  if (!entries.length) return toast("Нет контактов и групп для пересылки", true);
+  const overlay = document.createElement("div");
+  overlay.className = "overlay";
+  overlay.innerHTML = `<div class="modal text"><h2>Переслать сообщение</h2><div class="forward-targets"></div><button type="button" class="forward-cancel">Отмена</button></div>`;
+  const list = overlay.querySelector(".forward-targets");
+  for (const target of entries) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = `${target.group ? "Группа: " : ""}${target.label}`;
+    button.onclick = async () => {
+      try {
+        let bytes = msgImages(message).reduce((sum, image) => {
+          return sum + Math.max(0, (image.length - image.indexOf(",") - 1) * 0.75);
+        }, 0);
+        if (message.audio) bytes += await invoke("chat_audio_size", { path: message.audio });
+        if (bytes > 5 * 1024 * 1024) {
+          const confirmed = await askConfirm(
+            "Большое вложение",
+            `Переслать около ${(bytes / 1024 / 1024).toFixed(1)} МБ?`,
+            "Переслать",
+          );
+          if (!confirmed) return;
+        }
+        const forwardedFrom = message.from_me ? makeMyNick() : (message.from_nick || "?");
+        const images = msgImages(message);
+        const payload = {
+          text: message.text || "",
+          image: images[0] || "",
+          images,
+          audio: message.audio || "",
+          forwardedFrom,
+        };
+        const sent = target.group
+          ? await invoke("send_group_chat", { groupId: target.key, ...payload })
+          : await invoke("send_chat", { peerIp: target.key, ...payload });
+        if (sent.peer === curKey() && pushMsg(sent)) renderChat();
+        overlay.remove();
+        toast("Сообщение переслано");
+      } catch (error) {
+        toast("Не удалось переслать: " + error, true);
+      }
+    };
+    list.appendChild(button);
+  }
+  overlay.querySelector(".forward-cancel").onclick = () => overlay.remove();
+  overlay.addEventListener("click", (event) => { if (event.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+}
 
 function replyToggleUI() {
   // подкрашиваем строку-оригинал в чате
@@ -1144,6 +1221,7 @@ function openMsgMenu(e, m) {
   const reactRow = emojis.map((em) => `<button data-act="react" data-emoji="${em}" title="Реакция «${em}»">${em}</button>`).join("");
   const isPinned = pinnedFor().some((x) => x.id === m.id);
   const actions = [
+    `<button data-act="forward">Переслать</button>`,
     `<button data-act="pin">${isPinned ? "Открепить" : "Закрепить"}</button>`,
     `<button data-act="reply">Ответить</button>`,
     mine ? `<button data-act="edit">Изменить</button>` : "",
@@ -1175,6 +1253,8 @@ function openMsgMenu(e, m) {
         .catch((err) => toast("" + err, true));
     } else if (act === "reply") {
       setReply({ id: src.id, author: src.from_me ? makeMyNick() : src.from_nick, text: msgPreview(src) });
+    } else if (act === "forward") {
+      openForwardPicker(src);
     } else if (act === "edit") {
       if (Date.now() > 12 * 3600 * 1000) {} // правка доступна всегда в этой версии
       setEdit({ id: src.id, text: src.text || "" });
@@ -1202,6 +1282,93 @@ async function shrinkChatImage(dataUrl, maxDim = 1024) {
   return c.toDataURL("image/jpeg", 0.82);
 }
 let pendingImages = [];
+let pendingAudio = null;
+let voiceRecorder = null;
+let voiceStream = null;
+let voiceChunks = [];
+let voiceLimitTimer = null;
+
+function renderPendingAudio() {
+  const host = $("#pending-audio");
+  if (!host) return;
+  host.innerHTML = "";
+  host.classList.toggle("hidden", !pendingAudio);
+  if (!pendingAudio) return;
+  const row = document.createElement("div");
+  row.className = "pending-audio-row";
+  row.innerHTML = `<audio controls src="${pendingAudio.path ? tauriFile(pendingAudio.path) : pendingAudio.url}"></audio><button type="button">Отменить</button>`;
+  row.querySelector("button").onclick = async () => {
+    const path = pendingAudio?.path;
+    if (pendingAudio?.url) URL.revokeObjectURL(pendingAudio.url);
+    pendingAudio = null;
+    renderPendingAudio();
+    if (path) await invoke("discard_voice_record", { path }).catch(() => {});
+  };
+  host.appendChild(row);
+}
+
+const VOICE_ICON_MIC = "<svg class='ic' viewBox='0 0 24 24'><path d='M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z'/><path d='M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z'/></svg>";
+const VOICE_ICON_STOP = "<svg class='ic' viewBox='0 0 24 24'><rect x='6' y='6' width='12' height='12' rx='2'/></svg>";
+function initVoiceRecorder() {
+  const button = $("#btn-record-audio");
+  if (
+    !button ||
+    !window.MediaRecorder ||
+    typeof MediaRecorder.isTypeSupported !== "function" ||
+    !navigator.mediaDevices?.getUserMedia
+  ) return;
+  const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg"]
+    .find((type) => MediaRecorder.isTypeSupported(type));
+  if (!mime) return;
+  button.classList.remove("hidden");
+  button.onclick = async () => {
+    if (voiceRecorder?.state === "recording") { voiceRecorder.stop(); return; }
+    try {
+      // выбранный в настройках микрофон; устаревший id (WebKit) — любой
+      voiceStream = await gumFallback([
+        ...(settings?.mic_id ? [{ audio: { deviceId: { exact: settings.mic_id } } }] : []),
+        { audio: true },
+      ]);
+      voiceChunks = [];
+      voiceRecorder = new MediaRecorder(voiceStream, { mimeType: mime });
+      voiceRecorder.ondataavailable = (event) => { if (event.data?.size) voiceChunks.push(event.data); };
+      voiceRecorder.onstop = async () => {
+        clearTimeout(voiceLimitTimer);
+        voiceStream?.getTracks().forEach((track) => track.stop());
+        voiceStream = null;
+        button.innerHTML = VOICE_ICON_MIC; button.classList.remove("rec");
+        const blob = new Blob(voiceChunks, { type: mime });
+        voiceChunks = [];
+        if (!blob.size) return;
+        const url = URL.createObjectURL(blob);
+        try {
+          const data = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(blob);
+          });
+          const extension = mime.includes("ogg") ? "ogg" : "webm";
+          const path = await invoke("save_voice_record", { data, extension });
+          pendingAudio = { path, url };
+          renderPendingAudio();
+        } catch (error) {
+          URL.revokeObjectURL(url);
+          toast("Запись не сохранена: " + error, true);
+        }
+      };
+      voiceRecorder.start();
+      button.innerHTML = VOICE_ICON_STOP; button.classList.add("rec");
+      voiceLimitTimer = setTimeout(() => voiceRecorder?.state === "recording" && voiceRecorder.stop(), 120000);
+    } catch (error) {
+      voiceStream?.getTracks().forEach((track) => track.stop());
+      voiceStream = null;
+      toast("Не удалось включить микрофон: " + (error?.message || error), true);
+    }
+  };
+}
+initVoiceRecorder();
+
 function renderPendingAttachments() {
   const host = $("#pending-attachments"); if (!host) return;
   host.innerHTML = "";
@@ -4516,6 +4683,12 @@ $("#btn-scan-now").onclick = async () => {
     settings.show_typing = st.checked;
     invoke("save_settings", { settings }).catch((e) => toast("" + e, true));
   };
+  const receipts = $("#set-read-receipts");
+  if (receipts) receipts.onchange = () => {
+    settings.read_receipts = receipts.checked;
+    if (receipts.checked) { lastReadSent = ""; markDirectChatRead(); }
+    invoke("save_settings", { settings }).catch((e) => toast("" + e, true));
+  };
 }
 
 bindAccordion();
@@ -4549,7 +4722,7 @@ try {
     setTypingState(key, m.from_nick, false); // сообщение пришло — «печатает» снимаем
     try { wtChatIncoming(m, key); } catch {}
     const sameChat = key === curKey();
-    if (sameChat) renderChat();
+    if (sameChat) { renderChat(); if (key === selectedIp) markDirectChatRead(); }
     else { unread[m.peer] = (unread[m.peer] || 0) + 1; renderContacts(); renderGroups(); toast(`<svg class='ic' viewBox='0 0 24 24'><path d="M20,2H4A2,2,0,0,0,2,4V22l4-4H20a2,2,0,0,0,2-2V4A2,2,0,0,0,20,2Z"/></svg> ${m.from_nick}: ${(m.text || "<svg class='ic' viewBox='0 0 24 24'><path d='M20,3H4A2,2,0,0,0,2,5V16.76l4.88-4.88A3,3,0,0,1,11,11.76l.87-.88A3,3,0,0,1,14,10a3,3,0,0,1,2.12.88L22,16.76V5A2,2,0,0,0,20,3ZM11,9a2,2,0,1,1,2-2A2,2,0,0,1,11,9ZM21.93,19.51a2,2,0,0,1-1.42,1.42A1.7,1.7,0,0,1,20,21H4a1.7,1.7,0,0,1-.51-.07,2,2,0,0,1-1.42-1.42L4,17.58l4.29-4.29a1,1,0,0,1,1.42,0L11,14.59l2.29-2.3a1,1,0,0,1,1.42,0L20,17.58Z'/></svg> картинка").slice(0, 80)}`); }
     // Sound only when the app is not in the foreground. In a focused window
     // the open chat stays silent; any other chat still plays the sound.

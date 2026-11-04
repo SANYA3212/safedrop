@@ -239,6 +239,8 @@ pub struct Settings {
     #[serde(default = "def_true")]
     pub show_typing: bool, // send "typing…" indicator while composing
     #[serde(default = "def_true")]
+    pub read_receipts: bool,
+    #[serde(default = "def_true")]
     pub duck_media: bool, // quieter YouTube/browser video while someone in the call talks
     #[serde(default = "def_duck_level")]
     pub duck_level: u8, // % of the normal video volume while ducked
@@ -321,6 +323,7 @@ impl Default for Settings {
             push_to_talk_key: "Space".into(),
             udp_port: def_udp_port(),
             show_typing: true,
+            read_receipts: true,
             duck_media: true,
             duck_level: 30,
             scan_adapters: Vec::new(),
@@ -489,9 +492,13 @@ pub struct ChatMsg {
     #[serde(default)]
     pub audio: String, // local absolute path to an audio file in chat ("")
     #[serde(default)]
+    pub forwarded_from: String,
+    #[serde(default)]
     pub status: String, // "" (legacy) | sent | delivered
     #[serde(default)]
     pub delivered_to: Vec<String>, // ips that acknowledged a group message
+    #[serde(default)]
+    pub read: bool,
     #[serde(default)]
     pub reply_to: String, // id of the quoted message ("" = none)
     #[serde(default)]
