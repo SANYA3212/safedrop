@@ -781,6 +781,9 @@ function buildRow(m, p, g, myLetter, myNick) {
   d.dataset.mid = m.id;
   d.innerHTML = `<span class="ava sm"><span>${avaInner(av, letter)}</span></span><div class="mbody"><div class="mhead"><b>${esc(me ? myNick : m.from_nick)}</b><time>${esc(msgTime(m))}</time>${editMark}${msgStatusHTML(m)}</div>${m.forwarded_from ? `<div class="forwarded-mark">Переслано от ${esc(m.forwarded_from)}</div>` : ""}${quoteHTML(quoteOf(m))}${imgsHTML}${m.audio ? `<div class="chat-audio"><audio controls preload="metadata" src="${tauriFile(m.audio)}"></audio><span>${esc(fileName(m.audio))}</span></div>` : ""}<p data-raw="${esc(m.text || "")}">${renderMsgText(m.text)}</p>${reactionsHTML(m, myNick)}</div><button class="mdel" title="Удалить"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button>`;
   d.querySelectorAll(".chat-img").forEach((img) => { img.onclick = () => openImg(images[Number(img.dataset.i)]); });
+  // файл аудио не дошёл (получатель был не в сети, отклонил файл) — не пустой плеер
+  const au = d.querySelector(".chat-audio audio");
+  if (au) au.addEventListener("error", () => { au.replaceWith(Object.assign(document.createElement("i"), { className: "muted", textContent: "аудиофайл не получен" })); }, { once: true });
   d.querySelector(".mdel").onclick = () => openDel({ mode: "msg", id: m.id, mine: me });
   d.oncontextmenu = (e) => { e.preventDefault(); openMsgMenu(e, m); };
   const q = d.querySelector(".mquote");
@@ -1070,7 +1073,7 @@ async function sendChat() {
   try {
     let m;
     if (voice) {
-      m = await sendAudioToChat(voice.path, text);
+      m = await sendAudioToChat(voice.path, { caption: text, images, replyTo: replyToId });
       if (!m) throw new Error("голосовое не доставлено");
       if (voice.url) URL.revokeObjectURL(voice.url);
     } else {
@@ -1150,7 +1153,9 @@ function openForwardPicker(message) {
           forwardedFrom,
         };
         if (payload.audio) {
-          // само аудио едет отдельным файлом (как при обычной отправке аудио)
+          // само аудио едет отдельным файлом (как при обычной отправке аудио),
+          // под уникальным именем: у получателя может быть другой файл с тем же
+          try { payload.audio = await invoke("stage_chat_audio", { path: payload.audio }); } catch {}
           const g = target.group ? groups.find((x) => x.id === target.key) : null;
           const to = g ? g.members.filter((ip) => ip !== myIp && peers.find((p) => p.ip === ip)?.online) : [target.key];
           let delivered = 0;
@@ -1323,6 +1328,8 @@ let pendingImages = [];
 let pendingAudio = null;
 let voiceRecorder = null; // идущая запись (MediaRecorder) или null
 let voiceStarting = false; // ждём микрофон: второй клик ничего не начинает
+let voiceCancelStart = false; // окно закрыли, пока ждали микрофон — не начинать
+let voiceSaveSeq = 0, voicePublishedSeq = 0; // порядок записей: старая не заменит новую
 
 function renderPendingAudio() {
   const host = $("#pending-audio");
@@ -1348,6 +1355,7 @@ const VOICE_ICON_STOP = "<svg class='ic' viewBox='0 0 24 24'><rect x='6' y='6' w
 // Остановить запись: при закрытии окна — сохранить как неотправленную,
 // при выходе — выбросить.
 function stopVoiceRecording(discard = false) {
+  if (voiceStarting) voiceCancelStart = true;
   if (voiceRecorder?.state !== "recording") return;
   voiceRecorder.discard = discard;
   voiceRecorder.stop();
@@ -1368,6 +1376,7 @@ function initVoiceRecorder() {
     if (voiceRecorder?.state === "recording") { voiceRecorder.stop(); return; }
     if (voiceStarting) return;
     voiceStarting = true;
+    voiceCancelStart = false;
     let stream = null;
     try {
       // выбранный в настройках микрофон; устаревший id (WebKit) — любой
@@ -1375,8 +1384,10 @@ function initVoiceRecorder() {
         ...(settings?.mic_id ? [{ audio: { deviceId: { exact: settings.mic_id } } }] : []),
         { audio: true },
       ]);
+      if (voiceCancelStart) { stream.getTracks().forEach((track) => track.stop()); return; }
       // поток, куски и таймер — у каждой записи свои: старая запись не мешает новой
       const rec = new MediaRecorder(stream, { mimeType: mime });
+      const seq = ++voiceSaveSeq;
       const chunks = [];
       const own = stream;
       let limit = null;
@@ -1398,6 +1409,13 @@ function initVoiceRecorder() {
           });
           const extension = mime.includes("ogg") ? "ogg" : "webm";
           const path = await invoke("save_voice_record", { data, extension });
+          if (seq < voicePublishedSeq) {
+            // пока эта сохранялась, уже появилась более новая — эту выбросить
+            URL.revokeObjectURL(url);
+            invoke("discard_voice_record", { path }).catch(() => {});
+            return;
+          }
+          voicePublishedSeq = seq;
           // новая запись заменяет неотправленную старую
           const old = pendingAudio;
           if (old?.url) URL.revokeObjectURL(old.url);
@@ -2983,9 +3001,9 @@ function showGroupUI() {
   startCallTimer(); renderConv(); renderCallPanel(); renderCallStage(); updateVoiceBar(); updateBusy();
 }
 async function acceptMeshOffer(ip, sdp) {
-  if (groupCall && !activeCallAnsweredAt) activeCallAnsweredAt = Date.now(); // кто-то вошёл в звонок
   const c = ensureGPC(ip);
   await c.setRemoteDescription(JSON.parse(sdp));
+  if (groupCall && !activeCallAnsweredAt) activeCallAnsweredAt = Date.now(); // кто-то вошёл в звонок
   await flushGin(ip);
   const ans = await c.createAnswer();
   await c.setLocalDescription(ans);
@@ -4357,7 +4375,7 @@ setInterval(() => {
 }, 15000);
 // перезагрузка страницы = смерть звонка/показа: тормозим её во время голоса
 window.addEventListener("beforeunload", (e) => {
-  if (inVoice() || Object.keys(myShares).length || voiceRecorder?.state === "recording") { e.preventDefault(); e.returnValue = ""; }
+  if (inVoice() || Object.keys(myShares).length || voiceStarting || voiceRecorder?.state === "recording") { e.preventDefault(); e.returnValue = ""; }
 });
 window.addEventListener("keydown", (e) => {
   if (!inVoice() && !Object.keys(myShares).length) return;
@@ -4437,26 +4455,37 @@ document.addEventListener("play", (e) => {
     });
   }
 }, true);
-async function sendAudioToChat(path, captionText) {
-  if (!selectedIp && !selGroup) { toast("Сначала выбери контакт или группу", true); return null; }
-  const name = fileName(path);
-  const caption = captionText ?? ($("#chat-input")?.value || "").trim();
-  const targets = selGroup
-    ? (curGroup()?.members || []).filter((ip) => peers.find((p) => p.ip === ip)?.online)
-    : (selectedIp ? [selectedIp] : []);
+// Аудио в чат: сначала сам файл (под уникальным именем — у получателя может
+// лежать другой файл с тем же), потом сообщение. Адресат фиксируется в начале:
+// переключение чата во время передачи не уводит сообщение другому.
+// opts: caption, images, replyTo; без caption подпись берётся из поля ввода.
+async function sendAudioToChat(path, opts = {}) {
+  const groupId = selGroup, peerIp = selectedIp;
+  if (!peerIp && !groupId) { toast("Сначала выбери контакт или группу", true); return null; }
+  const fromInput = opts.caption === undefined;
+  const caption = fromInput ? ($("#chat-input")?.value || "").trim() : opts.caption;
+  const group = groupId ? groups.find((g) => g.id === groupId) : null;
+  const targets = group
+    ? (group.members || []).filter((ip) => ip !== myIp && peers.find((p) => p.ip === ip)?.online)
+    : [peerIp];
   if (!targets.length) { toast("Нет получателей в сети", true); return null; }
-  toast(`Отправка аудио ${name}…`);
+  let audio = path;
+  try { audio = await invoke("stage_chat_audio", { path }); } catch {}
+  toast(`Отправка аудио ${fileName(audio)}…`);
   let ok = 0;
   for (const t of targets) {
-    try { await invoke("send_file", { peerIp: t, filePath: path }); ok++; }
+    try { await invoke("send_file", { peerIp: t, filePath: audio }); ok++; }
     catch (e) { toast("Не отправлено: " + e, true); }
   }
   if (!ok) return null;
-  const m = selGroup
-    ? await invoke("send_group_chat", { groupId: selGroup, text: caption, image: "", images: [], audio: path })
-    : await invoke("send_chat", { peerIp: selectedIp, text: caption, image: "", images: [], audio: path });
-  if ($("#chat-input")) $("#chat-input").value = "";
-  if (pushMsg(m)) renderChat();
+  const images = opts.images || [];
+  const payload = { text: caption, image: images[0] || "", images, audio };
+  if (opts.replyTo) payload.replyTo = opts.replyTo;
+  const m = group
+    ? await invoke("send_group_chat", { groupId, ...payload })
+    : await invoke("send_chat", { peerIp, ...payload });
+  if (fromInput && $("#chat-input") && $("#chat-input").value.trim() === caption) $("#chat-input").value = "";
+  if (m.peer === curKey() && pushMsg(m)) renderChat();
   stopTypingLocal();
   return m;
 }

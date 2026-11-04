@@ -802,7 +802,8 @@ pub(crate) async fn process_frame(
                     if let Some(rows) = chats.get_mut(&addr) {
                         let Some(upto) = rows.iter().find(|m| m.id == id && m.from_me).map(|m| m.sent_at) else { continue };
                         let mut any = false;
-                        for msg in rows.iter_mut().filter(|m| m.from_me && !m.read && m.sent_at <= upto) {
+                        // только дошедшие: недоставленное раньше прочитанным не станет
+                        for msg in rows.iter_mut().filter(|m| m.from_me && !m.read && m.sent_at <= upto && (m.id == id || m.status == "delivered")) {
                             msg.read = true;
                             any = true;
                         }
@@ -1284,6 +1285,8 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
         .map(|g| (format!("g:{}", g.id), g.name.clone(), g.members.clone()))
         .collect();
     let mut jobs: Vec<serde_json::Value> = Vec::new();
+    // аудио недоставленных сообщений: сначала файл, иначе у получателя имя без файла
+    let mut audio_jobs: Vec<String> = Vec::new();
     let mut extras: Vec<(String, serde_json::Value)> = Vec::new();
     {
         let chats = state.chats.lock().await;
@@ -1293,6 +1296,7 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
             if !is_direct && group.is_none() { continue; }
             if is_direct {
                 for m in rows.iter().rev().filter(|m| m.from_me && m.status == "sent").take(100) {
+                    if !m.audio.is_empty() { audio_jobs.push(m.audio.clone()); }
                     jobs.push(serde_json::json!({
                         "kind": "chat", "id": m.id, "sent_at": m.sent_at, "from": nick, "nickname": nick,
                         "text": m.text, "ts": m.ts, "image": m.image, "images": m.images,
@@ -1346,11 +1350,30 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
             }
         }
     }
-    for v in jobs {
+    let audio_jobs: Vec<String> = audio_jobs.into_iter().filter(|p| std::path::Path::new(p).is_file()).collect();
+    if audio_jobs.is_empty() {
+        for v in jobs {
+            let app2 = app.clone();
+            let target = peer_ip.to_string();
+            tokio::spawn(async move {
+                let _ = crate::quic::send_frame_dual(&app2, &target, port, v, false).await;
+            });
+        }
+    } else {
+        let (tcp_port, device) = {
+            let s = state.settings.lock().await;
+            (s.tcp_port, s.device_name.clone())
+        };
+        let confirm = state.peers.lock().await.get(peer_ip).map(|p| p.supports_file_confirm).unwrap_or(false);
         let app2 = app.clone();
         let target = peer_ip.to_string();
         tokio::spawn(async move {
-            let _ = crate::quic::send_frame_dual(&app2, &target, port, v, false).await;
+            for path in audio_jobs {
+                let _ = crate::quic::send_file_dual(&app2, target.clone(), tcp_port, path, device.clone(), "file".into(), confirm, String::new(), String::new()).await;
+            }
+            for v in jobs {
+                let _ = crate::quic::send_frame_dual(&app2, &target, port, v, false).await;
+            }
         });
     }
     if extras.is_empty() { return; }

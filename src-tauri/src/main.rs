@@ -383,6 +383,30 @@ async fn discard_voice_record(state: tauri::State<'_, AppState>, path: String) -
     Ok(())
 }
 
+/// Копия аудио для отправки в чат под уникальным именем (`имя-1a2b3c4d.ext`):
+/// у получателя может уже лежать другой файл с тем же именем, и сообщение
+/// показало бы его. Свои голосовые и так уникальны.
+#[tauri::command]
+async fn stage_chat_audio(state: tauri::State<'_, AppState>, path: String) -> Result<String, String> {
+    if !audio_ext_ok(&path) {
+        return Err("unsupported audio".into());
+    }
+    let src = std::path::Path::new(&path);
+    let name = src.file_name().and_then(|x| x.to_str()).unwrap_or("");
+    if name.starts_with("safedrop-voice-") {
+        return Ok(path);
+    }
+    let stem = src.file_stem().and_then(|x| x.to_str()).unwrap_or("audio");
+    let stem: String = stem.chars().take(60).collect();
+    let ext = src.extension().and_then(|x| x.to_str()).unwrap_or("ogg").to_ascii_lowercase();
+    let dir = state.app_dir.join("audio-out");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let dst = dir.join(format!("{stem}-{}.{ext}", &id[..8]));
+    std::fs::copy(src, &dst).map_err(|e| e.to_string())?;
+    Ok(dst.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 async fn chat_audio_size(path: String) -> Result<u64, String> {
     if !audio_ext_ok(&path) {
@@ -1448,6 +1472,7 @@ async fn factory_reset(
         let _ = std::fs::remove_file(f);
     }
     let _ = std::fs::remove_dir_all(state.app_dir.join("avatars"));
+    let _ = std::fs::remove_dir_all(state.app_dir.join("audio-out"));
     let voice_dir = state.settings.lock().await.loaddrop_dir.clone();
     let mut voice_files = std::collections::HashSet::new();
     for rows in state.chats.lock().await.values() {
@@ -2443,7 +2468,7 @@ fn main() {
             get_my_ips, get_my_adapters, get_peers, add_peer,
             rename_peer, remove_peer, toggle_trust, ping_peer, scan_network,
             get_call_history, clear_call_history, add_call_record,
-            get_chat, send_chat, send_group_chat, send_chat_read, save_voice_record, discard_voice_record, chat_audio_size, chat_edit, chat_react, chat_typing, sig_send, delete_msgs, clear_chat, open_mic_settings, set_busy,
+            get_chat, send_chat, send_group_chat, send_chat_read, save_voice_record, discard_voice_record, stage_chat_audio, chat_audio_size, chat_edit, chat_react, chat_typing, sig_send, delete_msgs, clear_chat, open_mic_settings, set_busy,
             get_groups, create_group, rename_group, set_group_avatar, delete_group, leave_group, group_add_member, group_remove_member,
             send_file, send_update, apply_update, open_url, open_notif_settings, get_transfers, clear_transfers, cancel_transfer, respond_file_offer, test_notify, open_loaddrop, move_loaddrop, get_loaddrop,
             pick_files, pick_image, pick_folder, pick_audio, read_image_dataurl,
