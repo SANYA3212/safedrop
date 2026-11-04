@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check JavaScript syntax
+        shell: pwsh
+        run: Copy-Item src/app.js src/app.mjs; node --check src/app.mjs; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Remove-Item src/app.mjs
+      # Tauri кладёт DLL меню Проводника в ресурсы и без неё не собирается
+      - name: Build Explorer shell extension
+        run: cargo build --release --manifest-path src-shell/Cargo.toml
+      - run: cargo check --release
+        working-directory: src-tauri
+      - run: cargo test --release
+        working-directory: src-tauri
+
+  ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      - name: Check JavaScript syntax
+        run: cp src/app.js src/app.mjs && node --check src/app.mjs && rm src/app.mjs
+      - run: cargo check --release
+        working-directory: src-tauri
+      - run: cargo test --release
+        working-directory: src-tauri
