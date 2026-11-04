@@ -253,6 +253,7 @@ async function loadAll() {
   $("#set-udp").checked = !!settings.udp_enabled;
   $("#set-udpport").value = settings.udp_port || 47833;
   $("#set-udpport").disabled = !settings.udp_enabled;
+  $("#set-stun").checked = !!settings.stun_enabled;
   $("#set-autotrust").checked = settings.auto_accept_trusted;
   $("#set-limit").value = settings.auto_accept_limit_mb;
   $("#set-autostart").checked = settings.autostart;
@@ -1983,7 +1984,7 @@ async function flushInIce() {
 }
 function ensurePC(peerIp) {
   if (pc) return pc;
-  pc = new RTCPeerConnection(RTC_CONFIG);
+  pc = new RTCPeerConnection(rtcConfig());
   pc.onicecandidate = (e) => {
     if (!e.candidate) return;
     if (currentCall === peerIp) sendIce(peerIp, e.candidate);
@@ -2027,7 +2028,9 @@ function hideCallUI() {
 }
 // max-bundle: весь звонок одним транспортом. WebKitGTK (GStreamer webrtcbin) не умеет
 // политику balanced по умолчанию и без этого не соединяется; Chromium/WebView2 — умеет.
-const RTC_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }], bundlePolicy: "max-bundle" };
+function rtcConfig() {
+  return { iceServers: settings?.stun_enabled ? [{ urls: "stun:stun.l.google.com:19302" }] : [], bundlePolicy: "max-bundle" };
+}
 // WebKit на Linux бывает собран без WebRTC — тогда звонков и демонстраций нет вовсе.
 function noRtc() {
   if (typeof RTCPeerConnection !== "undefined") return false;
@@ -2545,7 +2548,7 @@ let gpc = {}, groupCall = null;
 let ginBuf = {};
 function ensureGPC(peerIp) {
   if (gpc[peerIp]?.pc) return gpc[peerIp].pc;
-  const c = new RTCPeerConnection(RTC_CONFIG);
+  const c = new RTCPeerConnection(rtcConfig());
   gpc[peerIp] = { pc: c };
   c.onicecandidate = (e) => {
     if (!e.candidate) return;
@@ -2839,7 +2842,7 @@ async function startShareStream(stream, label, withAudio, kind = "screen", audio
   stream.getVideoTracks()[0]?.addEventListener("ended", () => stopShare(shareId));
   for (const ip of targets) {
     try {
-      const c = new RTCPeerConnection(RTC_CONFIG);
+      const c = new RTCPeerConnection(rtcConfig());
       myShares[shareId].pcs[ip] = c;
       myShares[shareId].pcsAt[ip] = Date.now();
       const senders = [];
@@ -2915,7 +2918,7 @@ $("#btn-share-dbg").onclick = () => {
 };
 async function acceptScreenView({ ip, sdp, share_id, label, call_id }) {
   if (views[share_id]) return;
-  const c = new RTCPeerConnection(RTC_CONFIG);
+  const c = new RTCPeerConnection(rtcConfig());
   const stream = new MediaStream();
   views[share_id] = { pc: c, ip, label: label || `Экран • ${ip}`, callId: call_id || "", stream, volume: 100, muted: false, inbuf: [], createdAt: Date.now(), firstTrackAt: 0 };
   c.ontrack = (e) => {
@@ -3426,7 +3429,7 @@ $("#btn-move-loaddrop2").onclick = moveLoaddrop;
 $("#btn-save").onclick = async () => {
   const oldPort = settings.tcp_port;
   const oldUdp = settings.udp_port;
-  settings = { ...settings, device_name: $("#set-device").value, tcp_port: parseInt($("#set-port").value) || 47831, udp_enabled: $("#set-udp").checked, udp_port: parseInt($("#set-udpport").value) || 47833, auto_accept_trusted: $("#set-autotrust").checked, auto_accept_limit_mb: parseInt($("#set-limit").value) || 500, autostart: $("#set-autostart").checked, minimize_to_tray: $("#set-tray").checked, ctx_menu: $("#set-ctxmenu").checked, theme: collectTheme() };
+  settings = { ...settings, device_name: $("#set-device").value, tcp_port: parseInt($("#set-port").value) || 47831, udp_enabled: $("#set-udp").checked, udp_port: parseInt($("#set-udpport").value) || 47833, stun_enabled: $("#set-stun").checked, auto_accept_trusted: $("#set-autotrust").checked, auto_accept_limit_mb: parseInt($("#set-limit").value) || 500, autostart: $("#set-autostart").checked, minimize_to_tray: $("#set-tray").checked, ctx_menu: $("#set-ctxmenu").checked, theme: collectTheme() };
   try {
     await invoke("save_settings", { settings });
     if ($("#set-ctxmenu").checked !== undefined) { try { await invoke("set_ctx_menu", { enabled: $("#set-ctxmenu").checked }); } catch (e) { toast("Меню проводника: " + e, true); } }
@@ -3434,6 +3437,8 @@ $("#btn-save").onclick = async () => {
   } catch (e) { toast("" + e, true); }
 };
 $("#set-udp").onchange = (e) => { $("#set-udpport").disabled = !e.target.checked; };
+// новые звонки берут STUN из настроек сразу, без кнопки «Сохранить» в разделе сети
+$("#set-stun").onchange = (e) => { settings.stun_enabled = e.target.checked; invoke("save_settings", { settings }).catch((x) => toast("" + x, true)); };
 $("#btn-firewall").onclick = async () => {
   toast("Открываю порты… (если спросит — разреши права администратора)");
   try { const log = await invoke("open_firewall"); toast("Firewall: " + String(log).replace(/\n/g, " ")); }

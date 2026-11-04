@@ -228,6 +228,8 @@ pub struct Settings {
     pub share_quality: String, // low | medium | high
     #[serde(default)]
     pub udp_enabled: bool, // beta: dual TCP+UDP (QUIC) transport
+    #[serde(default)]
+    pub stun_enabled: bool,
     #[serde(default = "def_udp_port")]
     pub udp_port: u16, // QUIC endpoint port
     #[serde(default = "def_true")]
@@ -310,6 +312,7 @@ impl Default for Settings {
             peer_volumes: HashMap::new(),
             share_quality: def_quality(),
             udp_enabled: false,
+            stun_enabled: false,
             udp_port: def_udp_port(),
             show_typing: true,
             duck_media: true,
