@@ -163,7 +163,9 @@ pub async fn run_signal_server(app: AppHandle, port: u16) {
 }
 
 async fn handle_frame(app: AppHandle, sock: TcpStream, ip: String) -> Result<(), String> {
-    let (mut sock, _encrypted) = crate::tls::accept(sock).await.map_err(|e| e.to_string())?;
+    let (mut sock, auth) = crate::tls::accept(sock).await.map_err(|e| e.to_string())?;
+    // контакт с запомненным ключом: чужой ключ или соединение без ключа не разбираем
+    crate::tls::check_inbound(&ip, &auth)?;
     let mut reader = BufReader::new(&mut sock);
     // one JSON line per connection, size- and time-limited
     let buf = crate::quic::read_line_limited(&mut reader, crate::quic::MAX_LINE, std::time::Duration::from_secs(60)).await?;

@@ -419,10 +419,12 @@ function renderPeerCard() {
     $("#rc-del").title = "Удалить группу";
     $("#rc-avatar-btn").style.display = "none";
     $("#rc-trust").style.display = "none";
+    renderKeyInfo(null);
     return;
   }
   $("#rc-avatar-btn").style.display = "";
   $("#rc-trust").style.display = "";
+  renderKeyInfo(sel());
   $("#rc-rename").onclick = renameSel;
   $("#rc-rename").title = "Локальное имя";
   $("#rc-del").onclick = delSel;
@@ -437,6 +439,44 @@ function renderPeerCard() {
   $("#rc-ping").innerHTML = p.online ? `<span style="color:#3ddc84">●</span> в сети · ${p.ping_ms ?? "?"} мс` : `<span style="color:#666">●</span> не в сети`;
   $("#rc-avatar").outerHTML = avaHTML(p, "lg").replace('class="ava lg', 'id="rc-avatar" class="ava lg');
   $("#rc-trust").innerHTML = p.trusted ? '<svg class="ic" viewBox="0 0 24 24" style="color:#f5c518"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
+}
+
+// ---------- ключ контакта ----------
+// Отпечаток ключа запоминается при первом защищённом соединении; код из 12 цифр
+// одинаков у обоих собеседников — его сверяют голосом, чтобы исключить подмену.
+let keyInfoGen = 0;
+async function renderKeyInfo(p) {
+  const box = $("#rc-key"); if (!box) return;
+  const gen = ++keyInfoGen;
+  if (!p || isDemo) { box.innerHTML = ""; return; }
+  let k = null;
+  try { k = await invoke("get_key_info", { ip: p.ip }); } catch {}
+  if (gen !== keyInfoGen) return;
+  if (!k?.fp) {
+    box.innerHTML = `${LOCK_ICON}Ключ ещё не получен: он запомнится при первом защищённом соединении.`;
+    return;
+  }
+  box.innerHTML = `${LOCK_ICON}Код безопасности: <b class="key-code">${esc(k.code)}</b><br>Сверьте его с другом голосом — у него должен быть такой же.`
+    + (k.pending ? `<br><span class="key-warn">Пришёл другой ключ — соединения отклоняются, пока вы не решите.</span> <button id="rc-key-trust">Доверять новому</button>` : "");
+  const b = $("#rc-key-trust");
+  if (b) b.onclick = () => trustNewKey(p.ip);
+}
+const LOCK_ICON = "<svg class='ic' viewBox='0 0 24 24' style='vertical-align:-3px;margin-right:4px'><path d='M18,8H17V7A5,5,0,0,0,7,7V8H6a2,2,0,0,0-2,2V20a2,2,0,0,0,2,2H18a2,2,0,0,0,2-2V10A2,2,0,0,0,18,8Zm-5,8.79V17a1,1,0,0,1-2,0v-.21a2.5,2.5,0,1,1,2,0ZM15,8H9V7a3,3,0,0,1,6,0Z'/></svg>";
+async function trustNewKey(ip) {
+  const p = peers.find((x) => x.ip === ip || (x.ips || []).includes(ip));
+  if (!await askConfirm("Доверять новому ключу?", `Сделайте это, только если ${p ? dispName(p) : ip} переустановил SafeDrop или сменил ПК. Лучше сначала созвонитесь и сверьте код безопасности.`, "Доверять")) return;
+  try { await invoke("trust_new_key", { ip }); toast("Новый ключ принят"); }
+  catch (e) { toast("Ключ: " + e, true); }
+  $("#help-modal").classList.add("hidden");
+  renderPeerCard();
+}
+function onKeyChanged({ ip }) {
+  const p = peers.find((x) => x.ip === ip || (x.ips || []).includes(ip));
+  const who = esc(p ? dispName(p) : ip);
+  showHelp("Ключ контакта изменился", `<p><b>${who}</b> (${esc(ip)}) подключился с другим ключом. Соединения с ним отклоняются.</p>
+<ul><li>Если друг переустановил SafeDrop, нажал «Сбросить всё» с удалением ключа или сменил ПК — это нормально: созвонитесь, сверьте код безопасности и примите новый ключ.</li>
+<li>Если ничего такого не было — кто-то может выдавать себя за него. Не принимайте ключ.</li></ul>`, `${LOCK_ICON}Доверять новому ключу`, () => trustNewKey(ip));
+  if (p && p.ip === selectedIp) renderPeerCard();
 }
 
 // ---------- groups ----------
@@ -4563,6 +4603,7 @@ try {
     renderGroups(); renderConv(); renderPeerCard();
     if (selGroup && !curGroup()) { selGroup = null; renderConv(); renderPeerCard(); renderChat(); }
   });
+  await listen("safedrop-key-changed", (e) => onKeyChanged(e.payload || {}));
   await listen("safedrop-update-offer", async (e) => {
     const { version, path, peer, filename } = e.payload;
     let my = "0.0.0";

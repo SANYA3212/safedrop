@@ -222,7 +222,10 @@ pub async fn run_server(app: AppHandle, port: u16) {
         tokio::spawn(async move {
             let _ = sock.set_nodelay(true);
             let sock = match crate::tls::accept(sock).await {
-                Ok((s, _)) => s,
+                Ok((s, auth)) => match crate::tls::check_inbound(&peer_addr.ip().to_string(), &auth) {
+                    Ok(()) => s,
+                    Err(e) => { eprintln!("conn error: {e}"); return; }
+                },
                 Err(e) => { eprintln!("conn error: {e}"); return; }
             };
             if let Err(e) = handle_conn(app2, sock, peer_addr.to_string(), drop_dir).await {

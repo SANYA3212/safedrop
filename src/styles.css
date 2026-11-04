@@ -512,6 +512,12 @@ details.set-sec .sec-arrow { width: 0; height: 0; border-left: 5px solid var(--m
 details.set-sec[open] .sec-arrow { transform: rotate(90deg); }
 details.set-sec > .card { border: 0; background: transparent; border-top: 1px solid var(--line); border-radius: 0; }
 details.set-sec > .card:first-of-type { border-top: 0; }
+/* ключ контакта: код безопасности под карточкой */
+.rc-key { margin: 0 4px 10px; line-height: 1.5; }
+.rc-key:empty { display: none; }
+.rc-key .key-code { color: var(--text); font-family: ui-monospace, Consolas, monospace; letter-spacing: 1px; }
+.rc-key .key-warn { color: #ff6b6b; }
+.rc-key button { margin-top: 6px; padding: 4px 10px; font-size: 12px; }
 .settings-search { margin-bottom: 2px; }
 .settings-search input { width: 100%; background: var(--input); border: 1px solid var(--line); border-radius: 10px; padding: 8px 11px; color: var(--text); font-size: 13px; }
 #settings-acc mark { background: rgba(91,140,255,.35); color: inherit; border-radius: 3px; padding: 0 1px; }

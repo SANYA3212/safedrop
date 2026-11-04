@@ -49,72 +49,23 @@ fn server_crypto(app_dir: &std::path::Path) -> Result<quinn::crypto::rustls::Qui
     let mut inner = rustls::ServerConfig::builder_with_provider(ring_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| e.to_string())?
-        .with_no_client_auth()
+        .with_client_cert_verifier(Arc::new(crate::tls::ClientKeyVerify))
         .with_single_cert(vec![cert], key)
         .map_err(|e| e.to_string())?;
     inner.alpn_protocols = vec![ALPN.to_vec()];
     quinn::crypto::rustls::QuicServerConfig::try_from(inner).map_err(|e| e.to_string())
 }
 
-/// Accept-anything verifier: our network is private (Radmin/LAN),
-/// peers are identified by Radmin IP, not by certificate.
-#[derive(Debug)]
-pub(crate) struct SkipVerify;
-
-impl rustls::client::danger::ServerCertVerifier for SkipVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        use rustls::SignatureScheme::*;
-        vec![
-            ECDSA_NISTP256_SHA256,
-            ECDSA_NISTP384_SHA384,
-            ECDSA_NISTP521_SHA512,
-            ED25519,
-            RSA_PSS_SHA256,
-            RSA_PSS_SHA384,
-            RSA_PSS_SHA512,
-            RSA_PKCS1_SHA256,
-        ]
-    }
-}
-
 fn client_crypto() -> Result<quinn::crypto::rustls::QuicClientConfig, String> {
-    let mut inner = rustls::ClientConfig::builder_with_provider(ring_provider())
+    let builder = rustls::ClientConfig::builder_with_provider(ring_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| e.to_string())?
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth();
-    inner
         .dangerous()
-        .set_certificate_verifier(Arc::new(SkipVerify));
+        .with_custom_certificate_verifier(Arc::new(crate::tls::KeyVerify));
+    let mut inner = match crate::tls::my_cert() {
+        Some((cert, key)) => builder.with_client_auth_cert(vec![cert], key).map_err(|e| e.to_string())?,
+        None => builder.with_no_client_auth(),
+    };
     inner.alpn_protocols = vec![ALPN.to_vec()];
     quinn::crypto::rustls::QuicClientConfig::try_from(inner).map_err(|e| e.to_string())
 }
@@ -141,10 +92,16 @@ async fn connect(ip: &str, port: u16) -> Result<quinn::Connection, String> {
     let connecting = ep
         .connect(addr, "safedrop")
         .map_err(|e| e.to_string())?;
-    tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+    let conn = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await
         .map_err(|_| "quic timeout".to_string())?
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // тот же учёт ключей, что у TCP: чужой ключ — отказ
+    if let Err(e) = crate::tls::check_quic_outbound(ip, &conn) {
+        conn.close(0u32.into(), b"key");
+        return Err(e);
+    }
+    Ok(conn)
 }
 
 async fn read_line_capped(
@@ -211,6 +168,12 @@ pub async fn run_quic_server(app: AppHandle, port: u16) {
                 Err(_) => return,
             };
             let ip = conn.remote_address().ip().to_string();
+            let auth = crate::tls::PeerAuth { tls: true, fp: crate::tls::quic_peer_fp(&conn) };
+            if let Err(e) = crate::tls::check_inbound(&ip, &auth) {
+                eprintln!("quic: {e}");
+                conn.close(0u32.into(), b"key");
+                return;
+            }
             loop {
                 let (send, recv) = match conn.accept_bi().await {
                     Ok(s) => s,

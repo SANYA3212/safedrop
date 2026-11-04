@@ -1373,6 +1373,9 @@ async fn factory_reset(
         let _ = reg(&["delete", &clsid_key(), "/f"]);
     }
     let _ = settings::apply_autostart(false);
+    // ключи контактов забываем вместе с контактами; свой ключ остаётся,
+    // чтобы друзьям не пришлось заново подтверждать этот ПК
+    tls::clear_pins();
     let fresh = Settings::default();
     let _ = std::fs::create_dir_all(&fresh.loaddrop_dir);
     *state.settings.lock().await = fresh;
@@ -1900,6 +1903,34 @@ async fn get_build_info() -> Result<serde_json::Value, String> {
     }))
 }
 
+/// Ключ контакта для карточки: свой и его отпечаток, код для сверки голосом.
+#[tauri::command]
+async fn get_key_info(ip: String) -> Result<serde_json::Value, String> {
+    let me = tls::my_fp();
+    let pin = tls::pin_of(&ip);
+    let fp = pin.as_ref().map(|p| p.fp.clone()).unwrap_or_default();
+    Ok(serde_json::json!({
+        "my_fp": me,
+        "fp": fp,
+        "mutual": pin.as_ref().map(|p| p.mutual).unwrap_or(false),
+        "pending": pin.as_ref().map(|p| p.pending.clone()).unwrap_or_default(),
+        "code": tls::safety_code(&me, &fp),
+    }))
+}
+
+/// Пользователь подтвердил смену ключа контакта (переустановил SafeDrop и т.п.).
+#[tauri::command]
+async fn trust_new_key(ip: String) -> Result<String, String> {
+    tls::trust_pending(&ip)
+}
+
+/// Забыть ключ контакта: при следующем соединении запомнится заново.
+#[tauri::command]
+async fn forget_key(ip: String) -> Result<(), String> {
+    tls::forget_key(&ip);
+    Ok(())
+}
+
 /// Clear transfer history (sent files list).
 #[tauri::command]
 async fn clear_transfers(state: tauri::State<'_, AppState>) -> Result<(), String> {
@@ -2097,6 +2128,11 @@ fn main() {
         })
         .setup(|app| {
             settings::init_chat_saver(app.handle());
+            // контакт показал не тот ключ — спросить пользователя
+            let key_app = app.handle().clone();
+            tls::set_key_notifier(Box::new(move |ip, old, new| {
+                let _ = key_app.emit("safedrop-key-changed", serde_json::json!({ "ip": ip, "old": old, "new": new }));
+            }));
             // WebRTC в WebKitGTK выключен, пока его не включат в настройках (и есть,
             // только если WebKit собран с ним — см. packaging/arch/webkit2gtk-4.1-webrtc)
             #[cfg(target_os = "linux")]
@@ -2277,7 +2313,7 @@ fn main() {
             pick_files, pick_image, pick_folder, pick_audio, read_image_dataurl,
             clear_peers, scan_debug, factory_reset, open_firewall, set_ctx_menu, refresh_ctx_menu, get_pending_send,
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
-            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, own_installer,
+            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, own_installer, get_key_info, trust_new_key, forget_key,
             ytbrowse::ytb_open, ytbrowse::ytb_go, ytbrowse::ytb_nav, ytbrowse::ytb_watch, ytbrowse::ytb_notify, ytbrowse::ytb_state,
             ytbrowse::ytb_set_share, ytbrowse::ytb_remote_nav, ytbrowse::ytb_pause_media, ytbrowse::ytb_media_apply, ytbrowse::ytb_duck, ytbrowse::ytb_chat_send, ytbrowse::ytb_chat_show, ytbrowse::ytb_chat_toggle, ytbrowse::ytb_chat_request, ytbrowse::ytb_chat_history,
             ytbrowse::ytb_close, ytbrowse::ytb_close_all, ytbrowse::ytb_remote_cursor, ytbrowse::ytb_remote_scroll, ytbrowse::ytb_people,

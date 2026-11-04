@@ -6,12 +6,17 @@
 //! рукопожатие не удалось (контакт откатился на старую версию), соединение
 //! повторяется без шифрования, а контакт перестаёт считаться «шифрующим».
 //!
-//! Ключи — тот же самоподписанный сертификат, что у QUIC. Сертификат не
-//! проверяется: это защита от подслушивания по дороге (Radmin-ретранслятор,
-//! чужая Wi-Fi), а не от подмены собеседника.
+//! Ключ устройства — самоподписанный сертификат (тот же, что у QUIC). С 0.3.31
+//! обе стороны предъявляют его (взаимный TLS), подпись рукопожатия проверяется,
+//! а отпечаток сертификата запоминается при первом контакте (TOFU, `pins.json`).
+//! Контакт с запомненным ключом:
+//! - исходящее соединение — только TLS и только с тем же ключом, без отката;
+//! - входящее — после того как он хоть раз предъявил свой сертификат
+//!   (`mutual`), без сертификата или с другим ключом не принимается.
+//! Смена ключа не принимается молча: интерфейс спрашивает пользователя.
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -52,21 +57,309 @@ fn forget(ip: &str) {
     if let Ok(mut s) = peers().lock() { s.remove(ip); }
 }
 
+// ---------- ключ устройства и запомненные ключи контактов ----------
+
+/// Отпечаток сертификата: SHA-256 его DER в hex. Сертификат создаётся один раз
+/// и хранится в папке приложения, поэтому отпечаток — постоянный ID устройства.
+pub fn fp_of(cert_der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(cert_der).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+struct Identity {
+    cert: rustls::pki_types::CertificateDer<'static>,
+    key: Vec<u8>,
+    fp: String,
+}
+
+fn identity() -> &'static OnceLock<Identity> {
+    static I: OnceLock<Identity> = OnceLock::new();
+    &I
+}
+
+/// Свой сертификат и PKCS#8-ключ (для QUIC).
+pub(crate) fn my_cert() -> Option<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)> {
+    identity().get().map(|i| (i.cert.clone(), rustls::pki_types::PrivateKeyDer::Pkcs8(i.key.clone().into())))
+}
+
+pub fn my_fp() -> String {
+    identity().get().map(|i| i.fp.clone()).unwrap_or_default()
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Pin {
+    pub fp: String,
+    /// контакт сам предъявлял этот ключ при входящем соединении (0.3.31+)
+    #[serde(default)]
+    pub mutual: bool,
+    /// другой ключ, который пришёл вместо запомненного (ждёт решения пользователя)
+    #[serde(default)]
+    pub pending: String,
+}
+
+fn pins() -> &'static Mutex<HashMap<String, Pin>> {
+    static P: OnceLock<Mutex<HashMap<String, Pin>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pins_path() -> &'static OnceLock<PathBuf> {
+    static P: OnceLock<PathBuf> = OnceLock::new();
+    &P
+}
+
+fn save_pins(map: &HashMap<String, Pin>) {
+    if let (Some(path), Ok(data)) = (pins_path().get(), serde_json::to_string_pretty(map)) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, data).is_ok() { let _ = std::fs::rename(&tmp, path); }
+    }
+}
+
+/// Кто-то показал не тот ключ: (ip, запомненный, пришедший). Ставит main.rs.
+type KeyNotifier = Box<dyn Fn(&str, &str, &str) + Send + Sync>;
+fn notifier() -> &'static OnceLock<KeyNotifier> {
+    static N: OnceLock<KeyNotifier> = OnceLock::new();
+    &N
+}
+
+pub fn set_key_notifier(f: KeyNotifier) {
+    let _ = notifier().set(f);
+}
+
+pub fn pin_of(ip: &str) -> Option<Pin> {
+    pins().lock().ok()?.get(ip).cloned()
+}
+
+/// Чужой ключ вместо запомненного: запомнить его как ожидающий и сообщить
+/// интерфейсу (один раз на каждый новый ключ, а не на каждую попытку).
+fn key_mismatch(map: &mut HashMap<String, Pin>, ip: &str, got: &str) -> String {
+    let Some(p) = map.get_mut(ip) else { return String::new() };
+    let fresh = p.pending != got;
+    p.pending = got.to_string();
+    let old = p.fp.clone();
+    save_pins(map);
+    if fresh {
+        if let Some(n) = notifier().get() { n(ip, &old, got); }
+    }
+    format!("{ip}: ключ контакта изменился — соединение отклонено до подтверждения")
+}
+
+/// Мы подключились к ip и он предъявил сертификат `fp`.
+fn check_outbound(ip: &str, fp: &str) -> Result<(), String> {
+    let mut map = pins().lock().map_err(|_| "pins lock")?;
+    match map.get(ip) {
+        None => {
+            map.insert(ip.to_string(), Pin { fp: fp.to_string(), ..Default::default() });
+            save_pins(&map);
+            Ok(())
+        }
+        Some(p) if p.fp == fp => Ok(()),
+        Some(_) => Err(key_mismatch(&mut map, ip, fp)),
+    }
+}
+
+/// Как подключился собеседник: по TLS ли и с каким сертификатом.
+#[derive(Clone, Debug, Default)]
+pub struct PeerAuth {
+    pub tls: bool,
+    pub fp: Option<String>,
+}
+
+/// Можно ли принять входящее соединение от ip (до разбора кадров).
+pub fn check_inbound(ip: &str, auth: &PeerAuth) -> Result<(), String> {
+    let mut map = pins().lock().map_err(|_| "pins lock")?;
+    let Some(p) = map.get(ip).cloned() else {
+        if let Some(fp) = &auth.fp {
+            map.insert(ip.to_string(), Pin { fp: fp.clone(), mutual: true, pending: String::new() });
+            save_pins(&map);
+        }
+        return Ok(());
+    };
+    match &auth.fp {
+        Some(fp) if *fp == p.fp => {
+            if !p.mutual {
+                if let Some(e) = map.get_mut(ip) { e.mutual = true; }
+                save_pins(&map);
+            }
+            Ok(())
+        }
+        Some(fp) => Err(key_mismatch(&mut map, ip, fp)),
+        // старая версия без своего сертификата — пока контакт ни разу его не
+        // показывал; потом без ключа (и без шифрования) от его имени не пускаем
+        None if p.mutual => Err(format!(
+            "{ip}: соединение {} от контакта с запомненным ключом отклонено",
+            if auth.tls { "без ключа" } else { "без шифрования" }
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Пользователь подтвердил новый ключ: заменить старый на всех адресах контакта.
+pub fn trust_pending(ip: &str) -> Result<String, String> {
+    let mut map = pins().lock().map_err(|_| "pins lock")?;
+    let p = map.get(ip).cloned().ok_or("для этого адреса нет запомненного ключа")?;
+    if p.pending.is_empty() { return Err("новый ключ не приходил".into()); }
+    for e in map.values_mut().filter(|e| e.fp == p.fp || e.pending == p.pending) {
+        *e = Pin { fp: p.pending.clone(), mutual: false, pending: String::new() };
+    }
+    save_pins(&map);
+    Ok(p.pending)
+}
+
+/// Забыть ключ контакта (на всех его адресах): следующий контакт запомнит заново.
+pub fn forget_key(ip: &str) {
+    if let Ok(mut map) = pins().lock() {
+        if let Some(fp) = map.get(ip).map(|p| p.fp.clone()) {
+            map.retain(|_, e| e.fp != fp);
+            save_pins(&map);
+        }
+    }
+}
+
+pub fn clear_pins() {
+    if let Ok(mut map) = pins().lock() {
+        map.clear();
+        save_pins(&map);
+    }
+}
+
+/// Код для сверки голосом: одинаковый у обоих собеседников.
+pub fn safety_code(a: &str, b: &str) -> String {
+    use sha2::{Digest, Sha256};
+    if a.is_empty() || b.is_empty() { return String::new(); }
+    let (x, y) = if a <= b { (a, b) } else { (b, a) };
+    let h = Sha256::digest(format!("safedrop-code:{x}:{y}").as_bytes());
+    let n = u64::from_be_bytes(h[..8].try_into().unwrap_or_default()) % 1_000_000_000_000;
+    let s = format!("{n:012}");
+    format!("{} {} {}", &s[..4], &s[4..8], &s[8..])
+}
+
+// ---------- проверка подписи рукопожатия ----------
+
+fn verify13(
+    message: &[u8],
+    cert: &rustls::pki_types::CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    // сертификат никем не подписан (самоподписанный), но собеседник обязан
+    // доказать, что владеет его ключом: иначе чужой сертификат можно было бы
+    // просто показать, и запоминание ключа ничего бы не дало
+    rustls::crypto::verify_tls13_signature(message, cert, dss, &crate::quic::ring_provider().signature_verification_algorithms)
+}
+
+fn schemes() -> Vec<rustls::SignatureScheme> {
+    crate::quic::ring_provider().signature_verification_algorithms.supported_schemes()
+}
+
+/// Сертификат сервера: любой самоподписанный (ключ сверяем после рукопожатия
+/// по отпечатку), но с настоящей проверкой подписи.
+#[derive(Debug)]
+pub(crate) struct KeyVerify;
+
+impl rustls::client::danger::ServerCertVerifier for KeyVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::PeerIncompatible(rustls::PeerIncompatible::Tls12NotOffered))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        verify13(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        schemes()
+    }
+}
+
+/// Сертификат клиента: просим, но не требуем (старые версии его не шлют).
+#[derive(Debug)]
+pub(crate) struct ClientKeyVerify;
+
+impl rustls::server::danger::ClientCertVerifier for ClientKeyVerify {
+    fn offer_client_auth(&self) -> bool { true }
+
+    fn client_auth_mandatory(&self) -> bool { false }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] { &[] }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::PeerIncompatible(rustls::PeerIncompatible::Tls12NotOffered))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        verify13(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        schemes()
+    }
+}
+
+// ---------- TLS-конфиги и соединения ----------
+
 fn server_config() -> &'static OnceLock<Option<Arc<rustls::ServerConfig>>> {
     static S: OnceLock<Option<Arc<rustls::ServerConfig>>> = OnceLock::new();
     &S
 }
 
-/// Подготовить серверный TLS (сертификат из папки приложения). Без него сервер
-/// принимает только незашифрованные соединения, как раньше.
+/// Подготовить TLS: ключ устройства из папки приложения и запомненные ключи
+/// контактов. Без сертификата сервер принимает только незашифрованные
+/// соединения, как раньше.
 pub fn init(app_dir: &Path) {
+    let path = app_dir.join("pins.json");
+    if let Ok(data) = std::fs::read_to_string(&path) {
+        if let (Ok(map), Ok(mut g)) = (serde_json::from_str::<HashMap<String, Pin>>(&data), pins().lock()) {
+            *g = map;
+        }
+    }
+    let _ = pins_path().set(path);
+    if let Ok((cert_der, key_der)) = crate::quic::load_or_gen_cert(app_dir) {
+        let fp = fp_of(&cert_der);
+        let _ = identity().set(Identity { cert: cert_der.into(), key: key_der, fp });
+    }
     server_config().get_or_init(|| {
-        let (cert_der, key_der) = crate::quic::load_or_gen_cert(app_dir).ok()?;
-        let cert = rustls::pki_types::CertificateDer::from(cert_der);
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into());
+        let (cert, key) = my_cert()?;
         let cfg = rustls::ServerConfig::builder_with_provider(crate::quic::ring_provider())
             .with_protocol_versions(&[&rustls::version::TLS13]).ok()?
-            .with_no_client_auth()
+            .with_client_cert_verifier(Arc::new(ClientKeyVerify))
             .with_single_cert(vec![cert], key).ok()?;
         Some(Arc::new(cfg))
     });
@@ -75,18 +368,21 @@ pub fn init(app_dir: &Path) {
 fn client_config() -> Option<Arc<rustls::ClientConfig>> {
     static C: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
     C.get_or_init(|| {
-        let cfg = rustls::ClientConfig::builder_with_provider(crate::quic::ring_provider())
+        let builder = rustls::ClientConfig::builder_with_provider(crate::quic::ring_provider())
             .with_protocol_versions(&[&rustls::version::TLS13]).ok()?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::quic::SkipVerify))
-            .with_no_client_auth();
+            .with_custom_certificate_verifier(Arc::new(KeyVerify));
+        let cfg = match my_cert() {
+            Some((cert, key)) => builder.with_client_auth_cert(vec![cert], key).ok()?,
+            None => builder.with_no_client_auth(),
+        };
         Some(Arc::new(cfg))
     }).clone()
 }
 
 /// Входящее соединение: TLS, если клиент начал рукопожатие, иначе как есть.
-/// Второе значение — было ли соединение зашифровано.
-pub async fn accept(sock: TcpStream) -> std::io::Result<(Stream, bool)> {
+/// Вместе с потоком — как собеседник подключился (для `check_inbound`).
+pub async fn accept(sock: TcpStream) -> std::io::Result<(Stream, PeerAuth)> {
     let mut first = [0u8; 1];
     // зонды скана подключаются и молчат — не ждём их вечно
     let peeked = tokio::time::timeout(HANDSHAKE_TIMEOUT, sock.peek(&mut first)).await;
@@ -97,10 +393,11 @@ pub async fn accept(sock: TcpStream) -> std::io::Result<(Stream, bool)> {
             let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(sock))
                 .await
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timeout"))??;
-            return Ok((Box::new(tls), true));
+            let fp = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| fp_of(c));
+            return Ok((Box::new(tls), PeerAuth { tls: true, fp }));
         }
     }
-    Ok((Box::new(sock), false))
+    Ok((Box::new(sock), PeerAuth::default()))
 }
 
 async fn tcp(ip: &str, port: u16, timeout: Duration) -> Result<TcpStream, String> {
@@ -112,21 +409,41 @@ async fn tcp(ip: &str, port: u16, timeout: Duration) -> Result<TcpStream, String
     Ok(s)
 }
 
-/// Исходящее соединение: зашифрованное, если контакт это умеет.
+/// Исходящее соединение: зашифрованное, если контакт это умеет. С контактом,
+/// чей ключ запомнен, — только зашифрованное и только с этим ключом.
 pub async fn connect(ip: &str, port: u16, timeout: Duration) -> Result<Stream, String> {
+    let pinned = pin_of(ip).is_some();
     let sock = tcp(ip, port, timeout).await?;
-    if !peer_ok(ip) {
+    if !pinned && !peer_ok(ip) {
         return Ok(Box::new(sock));
     }
     if let (Some(cfg), Ok(name)) = (client_config(), rustls::pki_types::ServerName::try_from(SERVER_NAME)) {
         let connector = tokio_rustls::TlsConnector::from(cfg);
         if let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(name.to_owned(), sock)).await {
+            let fp = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| fp_of(c));
+            let Some(fp) = fp else { return Err(format!("{ip}: собеседник не показал ключ")) };
+            check_outbound(ip, &fp)?;
             return Ok(Box::new(tls));
         }
+    }
+    if pinned {
+        // без отката: подменивший контакт мог бы просто «сломать» рукопожатие
+        return Err(format!("{ip}: не удалось установить защищённое соединение"));
     }
     // контакт не ответил на рукопожатие (старая версия) — как раньше, без шифрования
     forget(ip);
     Ok(Box::new(tcp(ip, port, timeout).await?))
+}
+
+/// QUIC: сверить ключ сервера после подключения (тот же учёт, что у TCP).
+pub(crate) fn check_quic_outbound(ip: &str, conn: &quinn::Connection) -> Result<(), String> {
+    let fp = quic_peer_fp(conn).ok_or_else(|| format!("{ip}: собеседник не показал ключ"))?;
+    check_outbound(ip, &fp)
+}
+
+pub(crate) fn quic_peer_fp(conn: &quinn::Connection) -> Option<String> {
+    let certs = conn.peer_identity()?.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok()?;
+    certs.first().map(|c| fp_of(c))
 }
 
 #[cfg(test)]
@@ -146,43 +463,84 @@ mod tests {
         assert!(!peer_ok("10.0.0.1"));
     }
 
-    /// Сервер на одном порту принимает и TLS-клиента, и старого (без TLS).
+    #[test]
+    fn safety_code_is_symmetric() {
+        let c = safety_code("aa", "bb");
+        assert_eq!(c, safety_code("bb", "aa"));
+        assert_eq!(c.len(), 14);
+        assert_ne!(c, safety_code("aa", "cc"));
+        assert_eq!(safety_code("", "bb"), "");
+    }
+
+    #[test]
+    fn pins_tofu_mismatch_and_trust() {
+        let ip = "10.9.9.1";
+        let alt = "10.9.9.2"; // второй адрес того же ПК
+        let none = PeerAuth { tls: false, fp: None };
+        let key = |k: &str| PeerAuth { tls: true, fp: Some(k.into()) };
+        // первый контакт запоминает ключ; старый клиент без ключа пока проходит
+        check_outbound(ip, "k1").unwrap();
+        check_outbound(alt, "k1").unwrap();
+        assert!(check_inbound(ip, &none).is_ok());
+        // показал ключ — дальше без ключа нельзя
+        assert!(check_inbound(ip, &key("k1")).is_ok());
+        assert!(pin_of(ip).unwrap().mutual);
+        assert!(check_inbound(ip, &none).is_err());
+        // чужой ключ — отказ, ключ ждёт подтверждения
+        assert!(check_inbound(ip, &key("k2")).is_err());
+        assert!(check_outbound(ip, "k2").is_err());
+        assert_eq!(pin_of(ip).unwrap().pending, "k2");
+        // подтверждение меняет ключ на всех адресах контакта
+        assert_eq!(trust_pending(ip).unwrap(), "k2");
+        assert_eq!(pin_of(alt).unwrap().fp, "k2");
+        assert!(check_outbound(alt, "k2").is_ok());
+        forget_key(ip);
+        assert!(pin_of(ip).is_none() && pin_of(alt).is_none());
+    }
+
+    /// Сервер на одном порту принимает и TLS-клиента, и старого (без TLS);
+    /// клиент и сервер видят ключи друг друга.
     #[tokio::test]
     async fn one_port_serves_tls_and_plain() {
         let dir = std::env::temp_dir().join(format!("safedrop-tls-test-{}", std::process::id()));
         init(&dir);
+        let me = my_fp();
+        assert_eq!(me.len(), 64);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             for _ in 0..2 {
                 let (sock, _) = listener.accept().await.unwrap();
                 tokio::spawn(async move {
-                    let (mut s, enc) = accept(sock).await.unwrap();
+                    let (mut s, auth) = accept(sock).await.unwrap();
                     let mut line = String::new();
                     BufReader::new(&mut s).read_line(&mut line).await.unwrap();
-                    let reply = format!("{}|{}", if enc { "tls" } else { "plain" }, line);
+                    let who = if auth.fp.is_some() { "key" } else { "nokey" };
+                    let reply = format!("{}|{}|{}", if auth.tls { "tls" } else { "plain" }, who, line);
                     s.write_all(reply.as_bytes()).await.unwrap();
                     s.flush().await.unwrap();
                     let _ = s.shutdown().await;
                 });
             }
         });
-        // новый контакт — зашифровано
+        // новый контакт — зашифровано, обе стороны с ключом; ключ сервера запомнен
         note_peer_version("127.0.0.1", "0.3.26");
         let mut s = connect("127.0.0.1", port, Duration::from_secs(5)).await.unwrap();
         s.write_all(b"hello\n").await.unwrap();
         s.flush().await.unwrap();
         let mut got = String::new();
         BufReader::new(&mut s).read_line(&mut got).await.unwrap();
-        assert_eq!(got, "tls|hello\n");
-        // старый контакт — как раньше
+        assert_eq!(got, "tls|key|hello\n");
+        assert_eq!(pin_of("127.0.0.1").unwrap().fp, me);
+        // старый контакт без запомненного ключа — как раньше
+        forget_key("127.0.0.1");
         note_peer_version("127.0.0.1", "0.3.20");
         let mut s = connect("127.0.0.1", port, Duration::from_secs(5)).await.unwrap();
         s.write_all(b"hi\n").await.unwrap();
         s.flush().await.unwrap();
         let mut got = String::new();
         BufReader::new(&mut s).read_line(&mut got).await.unwrap();
-        assert_eq!(got, "plain|hi\n");
+        assert_eq!(got, "plain|nokey|hi\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
