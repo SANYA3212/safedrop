@@ -639,6 +639,9 @@ pub(crate) async fn process_frame(
                 reply_to: reply_to.clone(),
                 edited_at: 0,
                 reactions: Vec::new(),
+                // кадр пришёл напрямую от автора: адрес соединения (у контакта с
+                // запомненным ключом он подтверждён ключом) — автор сообщения
+                from_ip: ip.clone(),
             };
             let is_new = {
                 let mut c = state.chats.lock().await;
@@ -717,6 +720,8 @@ pub(crate) async fn process_frame(
                     // Delivery state is local to the sender; never inherit it from sync.
                     msg.status.clear();
                     msg.delivered_to.clear();
+                    // история пришла от другого участника: кто автор, по ней не проверить
+                    msg.from_ip.clear();
                     // Remote absolute paths are meaningless here: resolve audio from
                     // LoadDrop (for restored own messages too, never a peer's path).
                     if !msg.audio.is_empty() {
@@ -907,8 +912,14 @@ pub(crate) async fn process_frame(
                     let Some(rows) = c.get_mut(key) else { continue };
                     let Some(m) = rows.iter_mut().find(|m| m.id == id && !m.from_me) else { continue };
                     // direct chat: every message not ours is theirs (survives a
-                    // rename); group: by nickname, not one another member holds
-                    let theirs = !key.starts_with("g:") || (m.from_nick == author && !others.contains(&author));
+                    // rename); group: by the address the message came from, and
+                    // for messages restored from history (no address) by nickname,
+                    // not one another member holds
+                    let theirs = !key.starts_with("g:") || if m.from_ip.is_empty() {
+                        m.from_nick == author && !others.contains(&author)
+                    } else {
+                        addrs.contains(&m.from_ip)
+                    };
                     // a stale resend must not undo a newer edit
                     if theirs && edited_at >= m.edited_at && (m.text != text || m.edited_at < edited_at) {
                         m.text = text.clone();

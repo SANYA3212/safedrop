@@ -419,6 +419,7 @@ async fn send_chat(
         reply_to,
         edited_at: 0,
         reactions: Vec::new(),
+        from_ip: String::new(),
     };
     {
         let mut chats = state.chats.lock().await;
@@ -771,6 +772,7 @@ async fn send_group_chat(
         reply_to,
         edited_at: 0,
         reactions: Vec::new(),
+        from_ip: String::new(),
     };
     {
         let mut chats = state.chats.lock().await;

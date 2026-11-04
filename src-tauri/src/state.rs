@@ -498,6 +498,10 @@ pub struct ChatMsg {
     pub edited_at: i64, // UTC ms of the last edit (0 = never edited)
     #[serde(default)]
     pub reactions: Vec<ChatReaction>, // emoji -> who chose it
+    /// Адрес, с которого сообщение пришло напрямую от автора (для правок в
+    /// группах). Пусто у своих и у восстановленных из чужой истории.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from_ip: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
