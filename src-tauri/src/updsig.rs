@@ -66,6 +66,16 @@ mod tests {
         assert!(verify_bytes(b"test-installer", "").is_err());
     }
 
+    /// Проверка собранного установщика той же функцией, что у получателя:
+    /// `SAFEDROP_VERIFY=путь\к\SafeDrop_x_x64-setup.exe cargo test --release verify_release_file -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn verify_release_file() {
+        let p = std::env::var("SAFEDROP_VERIFY").expect("SAFEDROP_VERIFY");
+        let v = verify_file(Path::new(&p)).expect("подпись установщика");
+        println!("подпись верна, версия {v}");
+    }
+
     #[test]
     fn version_from_installer_name() {
         assert_eq!(installer_version("SafeDrop_0.3.31_x64-setup.exe").as_deref(), Some("0.3.31"));
