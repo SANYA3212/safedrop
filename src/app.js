@@ -266,6 +266,8 @@ async function loadAll() {
   if (st) st.checked = settings.show_typing !== false;
   const rr = $("#set-read-receipts");
   if (rr) rr.checked = settings.read_receipts !== false;
+  $("#set-audio-player-style").value = audioPlayerStyle();
+  document.querySelectorAll(".audio-player").forEach((el) => el.setAudioStyle());
   const dk = $("#set-duck"), dl = $("#set-duck-level");
   if (dk) dk.checked = settings.duck_media !== false;
   if (dl) { dl.value = String(settings.duck_level ?? 30); $("#set-duck-level-v").textContent = (settings.duck_level ?? 30) + "%"; }
@@ -659,8 +661,204 @@ let renderedKey = null;
 let lastChatAtBottom = true;
 function pauseMediaIn(root) {
   try {
+    root.querySelectorAll(".audio-player").forEach((el) => el.disposeAudioPlayer());
     root.querySelectorAll("video,audio").forEach((v) => { try { v.pause(); } catch {} });
   } catch {}
+}
+
+// ---------- chat audio (one media element for every style) ----------
+let activeAudioPlayer = null;
+const audioWaveCache = new Map(); // only 48 peaks + duration, never decoded buffers
+const audioWaveJobs = new Map();
+let audioWaveQueue = Promise.resolve();
+const AUDIO_WAVE_BYTES = 2 * 1024 * 1024;
+const AUDIO_WAVE_SECONDS = 120;
+const audioWaveObserver = typeof IntersectionObserver === "function" ? new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    entry.target.audioWaveVisible = entry.isIntersecting;
+    if (entry.isIntersecting) entry.target.loadAudioWave();
+  }
+}) : null;
+function audioPlayerStyle() {
+  return ["compact", "system"].includes(settings?.audio_player_style) ? settings.audio_player_style : "wave";
+}
+function audioTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—:——";
+  const s = Math.floor(seconds);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+async function readAudioWave(src, path) {
+  // Size is checked before reading, and again while streaming (no unbounded arrayBuffer).
+  if (!isDemo && !src.startsWith("blob:")) {
+    const size = await invoke("chat_audio_size", { path });
+    if (!(size > 0 && size <= AUDIO_WAVE_BYTES)) return null;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  let reader;
+  try {
+    const response = await fetch(src, { signal: controller.signal });
+    if (!response.ok || Number(response.headers.get("Content-Length")) > AUDIO_WAVE_BYTES || !response.body) return null;
+    reader = response.body.getReader();
+    const chunks = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > AUDIO_WAVE_BYTES) return null;
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    // Offline decoding at 8 kHz avoids opening another live audio device and keeps PCM small.
+    const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OfflineCtx) return null;
+    const ctx = new OfflineCtx(1, 1, 8000);
+    const buffer = await ctx.decodeAudioData(bytes.buffer);
+    if (!(buffer.duration > 0 && buffer.duration <= AUDIO_WAVE_SECONDS + 0.5)) return null;
+    const peaks = new Array(48).fill(0);
+    for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+      const samples = buffer.getChannelData(channel);
+      for (let i = 0; i < peaks.length; i++) {
+        const end = Math.floor((i + 1) * samples.length / peaks.length);
+        for (let j = Math.floor(i * samples.length / peaks.length); j < end; j++) peaks[i] = Math.max(peaks[i], Math.abs(samples[j]));
+      }
+    }
+    return { peaks, duration: buffer.duration };
+  } finally {
+    clearTimeout(timeout);
+    if (reader) { try { await reader.cancel(); } catch {} }
+    controller.abort();
+  }
+}
+function requestAudioWave(src, path, wanted) {
+  if (!wanted()) return Promise.resolve(null);
+  if (audioWaveCache.has(path)) {
+    const value = audioWaveCache.get(path);
+    audioWaveCache.delete(path); audioWaveCache.set(path, value);
+    return Promise.resolve(value);
+  }
+  if (audioWaveJobs.has(path)) return audioWaveJobs.get(path);
+  if (audioWaveJobs.size >= 8) return Promise.race(audioWaveJobs.values()).then(() => requestAudioWave(src, path, wanted));
+  // At most one decoder and eight pending/active jobs, even in a long chat history.
+  const job = audioWaveQueue.then(async () => {
+    if (!wanted()) return null;
+    let wave = null;
+    try { wave = await readAudioWave(src, path); } catch {}
+    if (wave) {
+      audioWaveCache.set(path, wave);
+      while (audioWaveCache.size > 32) audioWaveCache.delete(audioWaveCache.keys().next().value);
+    }
+    return wave;
+  }).finally(() => audioWaveJobs.delete(path));
+  audioWaveJobs.set(path, job);
+  audioWaveQueue = job.catch(() => {});
+  return job;
+}
+function createAudioPlayer(path, { src = tauriFile(path), voice = /^safedrop-voice-/i.test(fileName(path)), preview = false } = {}) {
+  const root = document.createElement("div");
+  root.className = "audio-player";
+  root.innerHTML = `<audio preload="metadata"></audio><div class="audio-custom"><button type="button" class="audio-play" aria-label="Воспроизвести"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg></button><div class="audio-main"><div class="audio-track"><div class="audio-wave" aria-hidden="true"></div><input class="audio-seek" type="range" min="0" max="1000" step="1" value="0" aria-label="Перемотка" disabled /></div><div class="audio-info"><span class="audio-time">0:00 / —:——</span><button type="button" class="audio-speed" aria-label="Скорость воспроизведения: 1×">1×</button></div></div></div><div class="audio-error hidden" role="status"><span></span><button type="button" class="audio-retry">Повторить</button></div><div class="audio-name"></div>`;
+  const audio = root.querySelector("audio");
+  const play = root.querySelector(".audio-play"), seek = root.querySelector(".audio-seek");
+  const speed = root.querySelector(".audio-speed"), time = root.querySelector(".audio-time");
+  const waveHost = root.querySelector(".audio-wave"), error = root.querySelector(".audio-error");
+  const label = preview ? "Предпрослушивание голосового" : voice ? "Голосовое сообщение" : fileName(path);
+  root.querySelector(".audio-name").textContent = label;
+  audio.setAttribute("aria-label", label);
+  let decodedDuration = 0, waveAttempted = false, disposed = false;
+  function duration() {
+    if (Number.isFinite(audio.duration) && audio.duration > 0) return audio.duration;
+    if (decodedDuration) return decodedDuration;
+    // Some MediaRecorder WebMs have no duration in their header; use the seekable end.
+    const end = audio.seekable.length ? audio.seekable.end(audio.seekable.length - 1) : 0;
+    return Number.isFinite(end) && end > 0 ? end : 0;
+  }
+  function update() {
+    const total = duration(), current = audio.currentTime || 0;
+    const progress = total ? Math.min(1, current / total) : 0;
+    seek.disabled = !total || !!audio.error;
+    seek.value = String(Math.round(progress * 1000));
+    seek.setAttribute("aria-valuetext", `${audioTime(current)} из ${audioTime(total || NaN)}`);
+    root.style.setProperty("--audio-progress", `${progress * 100}%`);
+    time.textContent = `${audioTime(current)} / ${audioTime(total || NaN)}`;
+    const playing = !audio.paused && !audio.ended;
+    play.setAttribute("aria-label", playing ? "Пауза" : "Воспроизвести");
+    play.title = playing ? "Пауза" : "Воспроизвести";
+    play.querySelector("path").setAttribute("d", playing ? "M6 5h4v14H6zM14 5h4v14h-4z" : "M8 5v14l11-7z");
+  }
+  function unavailable() {
+    if (disposed) return;
+    audio.pause();
+    root.classList.add("is-error");
+    error.classList.remove("hidden");
+    error.querySelector("span").textContent = preview ? "Не удалось открыть запись" : "аудиофайл не получен или формат не поддерживается";
+    update();
+  }
+  play.onclick = () => {
+    if (audio.paused) audio.play().catch((e) => {
+      if (e.name === "NotAllowedError") toast("Нажмите воспроизведение ещё раз", true);
+      else if (e.name !== "AbortError") unavailable();
+    });
+    else audio.pause();
+  };
+  seek.oninput = () => { if (duration()) { audio.currentTime = Number(seek.value) / 1000 * duration(); update(); } };
+  speed.onclick = () => { audio.playbackRate = audio.playbackRate === 1 ? 1.5 : audio.playbackRate === 1.5 ? 2 : 1; };
+  audio.addEventListener("ratechange", () => {
+    speed.textContent = `${audio.playbackRate}×`;
+    speed.setAttribute("aria-label", `Скорость воспроизведения: ${audio.playbackRate}×`);
+  });
+  audio.addEventListener("play", () => {
+    if (disposed) { audio.pause(); return; }
+    if (activeAudioPlayer && activeAudioPlayer !== audio) activeAudioPlayer.pause();
+    activeAudioPlayer = audio;
+    update();
+  });
+  audio.addEventListener("pause", () => { if (activeAudioPlayer === audio) activeAudioPlayer = null; update(); });
+  ["timeupdate", "durationchange", "loadedmetadata", "progress", "ended"].forEach((event) => audio.addEventListener(event, update));
+  audio.addEventListener("loadedmetadata", () => root.loadAudioWave());
+  audio.addEventListener("error", unavailable);
+  root.querySelector(".audio-retry").onclick = () => {
+    root.classList.remove("is-error"); error.classList.add("hidden");
+    waveAttempted = false; audio.load(); root.loadAudioWave();
+  };
+  root.loadAudioWave = async () => {
+    if (disposed || waveAttempted || !root.isConnected || !voice || root.dataset.style !== "wave" || audio.error || audio.readyState < 1) return;
+    if (audioWaveObserver && !root.audioWaveVisible) return;
+    if (Number.isFinite(audio.duration) && audio.duration > AUDIO_WAVE_SECONDS + 0.5) return;
+    waveAttempted = true;
+    const wave = await requestAudioWave(src, path, () => !disposed && root.isConnected && root.dataset.style === "wave" && (!audioWaveObserver || root.audioWaveVisible));
+    if (!wave || disposed) { waveAttempted = false; return; }
+    decodedDuration = wave.duration;
+    const max = Math.max(0.01, ...wave.peaks);
+    const bars = wave.peaks.map((peak, i) => {
+      const h = Math.max(3, peak / max * 30);
+      return `<rect x="${i * 5}" y="${(32 - h) / 2}" width="3" height="${h}" rx="1.5"/>`;
+    }).join("");
+    const svg = `<svg viewBox="0 0 240 32" preserveAspectRatio="none">${bars}</svg>`;
+    waveHost.innerHTML = svg + svg;
+    root.classList.add("has-wave"); update();
+    audioWaveObserver?.unobserve(root);
+  };
+  root.setAudioStyle = () => {
+    root.dataset.style = audioPlayerStyle();
+    audio.controls = root.dataset.style === "system";
+    if (voice && !waveAttempted && root.dataset.style === "wave") {
+      if (audioWaveObserver) audioWaveObserver.observe(root);
+      else root.loadAudioWave();
+    } else { audioWaveObserver?.unobserve(root); root.audioWaveVisible = false; }
+  };
+  // No observer or media reference survives removal, cancellation or a chat change.
+  root.disposeAudioPlayer = () => {
+    disposed = true; audioWaveObserver?.unobserve(root); audio.pause();
+    if (activeAudioPlayer === audio) activeAudioPlayer = null;
+    audio.removeAttribute("src"); audio.load();
+  };
+  audio.src = src;
+  root.setAudioStyle();
+  return root;
 }
 function rowAvatar(m, p, g, myLetter) {
   const me = !!m.from_me;
@@ -779,11 +977,9 @@ function buildRow(m, p, g, myLetter, myNick) {
   const d = document.createElement("div");
   d.className = "msgrow" + (me ? " me" : "");
   d.dataset.mid = m.id;
-  d.innerHTML = `<span class="ava sm"><span>${avaInner(av, letter)}</span></span><div class="mbody"><div class="mhead"><b>${esc(me ? myNick : m.from_nick)}</b><time>${esc(msgTime(m))}</time>${editMark}${msgStatusHTML(m)}</div>${m.forwarded_from ? `<div class="forwarded-mark">Переслано от ${esc(m.forwarded_from)}</div>` : ""}${quoteHTML(quoteOf(m))}${imgsHTML}${m.audio ? `<div class="chat-audio"><audio controls preload="metadata" src="${tauriFile(m.audio)}"></audio><span>${esc(fileName(m.audio))}</span></div>` : ""}<p data-raw="${esc(m.text || "")}">${renderMsgText(m.text)}</p>${reactionsHTML(m, myNick)}</div><button class="mdel" title="Удалить"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button>`;
+  d.innerHTML = `<span class="ava sm"><span>${avaInner(av, letter)}</span></span><div class="mbody"><div class="mhead"><b>${esc(me ? myNick : m.from_nick)}</b><time>${esc(msgTime(m))}</time>${editMark}${msgStatusHTML(m)}</div>${m.forwarded_from ? `<div class="forwarded-mark">Переслано от ${esc(m.forwarded_from)}</div>` : ""}${quoteHTML(quoteOf(m))}${imgsHTML}<p data-raw="${esc(m.text || "")}">${renderMsgText(m.text)}</p>${reactionsHTML(m, myNick)}</div><button class="mdel" title="Удалить"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button>`;
   d.querySelectorAll(".chat-img").forEach((img) => { img.onclick = () => openImg(images[Number(img.dataset.i)]); });
-  // файл аудио не дошёл (получатель был не в сети, отклонил файл) — не пустой плеер
-  const au = d.querySelector(".chat-audio audio");
-  if (au) au.addEventListener("error", () => { au.replaceWith(Object.assign(document.createElement("i"), { className: "muted", textContent: "аудиофайл не получен" })); }, { once: true });
+  if (m.audio) d.querySelector(".mbody").insertBefore(createAudioPlayer(m.audio), d.querySelector(".mbody > p"));
   d.querySelector(".mdel").onclick = () => openDel({ mode: "msg", id: m.id, mine: me });
   d.oncontextmenu = (e) => { e.preventDefault(); openMsgMenu(e, m); };
   const q = d.querySelector(".mquote");
@@ -866,6 +1062,7 @@ function renderChat() {
   const title = g ? g.name : (p ? dispName(p) : "");
   let hint = box.querySelector(".empty-hint");
   if (!list.length) {
+    if (!hint) pauseMediaIn(box);
     if (!hint) box.innerHTML = `<div class="empty-hint">Это начало переписки с <b>${esc(title)}</b>. Сообщения летят напрямую, без серверов. <svg class="ic" viewBox="0 0 24 24"><path d="M12,2C6.48,2,2,6.48,2,12s4.48,10,10,10,10-4.48,10-10S17.52,2,12,2Zm0,18c-4.41,0-8-3.59-8-8s3.59-8,8-8,8,3.59,8,8-3.59,8-8,8Z"/><path d="M12,6c-3.31,0-6,2.69-6,6s2.69,6,6,6,6-2.69,6-6-2.69-6-6-6Zm0,10c-2.21,0-4-1.79-4-4s1.79-4,4-4,4,1.79,4,4-1.79,4-4,4Z"/></svg></div>`;
     updateChatBottomButton();
     return;
@@ -1334,19 +1531,22 @@ let voiceSaveSeq = 0, voicePublishedSeq = 0; // порядок записей: �
 function renderPendingAudio() {
   const host = $("#pending-audio");
   if (!host) return;
+  pauseMediaIn(host);
   host.innerHTML = "";
   host.classList.toggle("hidden", !pendingAudio);
   if (!pendingAudio) return;
   const row = document.createElement("div");
   row.className = "pending-audio-row";
-  row.innerHTML = `<audio controls src="${pendingAudio.path ? tauriFile(pendingAudio.path) : pendingAudio.url}"></audio><button type="button">Отменить</button>`;
-  row.querySelector("button").onclick = async () => {
+  const cancel = document.createElement("button");
+  cancel.type = "button"; cancel.className = "pending-audio-cancel"; cancel.textContent = "Отменить";
+  cancel.onclick = async () => {
     const path = pendingAudio?.path;
     if (pendingAudio?.url) URL.revokeObjectURL(pendingAudio.url);
     pendingAudio = null;
     renderPendingAudio();
     if (path) await invoke("discard_voice_record", { path }).catch(() => {});
   };
+  row.append(createAudioPlayer(pendingAudio.path || pendingAudio.url, { src: pendingAudio.url || tauriFile(pendingAudio.path), voice: true, preview: true }), cancel);
   host.appendChild(row);
 }
 
@@ -4448,13 +4648,6 @@ $("#btn-mic-req").onclick = requestMic;
 // ---------- аудио в чате ----------
 const AUDIO_EXT = /\.(mp3|wav|ogg|m4a|flac)$/i;
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i;
-document.addEventListener("play", (e) => {
-  if (e.target?.tagName === "AUDIO" && e.target.closest?.("#messages")) {
-    document.querySelectorAll("#messages audio").forEach((a) => {
-      if (a !== e.target) { try { a.pause(); } catch {} }
-    });
-  }
-}, true);
 // Аудио в чат: сначала сам файл (под уникальным именем — у получателя может
 // лежать другой файл с тем же), потом сообщение. Адресат фиксируется в начале:
 // переключение чата во время передачи не уводит сообщение другому.
@@ -4788,6 +4981,12 @@ $("#btn-scan-now").onclick = async () => {
     settings.read_receipts = receipts.checked;
     if (receipts.checked) { lastReadSent = ""; markDirectChatRead(); }
     invoke("save_settings", { settings }).catch((e) => toast("" + e, true));
+  };
+  const audioStyle = $("#set-audio-player-style");
+  if (audioStyle) audioStyle.onchange = () => {
+    settings.audio_player_style = audioStyle.value;
+    document.querySelectorAll(".audio-player").forEach((el) => el.setAudioStyle());
+    invoke("save_settings", { settings }).catch((e) => toast("Не сохранилось: " + e, true));
   };
 }
 

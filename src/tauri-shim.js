@@ -12,6 +12,7 @@ export const bridgeInfo = () =>
 export function tauriFile(path) {
   try {
     if (!path) return "";
+    if (isDemo && DEMO_AUDIO_PATHS.includes(path)) return demoAudioUrl(path);
     if (TI()?.convertFileSrc) return TI().convertFileSrc(path);
     if (T()?.core?.convertFileSrc) return T().core.convertFileSrc(path);
   } catch {}
@@ -81,13 +82,36 @@ const demo = {
   settings: JSON.parse(localStorage.getItem("sd-settings") || "null") || {
     device_name: "My-PC", loaddrop_dir: "C:\\LoadDrop", tcp_port: 47831, sig_port: 47832,
     auto_accept_trusted: true, auto_accept_limit_mb: 500,
-    minimize_to_tray: true, autostart: false, sound: true, mic_id: "", speaker_id: "", camera_id: "",
+    minimize_to_tray: true, autostart: false, sound: true, audio_player_style: "wave", mic_id: "", speaker_id: "", camera_id: "",
     theme: { bg_mode: "gradient", bg_color: "#141824", bg_gradient: "linear-gradient(135deg,#1a2138,#0d1020)", bg_image: "", blur: 14, opacity: 0.85, accent: "#5b8cff", radius: 18, font: "Segoe UI", custom_css: "" },
     call_ui: { tile_size: 120, avatar_size: 120, show_names: true, ring_color: "#23a559", ring_width: 4, people_pos: "bottom", show_controls: true, bg_mode: "gradient", bg_color: "#1b1230", bg_from: "#1b1230", bg_to: "#120d20", accent_color: "#7c3aed", text_color: "#f2f3f5", show_logo: true },
     profile: { nickname: "", avatar: "" },
   },
 };
 function persist() { localStorage.setItem("sd-settings", JSON.stringify(demo.settings)); }
+
+// Small PCM WAVs are generated in memory, with no external audio or binary assets.
+const DEMO_AUDIO_PATHS = ["demo/safedrop-voice-preview.wav", "demo/Тестовый сигнал.wav"];
+const demoAudioUrls = new Map();
+function demoAudioUrl(path) {
+  if (demoAudioUrls.has(path)) return demoAudioUrls.get(path);
+  const sampleRate = 8000, samples = sampleRate * 3;
+  const bytes = new ArrayBuffer(44 + samples * 2), view = new DataView(bytes);
+  const text = (offset, value) => { for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i)); };
+  text(0, "RIFF"); view.setUint32(4, 36 + samples * 2, true); text(8, "WAVE"); text(12, "fmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true); text(36, "data"); view.setUint32(40, samples * 2, true);
+  const frequency = path === DEMO_AUDIO_PATHS[0] ? 330 : 440;
+  for (let i = 0; i < samples; i++) {
+    const t = i / sampleRate;
+    const envelope = Math.min(1, t * 8, (3 - t) * 8) * (0.35 + 0.65 * Math.sin(t * 7) ** 2);
+    view.setInt16(44 + i * 2, Math.sin(t * frequency * Math.PI * 2) * envelope * 2400, true);
+  }
+  const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+  demoAudioUrls.set(path, url);
+  return url;
+}
 
 // демо-контакты и переписка: чтобы вёрстку (и скриншоты для README) было видно
 // не на пустом окне. Только браузерный демо-режим, в приложении не используется.
@@ -120,5 +144,7 @@ function demoChat(ip) {
     m("d2", true, "Да, лови — 2,3 ГБ, через SafeDrop быстрее, чем через облако", 13),
     m("d3", false, "Дошло за минуту 🔥 Вечером созвон и посмотрим что-нибудь вместе?", 9),
     m("d4", true, "Давай, включу «Смотреть вместе» с YouTube", 8),
+    { ...m("d5", false, "", 3), audio: DEMO_AUDIO_PATHS[0] },
+    { ...m("d6", true, "А это аудиофайл для проверки плеера", 2), audio: DEMO_AUDIO_PATHS[1] },
   ];
 }

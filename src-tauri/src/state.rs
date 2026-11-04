@@ -149,6 +149,16 @@ impl Default for CallUi {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioPlayerStyle {
+    Compact,
+    System,
+    #[default]
+    #[serde(other)]
+    Wave,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "def_device")]
@@ -170,6 +180,8 @@ pub struct Settings {
     pub autostart: bool,
     #[serde(default = "def_true")]
     pub sound: bool,
+    #[serde(default)]
+    pub audio_player_style: AudioPlayerStyle,
     #[serde(default)]
     pub theme: ThemeConfig,
     #[serde(default)]
@@ -289,6 +301,7 @@ impl Default for Settings {
             minimize_to_tray: true,
             autostart: false,
             sound: true,
+            audio_player_style: AudioPlayerStyle::default(),
             theme: ThemeConfig::default(),
             call_ui: CallUi::default(),
             profile: Profile::default(),
