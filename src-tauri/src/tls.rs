@@ -364,10 +364,15 @@ pub fn init(app_dir: &Path) {
     }
     server_config().get_or_init(|| {
         let (cert, key) = my_cert()?;
-        let cfg = rustls::ServerConfig::builder_with_provider(crate::quic::ring_provider())
+        let mut cfg = rustls::ServerConfig::builder_with_provider(crate::quic::ring_provider())
             .with_protocol_versions(&[&rustls::version::TLS13]).ok()?
             .with_client_cert_verifier(Arc::new(ClientKeyVerify))
             .with_single_cert(vec![cert], key).ok()?;
+        // возобновление сессий не используем (одно соединение — один кадр), а
+        // билеты приходят отправителю уже после рукопожатия, и он их не читает:
+        // закрытие с непрочитанными данными рвёт соединение сбросом и теряет
+        // хвост большого кадра у отправителей 0.3.31–0.3.32 (см. finish)
+        cfg.send_tls13_tickets = 0;
         Some(Arc::new(cfg))
     });
 }
@@ -440,6 +445,31 @@ pub async fn connect(ip: &str, port: u16, timeout: Duration) -> Result<Stream, S
     // контакт не ответил на рукопожатие (старая версия) — как раньше, без шифрования
     forget(ip);
     Ok(Box::new(tcp(ip, port, timeout).await?))
+}
+
+/// Закрыть исходящее соединение после отправки кадра, не потеряв его хвост.
+/// Сервер TLS 1.3 сразу после рукопожатия присылает свои служебные данные
+/// (session tickets), а мы их не читаем. Закрытие сокета с непрочитанными
+/// входящими данными Windows (и Linux) делает сбросом (RST), и всё, что ещё
+/// лежало в буфере отправки, пропадает: короткий текст успевал уйти, а
+/// картинка в несколько сотен КБ по Radmin — нет. Поэтому после shutdown
+/// дочитываем до EOF: получатель закрывает соединение, когда прочитал кадр.
+pub async fn finish(mut s: Stream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _ = s.flush().await;
+    let _ = s.shutdown().await;
+    let drain = async {
+        let mut buf = [0u8; 4096];
+        let mut total = 0usize;
+        // ответ нам не нужен; лимит — чтобы чужая сторона не держала нас вечно
+        while total < 1024 * 1024 {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => total += n,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(30), drain).await;
 }
 
 /// QUIC: сверить ключ сервера после подключения (тот же учёт, что у TCP).
@@ -516,6 +546,58 @@ mod tests {
         forget_key(ip);
         assert!(pin_of(ip).is_none() && pin_of(alt).is_none());
         forget_key(other);
+    }
+
+    /// Картинка в чате — кадр в сотни КБ. Получатель читает его не сразу
+    /// (медленный Radmin, занятый поток): отправитель к этому моменту уже закрыл
+    /// соединение, и закрытие не должно отменить ещё не доставленные байты.
+    #[tokio::test]
+    async fn big_frame_survives_sender_close() {
+        let dir = std::env::temp_dir().join(format!("safedrop-tls-big-{}", std::process::id()));
+        init(&dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.4:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        const N: usize = 4 * 1024 * 1024;
+        // получатель 0.3.31–0.3.32 ещё шлёт билеты: от сброса спасает только finish
+        let mut old = (**server_config().get().unwrap().as_ref().unwrap()).clone();
+        old.send_tls13_tickets = 2;
+        let old = tokio_rustls::TlsAcceptor::from(Arc::new(old));
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut s = old.accept(sock).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let mut line = Vec::new();
+            let r = BufReader::new(&mut s).read_until(b'\n', &mut line).await;
+            (r.map_err(|e| e.to_string()), line.len(), listener)
+        });
+        note_peer_version("127.0.0.4", "0.3.26");
+        let mut s = connect("127.0.0.4", port, Duration::from_secs(5)).await.unwrap();
+        let mut data = vec![b'a'; N];
+        data.push(b'\n');
+        s.write_all(&data).await.unwrap();
+        finish(s).await;
+        let (r, got, listener) = server.await.unwrap();
+        assert_eq!((r.is_ok(), got), (true, N + 1), "{r:?}");
+
+        // отправитель 0.3.31–0.3.32 закрывал сразу после shutdown, не дочитывая:
+        // наш сервер не шлёт ему билеты, и закрытие не превращается в сброс
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (mut s, _) = accept(sock).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let mut line = Vec::new();
+            let r = BufReader::new(&mut s).read_until(b'\n', &mut line).await;
+            (r.map_err(|e| e.to_string()), line.len())
+        });
+        let mut s = connect("127.0.0.4", port, Duration::from_secs(5)).await.unwrap();
+        s.write_all(&data).await.unwrap();
+        s.flush().await.unwrap();
+        let _ = s.shutdown().await;
+        drop(s);
+        let (r, got) = server.await.unwrap();
+        assert_eq!((r.is_ok(), got), (true, N + 1), "{r:?}");
+        forget_key("127.0.0.4");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Сервер на одном порту принимает и TLS-клиента, и старого (без TLS);

@@ -1207,7 +1207,10 @@ pub async fn send_frame(ip: &str, port: u16, value: serde_json::Value, wait_repl
     s.write_all(out.as_bytes()).await.map_err(|e| e.to_string())?;
     s.flush().await.map_err(|e| e.to_string())?;
     if !wait_reply {
-        let _ = s.shutdown().await;
+        // не просто shutdown: см. tls::finish — иначе большие кадры (картинки)
+        // обрывались. Дочитываем в фоне: вызывающий (и 5-секундный бюджет
+        // send_frame_dual перед QUIC) ждать получателя не должен
+        tokio::spawn(crate::tls::finish(s));
         return Ok(None);
     }
     let mut reader = BufReader::new(&mut s);

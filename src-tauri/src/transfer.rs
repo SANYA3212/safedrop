@@ -660,8 +660,9 @@ async fn send_attempt(
         }
     }
     let id = pump_upload(app, prep, offset, peer_ip, &mut sock).await?;
-    // корректное закрытие (для TLS — close_notify): получатель видит конец потока
-    let _ = sock.shutdown().await;
+    // корректное закрытие (для TLS — close_notify) и ожидание, пока получатель
+    // дочитает: иначе закрытие сбросом (RST) терялся хвост файла (см. tls::finish)
+    crate::tls::finish(sock).await;
     Ok(id)
 }
 
