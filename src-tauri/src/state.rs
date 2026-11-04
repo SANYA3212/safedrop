@@ -228,6 +228,12 @@ pub struct Settings {
     pub share_quality: String, // low | medium | high
     #[serde(default)]
     pub udp_enabled: bool, // beta: dual TCP+UDP (QUIC) transport
+    #[serde(default)]
+    pub stun_enabled: bool,
+    #[serde(default)]
+    pub push_to_talk: bool,
+    #[serde(default)]
+    pub push_to_talk_key: String,
     #[serde(default = "def_udp_port")]
     pub udp_port: u16, // QUIC endpoint port
     #[serde(default = "def_true")]
@@ -310,6 +316,9 @@ impl Default for Settings {
             peer_volumes: HashMap::new(),
             share_quality: def_quality(),
             udp_enabled: false,
+            stun_enabled: false,
+            push_to_talk: false,
+            push_to_talk_key: "Space".into(),
             udp_port: def_udp_port(),
             show_typing: true,
             duck_media: true,
@@ -497,10 +506,26 @@ pub struct PendingSend {
     pub file: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallRecord {
+    pub id: String,
+    pub started_at: i64,
+    pub duration_secs: u64,
+    pub direction: String, // incoming | outgoing
+    pub status: String, // completed | missed
+    pub peer: String,
+    #[serde(default)]
+    pub participants: Vec<String>,
+    #[serde(default)]
+    pub group: bool,
+}
+
 pub struct AppState {
     pub settings: Mutex<Settings>,
     pub peers: Mutex<HashMap<String, Peer>>, // key = ip
     pub transfers: Mutex<Vec<TransferInfo>>,
+    pub call_history: Mutex<Vec<CallRecord>>,
     pub chats: Mutex<HashMap<String, Vec<ChatMsg>>>, // key = peer ip or g:<group>
     pub groups: Mutex<Vec<Group>>,
     pub group_sync: Mutex<GroupSyncState>,
@@ -521,6 +546,7 @@ impl AppState {
             settings: Mutex::new(Settings::default()),
             peers: Mutex::new(HashMap::new()),
             transfers: Mutex::new(Vec::new()),
+            call_history: Mutex::new(Vec::new()),
             chats: Mutex::new(HashMap::new()),
             groups: Mutex::new(Vec::new()),
             group_sync: Mutex::new(GroupSyncState::default()),
@@ -538,6 +564,7 @@ impl AppState {
     pub fn settings_path(&self) -> PathBuf { self.app_dir.join("settings.json") }
     pub fn peers_path(&self) -> PathBuf { self.app_dir.join("peers.json") }
     pub fn history_path(&self) -> PathBuf { self.app_dir.join("history.json") }
+    pub fn call_history_path(&self) -> PathBuf { self.app_dir.join("call-history.json") }
     pub fn chats_path(&self) -> PathBuf { self.app_dir.join("chats.json") }
     pub fn groups_path(&self) -> PathBuf { self.app_dir.join("groups.json") }
     pub fn group_sync_path(&self) -> PathBuf { self.app_dir.join("group-sync.json") }

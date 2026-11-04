@@ -253,6 +253,10 @@ async function loadAll() {
   $("#set-udp").checked = !!settings.udp_enabled;
   $("#set-udpport").value = settings.udp_port || 47833;
   $("#set-udpport").disabled = !settings.udp_enabled;
+  $("#set-stun").checked = !!settings.stun_enabled;
+  $("#set-ptt").checked = !!settings.push_to_talk;
+  $("#set-ptt-key").textContent = pttKeyLabel(settings.push_to_talk_key || "Space");
+  renderCallHistory();
   $("#set-autotrust").checked = settings.auto_accept_trusted;
   $("#set-limit").value = settings.auto_accept_limit_mb;
   $("#set-autostart").checked = settings.autostart;
@@ -713,6 +717,37 @@ function reactionsHTML(m, myNick) {
   }).join("");
   return `<div class="mreacts">${items}</div>`;
 }
+
+const PIN_STORE = "safedrop-pinned-messages";
+function pinnedMap() { try { return JSON.parse(localStorage.getItem(PIN_STORE) || "{}"); } catch { return {}; } }
+function pinnedFor(key = curKey()) { return (pinnedMap()[key] || []).slice(-5); }
+// закреплённые сообщения — только у себя (localStorage), до 5 на чат
+function togglePinned(key, msg) {
+  const all = pinnedMap(), rows = all[key] || [];
+  const i = rows.findIndex((x) => x.id === msg.id);
+  if (i >= 0) rows.splice(i, 1);
+  else rows.push({ id: msg.id, text: msgPreview(msg), author: msg.from_me ? makeMyNick() : msg.from_nick });
+  all[key] = rows.slice(-5);
+  try { localStorage.setItem(PIN_STORE, JSON.stringify(all)); } catch {}
+  renderPinned(); renderChat();
+}
+function renderPinned() {
+  const host = $("#pinned-strip"); if (!host) return;
+  const rows = pinnedFor();
+  host.innerHTML = "";
+  host.classList.toggle("hidden", !rows.length);
+  for (const pin of rows) {
+    const item = document.createElement("button");
+    item.className = "pinned-item";
+    item.textContent = "📌 " + pin.author + ": " + pin.text;
+    item.onclick = () => scrollToMsg(pin.id);
+    const unpin = document.createElement("button");
+    unpin.className = "pinned-remove"; unpin.textContent = "×"; unpin.title = "Открепить";
+    unpin.onclick = () => togglePinned(curKey(), { id: pin.id, text: pin.text, from_nick: pin.author });
+    host.append(item, unpin);
+  }
+}
+
 function buildRow(m, p, g, myLetter, myNick) {
   const me = !!m.from_me;
   const { av, letter } = rowAvatar(m, p, g, myLetter);
@@ -787,6 +822,7 @@ function refreshRow(row, m, p, g, myLetter, myNick) {
 }
 function renderChat() {
   const key = curKey();
+  renderPinned();
   const box = $("#messages"); const list = chats[key] || [];
   const keyChanged = key !== renderedKey;
   const wasAtBottom = keyChanged || (box.clientHeight > 0
@@ -1106,7 +1142,9 @@ function openMsgMenu(e, m) {
   const mine = !!m.from_me;
   const emojis = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
   const reactRow = emojis.map((em) => `<button data-act="react" data-emoji="${em}" title="Реакция «${em}»">${em}</button>`).join("");
+  const isPinned = pinnedFor().some((x) => x.id === m.id);
   const actions = [
+    `<button data-act="pin">${isPinned ? "Открепить" : "Закрепить"}</button>`,
     `<button data-act="reply">Ответить</button>`,
     mine ? `<button data-act="edit">Изменить</button>` : "",
     mine ? `<button data-act="copy">Копировать текст</button>` : "",
@@ -1128,7 +1166,8 @@ function openMsgMenu(e, m) {
     closeMsgMenu();
     if (!src) return;
     const act = b.dataset.act;
-    if (act === "react") {
+    if (act === "pin") { togglePinned(curKey(), src);
+    } else if (act === "react") {
       const emoji = b.dataset.emoji;
       const exists = (src.reactions || []).find((r) => r.emoji === emoji);
       const remove = exists ? exists.by.includes(makeMyNick()) : false;
@@ -1349,8 +1388,32 @@ async function pickPeerAvatar() {
   } catch (e) { toast(String(e), true); }
 }
 
+
+function bindPushToTalk() {
+  const enabled = $("#set-ptt"), keyButton = $("#set-ptt-key");
+  if (enabled) enabled.onchange = async () => {
+    settings.push_to_talk = enabled.checked; pttKeyDown = false; syncMicTrack(); syncVbMic(); renderCallStage();
+    try { await invoke("save_settings", { settings }); } catch (e) { toast("Не сохранилось: " + e, true); }
+  };
+  if (keyButton) keyButton.onclick = () => { keyButton.textContent = "Нажмите клавишу…"; keyButton.dataset.capture = "1"; };
+}
+function isPttKey(e) { return (settings?.push_to_talk_key || "Space") === (e.code || e.key); }
+document.addEventListener("keydown", (e) => {
+  const b = $("#set-ptt-key");
+  if (b?.dataset.capture) { e.preventDefault(); settings.push_to_talk_key = e.code || e.key; delete b.dataset.capture; b.textContent = pttKeyLabel(settings.push_to_talk_key); invoke("save_settings", { settings }).catch((x) => toast("" + x, true)); return; }
+  if (!settings?.push_to_talk || !(currentCall || groupCall) || !isPttKey(e) || e.repeat) return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "") || document.activeElement?.isContentEditable) return;
+  e.preventDefault(); pttKeyDown = true; syncMicTrack(); syncVbMic(); renderCallStage();
+});
+document.addEventListener("keyup", (e) => { if (settings?.push_to_talk && isPttKey(e)) { pttKeyDown = false; syncMicTrack(); syncVbMic(); renderCallStage(); } });
+window.addEventListener("blur", () => { if (pttKeyDown) { pttKeyDown = false; syncMicTrack(); syncVbMic(); renderCallStage(); } });
+bindPushToTalk();
+
 // ---------- devices + mic permission ----------
-let localStream = null, micMuted = false;
+let localStream = null, micMuted = false, pttKeyDown = false;
+function micIsMuted() { return micMuted || (!!settings?.push_to_talk && !pttKeyDown); }
+function syncMicTrack() { localStream?.getAudioTracks().forEach((t) => (t.enabled = !micIsMuted())); }
+function pttKeyLabel(key) { return key === "Space" ? "Пробел" : key; }
 function setMicState(st) {
   const el = $("#mic-state");
   el.className = "mic-state" + (st === "ok" ? " ok" : st === "no" ? " no" : "");
@@ -1556,7 +1619,7 @@ async function startMicNow() {
       { audio: true },
     ]);
     setMicState("ok");
-    localStream.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
+    syncMicTrack();
     // Local audio chain: RNNoise (optional), level, and a soft expander gate.
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -2001,8 +2064,41 @@ function ringbackStop() {
   if (ringbackAudio) { try { ringbackAudio.pause(); } catch {} ringbackAudio = null; }
   incomingRingtoneStop();
 }
+
+// ---------- история звонков (локально, в call-history.json) ----------
+let callHistoryRows = [];
+function fmtCallDuration(sec) { return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0"); }
+const CALL_STATUS = { missed: "Пропущен", unanswered: "Без ответа" };
+async function renderCallHistory() {
+  const host = $("#call-history-list"); if (!host) return;
+  try { callHistoryRows = (await invoke("get_call_history")) || []; } catch { callHistoryRows = []; }
+  host.innerHTML = "";
+  if (!callHistoryRows.length) { host.textContent = "Звонков пока нет"; return; }
+  for (const row of [...callHistoryRows].reverse()) {
+    const d = document.createElement("div");
+    d.className = "call-history-row";
+    const p = peers.find((x) => x.ip === row.peer || (x.ips || []).includes(row.peer));
+    const target = row.group ? "Группа: " + row.peer : (p ? dispName(p) : row.peer);
+    const kind = CALL_STATUS[row.status] || (row.direction === "incoming" ? "Входящий" : "Исходящий");
+    const dur = row.status === "completed" ? " · " + fmtCallDuration(row.durationSecs) : "";
+    d.textContent = `${kind} · ${target} · ${new Date(row.startedAt).toLocaleString()}${dur}`;
+    host.appendChild(d);
+  }
+}
+$("#clear-call-history")?.addEventListener("click", async () => {
+  try { await invoke("clear_call_history"); await renderCallHistory(); } catch (e) { toast("" + e, true); }
+});
+// durationFrom — когда собеседник ответил: гудки в длительность не входят
+function saveCallRecord({ direction, peer, group = false, status = "completed", startedAt = Date.now(), durationFrom = startedAt, participants = [] }) {
+  const durationSecs = status === "completed" ? Math.max(0, Math.floor((Date.now() - durationFrom) / 1000)) : 0;
+  invoke("add_call_record", { record: { id: crypto.randomUUID(), startedAt, durationSecs, direction, status, peer, group, participants } })
+    .then(renderCallHistory)
+    .catch((e) => console.warn("call history", e));
+}
+
 // ---------- WebRTC calls ----------
 let pc = null, currentCall = null, callTimer = null, callSec = 0, pendingOffer = null, callSetupPeer = null;
+let activeCallStartedAt = 0, activeCallDirection = "outgoing", activeCallAnsweredAt = 0;
 let iceOutBuf = [], iceInBuf = []; // кандидаты, пришедшие раньше готовности
 function sendIce(peerIp, cand) {
   invoke("sig_send", { peerIp, payload: { kind: "ice", from: profile.nickname || settings.device_name, candidate: JSON.stringify(cand) } }).catch(() => {});
@@ -2023,7 +2119,7 @@ async function flushInIce() {
 }
 function ensurePC(peerIp) {
   if (pc) return pc;
-  pc = new RTCPeerConnection(RTC_CONFIG);
+  pc = new RTCPeerConnection(rtcConfig());
   pc.onicecandidate = (e) => {
     if (!e.candidate) return;
     if (currentCall === peerIp) sendIce(peerIp, e.candidate);
@@ -2050,6 +2146,12 @@ function showCallUI(peerIp) {
 }
 function hideCallUI() {
   const endedPeer = currentCall;
+  if (endedPeer && activeCallStartedAt) {
+    // исходящий без ответа — «без ответа», а не состоявшийся звонок
+    const status = activeCallAnsweredAt ? "completed" : "unanswered";
+    saveCallRecord({ direction: activeCallDirection, peer: endedPeer, status, startedAt: activeCallStartedAt, durationFrom: activeCallAnsweredAt });
+    activeCallStartedAt = activeCallAnsweredAt = 0;
+  }
   if (endedPeer) {
     dropRemoteVoice(endedPeer);
     void closeScreensForPeer(endedPeer);
@@ -2067,7 +2169,9 @@ function hideCallUI() {
 }
 // max-bundle: весь звонок одним транспортом. WebKitGTK (GStreamer webrtcbin) не умеет
 // политику balanced по умолчанию и без этого не соединяется; Chromium/WebView2 — умеет.
-const RTC_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }], bundlePolicy: "max-bundle" };
+function rtcConfig() {
+  return { iceServers: settings?.stun_enabled ? [{ urls: "stun:stun.l.google.com:19302" }] : [], bundlePolicy: "max-bundle" };
+}
 // WebKit на Linux бывает собран без WebRTC — тогда звонков и демонстраций нет вовсе.
 function noRtc() {
   if (typeof RTCPeerConnection !== "undefined") return false;
@@ -2079,7 +2183,8 @@ async function startCall(peerIp) {
   if (noRtc()) return;
   if (currentCall || groupCall || pendingOffer || callSetupPeer) return toast("Сначала заверши текущий звонок или ответь на приглашение", true);
   callSetupPeer = peerIp;
-  try { await startMic(); } catch (e) { callSetupPeer = null; micFailed(e); return; }
+  activeCallStartedAt = Date.now(); activeCallDirection = "outgoing"; activeCallAnsweredAt = 0;
+  try { await startMic(); } catch (e) { callSetupPeer = null; activeCallStartedAt = 0; micFailed(e); return; }
   try {
     ensurePC(peerIp);
     const offer = await pc.createOffer();
@@ -2093,6 +2198,7 @@ async function startCall(peerIp) {
 async function acceptCall() {
   if (!pendingOffer || currentCall || groupCall || callSetupPeer) return;
   const { ip, sdp } = pendingOffer; pendingOffer = null;
+  activeCallStartedAt = activeCallAnsweredAt = Date.now(); activeCallDirection = "incoming";
   callSetupPeer = ip;
   $("#call-modal").classList.add("hidden"); ringbackStop();
   try { if (noRtc()) throw new Error("no webrtc"); await startMic(); }
@@ -2305,7 +2411,7 @@ function renderCallStage() {
   box.innerHTML = "";
   const myLetter = ((profile.nickname || settings?.device_name || "?"))[0].toUpperCase();
   const me = document.createElement("div");
-  me.innerHTML = tileHTML({ key: "me", ava: `<span class="ava lg"><span>${avaInner(profile.avatar, myLetter)}</span></span>`, name: "Ты", sub: deafened ? "звук выключен" : (micMuted ? "мут" : "в звонке"), mic: micMuted ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z"/><path d="M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z"/></svg>' });
+  me.innerHTML = tileHTML({ key: "me", ava: `<span class="ava lg"><span>${avaInner(profile.avatar, myLetter)}</span></span>`, name: "Ты", sub: deafened ? "звук выключен" : (micIsMuted() ? "мут" : "в звонке"), mic: micIsMuted() ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z"/><path d="M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z"/></svg>' });
   box.appendChild(me.firstChild);
   const addPeer = (ip) => {
     const p = peers.find((x) => x.ip === ip);
@@ -2376,9 +2482,9 @@ function updateVoiceBar() {
   renderCallScreen();
 }
 function syncVbMic() {
-  const b = $("#vb-mic"); if (b) { b.innerHTML = micMuted ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z"/><path d="M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z"/></svg>'; b.classList.toggle("off", micMuted); }
-  const m = $("#me-mic"); if (m) m.innerHTML = micMuted ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z"/><path d="M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z"/></svg>';
-  const c = $("#cp-mute"); if (c) c.innerHTML = micMuted ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z"/><path d="M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z"/></svg>';
+  const b = $("#vb-mic"); if (b) { b.innerHTML = micIsMuted() ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z"/><path d="M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z"/></svg>'; b.classList.toggle("off", micIsMuted()); }
+  const m = $("#me-mic"); if (m) m.innerHTML = micIsMuted() ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z"/><path d="M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z"/></svg>';
+  const c = $("#cp-mute"); if (c) c.innerHTML = micIsMuted() ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z"/><path d="M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z"/></svg>';
   syncCallScreenControls();
 }
 function syncVbDeaf() {
@@ -2413,8 +2519,8 @@ function syncCallScreenEsc(active) {
 function syncCallScreenControls() {
   const mic = $("#cs-mic");
   if (mic) {
-    mic.classList.toggle("off", micMuted);
-    mic.innerHTML = micMuted
+    mic.classList.toggle("off", micIsMuted());
+    mic.innerHTML = micIsMuted()
       ? '<svg viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><svg class="chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg>'
       : '<svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1H3v1a9 9 0 0 0 8 8.9V22h2v-2.1a9 9 0 0 0 8-8.9v-1z"/></svg><svg class="chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg>';
   }
@@ -2501,7 +2607,7 @@ function renderCallScreenStage() {
   }
   const people = [];
   if (groupCall) {
-    people.push({ key: "me", name: "Ты", ava: `<span class="ava lg"><span>${avaInner(profile.avatar, ((profile.nickname || settings?.device_name || "?")[0] || "?").toUpperCase())}</span></span>`, muted: micMuted });
+    people.push({ key: "me", name: "Ты", ava: `<span class="ava lg"><span>${avaInner(profile.avatar, ((profile.nickname || settings?.device_name || "?")[0] || "?").toUpperCase())}</span></span>`, muted: micIsMuted() });
     for (const m of groupCall.members) {
       if (myIp && m === myIp) continue;
       const p = callPeerByIp(m);
@@ -2550,8 +2656,9 @@ function renderCallScreen() {
   renderCallScreenStage();
 }
 function toggleMic() {
+  if (settings?.push_to_talk) return toast("Включён push-to-talk: говорите, удерживая клавишу. Выключить — в «Звонки и звук».");
   micMuted = !micMuted;
-  localStream?.getAudioTracks().forEach((t) => (t.enabled = !micMuted));
+  syncMicTrack();
   syncVbMic(); renderCallStage();
   toast(micMuted ? "Микрофон выключен" : "Микрофон включён");
 }
@@ -2585,7 +2692,7 @@ let gpc = {}, groupCall = null;
 let ginBuf = {};
 function ensureGPC(peerIp) {
   if (gpc[peerIp]?.pc) return gpc[peerIp].pc;
-  const c = new RTCPeerConnection(RTC_CONFIG);
+  const c = new RTCPeerConnection(rtcConfig());
   gpc[peerIp] = { pc: c };
   c.onicecandidate = (e) => {
     if (!e.candidate) return;
@@ -2642,6 +2749,7 @@ function startCallTimer() {
   }, 1000);
 }
 function showGroupUI() {
+  if (!activeCallStartedAt) { activeCallStartedAt = Date.now(); activeCallDirection = groupCall?.initiator === myIp ? "outgoing" : "incoming"; }
   callScreenOpen = true;
   bindSharesToCall(screenCallId(), groupCall?.members || []);
   $("#btn-hangup").classList.remove("hidden");
@@ -2679,6 +2787,7 @@ async function joinGroupCall(gref, viaIp, viaSdp) {
 }
 function endGroupCall(silent) {
   const endedGroup = groupCall;
+  if (endedGroup && activeCallStartedAt) { saveCallRecord({ direction: activeCallDirection, peer: endedGroup.name || endedGroup.id, group: true, participants: endedGroup.members, startedAt: activeCallStartedAt }); activeCallStartedAt = 0; }
   const hadCall = !!endedGroup || Object.keys(gpc).length > 0;
   ringbackStop();
   if (endedGroup) void closeScreensForCall(`group:${endedGroup.id}`, endedGroup.members);
@@ -2879,7 +2988,7 @@ async function startShareStream(stream, label, withAudio, kind = "screen", audio
   stream.getVideoTracks()[0]?.addEventListener("ended", () => stopShare(shareId));
   for (const ip of targets) {
     try {
-      const c = new RTCPeerConnection(RTC_CONFIG);
+      const c = new RTCPeerConnection(rtcConfig());
       myShares[shareId].pcs[ip] = c;
       myShares[shareId].pcsAt[ip] = Date.now();
       const senders = [];
@@ -2955,7 +3064,7 @@ $("#btn-share-dbg").onclick = () => {
 };
 async function acceptScreenView({ ip, sdp, share_id, label, call_id }) {
   if (views[share_id]) return;
-  const c = new RTCPeerConnection(RTC_CONFIG);
+  const c = new RTCPeerConnection(rtcConfig());
   const stream = new MediaStream();
   views[share_id] = { pc: c, ip, label: label || `Экран • ${ip}`, callId: call_id || "", stream, volume: 100, muted: false, inbuf: [], createdAt: Date.now(), firstTrackAt: 0 };
   c.ontrack = (e) => {
@@ -3466,7 +3575,7 @@ $("#btn-move-loaddrop2").onclick = moveLoaddrop;
 $("#btn-save").onclick = async () => {
   const oldPort = settings.tcp_port;
   const oldUdp = settings.udp_port;
-  settings = { ...settings, device_name: $("#set-device").value, tcp_port: parseInt($("#set-port").value) || 47831, udp_enabled: $("#set-udp").checked, udp_port: parseInt($("#set-udpport").value) || 47833, auto_accept_trusted: $("#set-autotrust").checked, auto_accept_limit_mb: parseInt($("#set-limit").value) || 500, autostart: $("#set-autostart").checked, minimize_to_tray: $("#set-tray").checked, ctx_menu: $("#set-ctxmenu").checked, theme: collectTheme() };
+  settings = { ...settings, device_name: $("#set-device").value, tcp_port: parseInt($("#set-port").value) || 47831, udp_enabled: $("#set-udp").checked, udp_port: parseInt($("#set-udpport").value) || 47833, stun_enabled: $("#set-stun").checked, auto_accept_trusted: $("#set-autotrust").checked, auto_accept_limit_mb: parseInt($("#set-limit").value) || 500, autostart: $("#set-autostart").checked, minimize_to_tray: $("#set-tray").checked, ctx_menu: $("#set-ctxmenu").checked, theme: collectTheme() };
   try {
     await invoke("save_settings", { settings });
     if ($("#set-ctxmenu").checked !== undefined) { try { await invoke("set_ctx_menu", { enabled: $("#set-ctxmenu").checked }); } catch (e) { toast("Меню проводника: " + e, true); } }
@@ -3474,6 +3583,8 @@ $("#btn-save").onclick = async () => {
   } catch (e) { toast("" + e, true); }
 };
 $("#set-udp").onchange = (e) => { $("#set-udpport").disabled = !e.target.checked; };
+// новые звонки берут STUN из настроек сразу, без кнопки «Сохранить» в разделе сети
+$("#set-stun").onchange = (e) => { settings.stun_enabled = e.target.checked; invoke("save_settings", { settings }).catch((x) => toast("" + x, true)); };
 $("#btn-firewall").onclick = async () => {
   toast("Открываю порты… (если спросит — разреши права администратора)");
   try { const log = await invoke("open_firewall"); toast("Firewall: " + String(log).replace(/\n/g, " ")); }
@@ -3492,6 +3603,7 @@ $("#btn-factory-reset").onclick = async () => {
   if (!await askConfirm("ПОЛНЫЙ СБРОС?", "Стереть контакты, чаты, настройки, оформление. Папка LoadDrop с файлами останется.", "Сбросить")) return;
   if (!await askConfirm("Точно-точно?", "Всё вернётся как при первом запуске.", "Да, сбросить")) return;
   try { await invoke("factory_reset"); } catch (e) { toast("" + e, true); return; }
+  try { localStorage.removeItem(PIN_STORE); } catch {}
   location.reload();
 };
 $("#btn-clear-cache").onclick = async () => {
@@ -3978,6 +4090,7 @@ $("#cm-accept").onclick = async () => {
   acceptCall();
 };
 $("#cm-decline").onclick = async () => {
+  if (pendingOffer) saveCallRecord({ direction: "incoming", peer: pendingOffer.group?.name || pendingOffer.ip, group: !!pendingOffer.group, status: "missed" });
   $("#call-modal").classList.add("hidden"); ringbackStop();
   if (pendingOffer) await invoke("sig_send", { peerIp: pendingOffer.ip, payload: { kind: "call-hangup", from: profile.nickname || "" } }).catch(() => {});
   pendingOffer = null;
@@ -4544,6 +4657,7 @@ try {
       try {
         await pc.setRemoteDescription(JSON.parse(t.sdp));
         await flushInIce();
+        if (!activeCallAnsweredAt) activeCallAnsweredAt = Date.now();
         ringbackStop();
         playCallJoinSound();
       } catch {}
@@ -4575,6 +4689,7 @@ try {
   await listen("safedrop-hangup", (e) => {
     const ip = e.payload?.ip;
     if (pendingOffer?.ip === ip) {
+      saveCallRecord({ direction: "incoming", peer: ip, group: !!pendingOffer.group, status: "missed", startedAt: Date.now() });
       pendingOffer = null;
       $("#call-modal").classList.add("hidden");
       ringbackStop();

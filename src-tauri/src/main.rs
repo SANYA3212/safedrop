@@ -11,7 +11,7 @@ mod transfer;
 mod updsig;
 mod ytbrowse;
 
-use state::{AppState, ChatMsg, Group, Peer, PendingSend, Profile, Settings, TransferInfo};
+use state::{AppState, CallRecord, ChatMsg, Group, Peer, PendingSend, Profile, Settings, TransferInfo};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WindowEvent};
 use tauri::webview::{PermissionKind, PermissionResponse};
@@ -1373,6 +1373,7 @@ async fn factory_reset(
         state.chats_path(),
         state.groups_path(),
         state.group_sync_path(),
+        state.call_history_path(),
     ] {
         let _ = std::fs::remove_file(f);
     }
@@ -1390,6 +1391,7 @@ async fn factory_reset(
     *state.settings.lock().await = fresh;
     state.peers.lock().await.clear();
     state.transfers.lock().await.clear();
+    state.call_history.lock().await.clear();
     state.chats.lock().await.clear();
     state.groups.lock().await.clear();
     *state.group_sync.lock().await = state::GroupSyncState::default();
@@ -1941,6 +1943,32 @@ async fn forget_key(ip: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Local call history, stored separately from file transfer history.
+#[tauri::command]
+async fn get_call_history(state: tauri::State<'_, AppState>) -> Result<Vec<CallRecord>, String> {
+    Ok(state.call_history.lock().await.clone())
+}
+
+#[tauri::command]
+async fn clear_call_history(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.call_history.lock().await.clear();
+    std::fs::write(state.call_history_path(), "[]").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn add_call_record(state: tauri::State<'_, AppState>, mut record: CallRecord) -> Result<(), String> {
+    if !["incoming", "outgoing"].contains(&record.direction.as_str()) { return Err("invalid call direction".into()); }
+    if !["completed", "missed", "unanswered"].contains(&record.status.as_str()) { return Err("invalid call status".into()); }
+    record.peer.truncate(256);
+    record.participants.truncate(64);
+    let mut history = state.call_history.lock().await;
+    history.push(record);
+    let extra = history.len().saturating_sub(300);
+    history.drain(..extra);
+    let data = serde_json::to_vec_pretty(&*history).map_err(|e| e.to_string())?;
+    std::fs::write(state.call_history_path(), data).map_err(|e| e.to_string())
+}
+
 /// Clear transfer history (sent files list).
 #[tauri::command]
 async fn clear_transfers(state: tauri::State<'_, AppState>) -> Result<(), String> {
@@ -2020,6 +2048,12 @@ fn main() {
     let st = AppState::new(dir);
     settings::load_settings(&st);
     settings::load_peers(&st);
+    if let Ok(data) = std::fs::read_to_string(st.call_history_path()) {
+        if let Ok(mut rows) = serde_json::from_str::<Vec<CallRecord>>(&data) {
+            if rows.len() > 300 { rows.drain(..rows.len() - 300); }
+            if let Ok(mut history) = st.call_history.try_lock() { *history = rows; }
+        }
+    }
     // с кем шифровать соединения — по версиям, известным с прошлого запуска
     if let Ok(peers) = st.peers.try_lock() {
         for p in peers.values() {
@@ -2317,6 +2351,7 @@ fn main() {
             get_settings, save_settings, get_profile, save_profile, set_peer_avatar,
             get_my_ips, get_my_adapters, get_peers, add_peer,
             rename_peer, remove_peer, toggle_trust, ping_peer, scan_network,
+            get_call_history, clear_call_history, add_call_record,
             get_chat, send_chat, send_group_chat, chat_edit, chat_react, chat_typing, sig_send, delete_msgs, clear_chat, open_mic_settings, set_busy,
             get_groups, create_group, rename_group, set_group_avatar, delete_group, leave_group, group_add_member, group_remove_member,
             send_file, send_update, apply_update, open_url, open_notif_settings, get_transfers, clear_transfers, cancel_transfer, respond_file_offer, test_notify, open_loaddrop, move_loaddrop, get_loaddrop,
