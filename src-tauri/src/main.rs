@@ -12,6 +12,7 @@ mod updsig;
 mod ytbrowse;
 
 use state::{AppState, CallRecord, ChatMsg, Group, Peer, PendingSend, Profile, Settings, TransferInfo};
+use base64::Engine;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WindowEvent};
 use tauri::webview::{PermissionKind, PermissionResponse};
@@ -348,11 +349,70 @@ async fn get_chat(state: tauri::State<'_, AppState>, peer_ip: String) -> Result<
     Ok(g.get(&peer_ip).cloned().unwrap_or_default())
 }
 
+#[tauri::command]
+async fn save_voice_record(state: tauri::State<'_, AppState>, data: String, extension: String) -> Result<String, String> {
+    if data.len() > 16 * 1024 * 1024 {
+        return Err("voice recording too large".into());
+    }
+    let ext = extension.to_ascii_lowercase();
+    if !matches!(ext.as_str(), "webm" | "ogg") {
+        return Err("unsupported voice format".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())?;
+    if bytes.is_empty() || bytes.len() > 12 * 1024 * 1024 {
+        return Err("voice recording too large".into());
+    }
+    let dir = state.settings.lock().await.loaddrop_dir.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = std::path::Path::new(&dir).join(format!("safedrop-voice-{}.{}", uuid::Uuid::new_v4(), ext));
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn discard_voice_record(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    // только своя неотправленная запись: имя safedrop-voice-* и лежит в LoadDrop
+    let p = std::path::Path::new(&path);
+    let name = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+    let dir = state.settings.lock().await.loaddrop_dir.clone();
+    let in_dir = p.parent().map(|d| d == std::path::Path::new(&dir)).unwrap_or(false);
+    if !name.starts_with("safedrop-voice-") || !in_dir {
+        return Err("invalid voice recording".into());
+    }
+    let _ = std::fs::remove_file(p);
+    Ok(())
+}
+
+#[tauri::command]
+async fn chat_audio_size(path: String) -> Result<u64, String> {
+    if !audio_ext_ok(&path) {
+        return Err("unsupported audio".into());
+    }
+    std::fs::metadata(path).map(|m| m.len()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn send_chat_read(app: tauri::AppHandle, state: tauri::State<'_, AppState>, peer_ip: String, id: String) -> Result<(), String> {
+    let (port, nick, enabled) = {
+        let s = state.settings.lock().await;
+        (s.sig_port, if s.profile.nickname.is_empty() { s.device_name.clone() } else { s.profile.nickname.clone() }, s.read_receipts)
+    };
+    if !enabled {
+        return Ok(());
+    }
+    let is_received = state.chats.lock().await.get(&peer_ip)
+        .map(|rows| rows.iter().any(|m| m.id == id && !m.from_me))
+        .unwrap_or(false);
+    if !is_received { return Err("message not found".into()); }
+    let frame = serde_json::json!({"kind":"chat-read", "from":nick, "id":id});
+    quic::send_frame_dual(&app, &peer_ip, port, frame, false).await.map(|_| ())
+}
+
 fn audio_ext_ok(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
         .and_then(|s| s.to_str())
-        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "mp3" | "wav" | "ogg" | "m4a" | "flac"))
+        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "mp3" | "wav" | "ogg" | "m4a" | "flac" | "webm"))
         .unwrap_or(false)
 }
 
@@ -377,6 +437,7 @@ async fn send_chat(
     images: Option<Vec<String>>,
     audio: Option<String>,
     reply_to: Option<String>,
+    forwarded_from: Option<String>,
 ) -> Result<ChatMsg, String> {
     let text = text.trim().chars().take(2000).collect::<String>();
     let mut images: Vec<String> = images.unwrap_or_default().into_iter()
@@ -403,6 +464,7 @@ async fn send_chat(
     // Kept only for older clients; 0.3.13+ renders sent_at with the local clock.
     let ts = chrono::Local::now().format("%H:%M").to_string();
     let reply_to = reply_to.unwrap_or_default();
+    let forwarded_from = forwarded_from.unwrap_or_default();
     let msg = ChatMsg {
         id: uuid::Uuid::new_v4().to_string(),
         peer: peer_ip.clone(),
@@ -414,8 +476,10 @@ async fn send_chat(
         image: image.clone(),
         images: images.clone(),
         audio: audio.clone(),
+        forwarded_from: forwarded_from.clone(),
         status: "sent".into(),
         delivered_to: Vec::new(),
+        read: false,
         reply_to,
         edited_at: 0,
         reactions: Vec::new(),
@@ -431,7 +495,7 @@ async fn send_chat(
     // Deliver in the background: an offline peer must not block the composer.
     // The message stays in chats.json with status "sent" and is flushed when
     // the peer comes online; the receiver acknowledges it with "chat-ack".
-    let v = serde_json::json!({"kind":"chat","id":msg.id,"sent_at":sent_at,"from":nick,"nickname":nick,"text":text,"ts":ts,"image":image,"images":images,"audio":audio_file_name(&audio),"reply_to":msg.reply_to});
+    let v = serde_json::json!({"kind":"chat","id":msg.id,"sent_at":sent_at,"from":nick,"nickname":nick,"text":text,"ts":ts,"image":image,"images":images,"audio":audio_file_name(&audio),"reply_to":msg.reply_to,"forwarded_from":forwarded_from});
     let app2 = app.clone();
     let peer = peer_ip.clone();
     tokio::spawn(async move {
@@ -721,6 +785,7 @@ async fn send_group_chat(
     images: Option<Vec<String>>,
     audio: Option<String>,
     reply_to: Option<String>,
+    forwarded_from: Option<String>,
 ) -> Result<ChatMsg, String> {
     let text = text.trim().chars().take(2000).collect::<String>();
     let mut images: Vec<String> = images.unwrap_or_default().into_iter()
@@ -754,6 +819,7 @@ async fn send_group_chat(
     // Kept only for older clients; 0.3.13+ renders sent_at with the local clock.
     let ts = chrono::Local::now().format("%H:%M").to_string();
     let reply_to = reply_to.unwrap_or_default();
+    let forwarded_from = forwarded_from.unwrap_or_default();
     let key = format!("g:{}", group.id);
     let msg = ChatMsg {
         id: uuid::Uuid::new_v4().to_string(),
@@ -766,8 +832,10 @@ async fn send_group_chat(
         image: image.clone(),
         images: images.clone(),
         audio: audio.clone(),
+        forwarded_from: forwarded_from.clone(),
         status: "sent".into(),
         delivered_to: Vec::new(),
+        read: false,
         reply_to,
         edited_at: 0,
         reactions: Vec::new(),
@@ -785,7 +853,7 @@ async fn send_group_chat(
     for m in &without_me(&group.members) {
         let v = serde_json::json!({
             "kind": "chat", "id": msg.id, "sent_at": sent_at, "from": nick, "nickname": nick, "text": text, "ts": ts,
-            "image": image, "images": images, "audio": audio_file_name(&audio), "to_group": group.id, "group_name": group.name, "members": group.members, "reply_to": msg.reply_to,
+            "image": image, "images": images, "audio": audio_file_name(&audio), "to_group": group.id, "group_name": group.name, "members": group.members, "reply_to": msg.reply_to, "forwarded_from": forwarded_from,
         });
         let app2 = app.clone();
         let target = m.clone();
@@ -1378,6 +1446,24 @@ async fn factory_reset(
         let _ = std::fs::remove_file(f);
     }
     let _ = std::fs::remove_dir_all(state.app_dir.join("avatars"));
+    let voice_dir = state.settings.lock().await.loaddrop_dir.clone();
+    let mut voice_files = std::collections::HashSet::new();
+    for rows in state.chats.lock().await.values() {
+        for message in rows {
+            let path = std::path::PathBuf::from(&message.audio);
+            let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("");
+            if name.starts_with("safedrop-voice-") { voice_files.insert(path); }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&voice_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("safedrop-voice-") {
+                voice_files.insert(entry.path());
+            }
+        }
+    }
+    for path in voice_files { let _ = std::fs::remove_file(path); }
     if cfg!(windows) {
         let _ = reg(&["delete", ctx_base(), "/f"]);
         let _ = reg(&["delete", &clsid_key(), "/f"]);
@@ -2352,7 +2438,7 @@ fn main() {
             get_my_ips, get_my_adapters, get_peers, add_peer,
             rename_peer, remove_peer, toggle_trust, ping_peer, scan_network,
             get_call_history, clear_call_history, add_call_record,
-            get_chat, send_chat, send_group_chat, chat_edit, chat_react, chat_typing, sig_send, delete_msgs, clear_chat, open_mic_settings, set_busy,
+            get_chat, send_chat, send_group_chat, send_chat_read, save_voice_record, discard_voice_record, chat_audio_size, chat_edit, chat_react, chat_typing, sig_send, delete_msgs, clear_chat, open_mic_settings, set_busy,
             get_groups, create_group, rename_group, set_group_avatar, delete_group, leave_group, group_add_member, group_remove_member,
             send_file, send_update, apply_update, open_url, open_notif_settings, get_transfers, clear_transfers, cancel_transfer, respond_file_offer, test_notify, open_loaddrop, move_loaddrop, get_loaddrop,
             pick_files, pick_image, pick_folder, pick_audio, read_image_dataurl,
