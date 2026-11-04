@@ -47,8 +47,22 @@ copy /y "%INSTALLER%" "update\%INSTALLER_NAME%" >nul
 if errorlevel 1 goto :failed
 echo %VERSION%> "update\version.txt"
 
+REM Sign the installer: since 0.3.31 friends only install updates signed with this key.
+REM The private key stays on this PC (never commit it); the public key is in src-tauri\src\updsig.rs.
+set "SIGN_KEY=%USERPROFILE%\.tauri\safedrop-update.key"
+if not exist "%SIGN_KEY%" (
+  echo ERROR: signing key not found: %SIGN_KEY%
+  goto :failed
+)
+cargo tauri signer sign -f "%SIGN_KEY%" -p "" "update\%INSTALLER_NAME%" >nul
+if errorlevel 1 goto :failed
+if not exist "update\%INSTALLER_NAME%.sig" (
+  echo ERROR: signature was not produced
+  goto :failed
+)
+
 echo.
-echo OK: dist\safedrop.exe, dist\safedrop-shell.dll and update\%INSTALLER_NAME%
+echo OK: dist\safedrop.exe, dist\safedrop-shell.dll, update\%INSTALLER_NAME% and its .sig
 echo The installer embeds safedrop-shell.dll as a Tauri resource.
 echo On other PCs: keep safedrop.exe and safedrop-shell.dll together in dist.
 echo WebView2 Runtime and Radmin VPN may also be required.

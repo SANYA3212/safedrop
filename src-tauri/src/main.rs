@@ -8,6 +8,7 @@ mod signal;
 mod state;
 mod tls;
 mod transfer;
+mod updsig;
 mod ytbrowse;
 
 use state::{AppState, ChatMsg, Group, Peer, PendingSend, Profile, Settings, TransferInfo};
@@ -1002,7 +1003,7 @@ async fn send_file(
         (s.tcp_port, s.device_name.clone())
     };
     let confirm = state.peers.lock().await.get(&peer_ip).map(|p| p.supports_file_confirm).unwrap_or(false);
-    quic::send_file_dual(&app, peer_ip, port, file_path, device, "file".into(), confirm, String::new()).await
+    quic::send_file_dual(&app, peer_ip, port, file_path, device, "file".into(), confirm, String::new(), String::new()).await
 }
 
 /// Send an installer to a peer as an update offer.
@@ -1018,12 +1019,16 @@ async fn send_update(
     if !extension.eq_ignore_ascii_case("exe") {
         return Err("Выбери установщик SafeDrop с расширением .exe".into());
     }
-    let ver = app_version();
+    // получатели (0.3.31+) ставят только подписанный установщик — без подписи не шлём
+    let path = std::path::Path::new(&file_path);
+    let sig = std::fs::read_to_string(updsig::sig_path(path))
+        .map_err(|_| "У установщика нет подписи (.sig рядом с .exe) — собери его через build-release.bat".to_string())?;
+    let ver = updsig::verify_file(path).map_err(|e| format!("Установщик не прошёл проверку подписи: {e}"))?;
     let (port, device) = {
         let s = state.settings.lock().await;
         (s.tcp_port, s.device_name.clone())
     };
-    let id = quic::send_file_dual(&app, peer_ip, port, file_path, device, "update".into(), false, ver.clone()).await?;
+    let id = quic::send_file_dual(&app, peer_ip, port, file_path, device, "update".into(), false, ver.clone(), sig).await?;
     Ok(format!("{id}:{ver}"))
 }
 
@@ -1033,8 +1038,12 @@ async fn apply_update(state: tauri::State<'_, AppState>, path: String, version: 
     if !std::path::Path::new(&path).exists() {
         return Err("файл обновления не найден (уже удалён?)".into());
     }
-    if version.is_empty() || !version.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())) {
-        return Err("некорректная версия установщика".into());
+    // перед запуском — ещё раз подпись: файл на диске могли подменить после приёма.
+    // Версия — из подписи, а не из того, что прислал отправитель.
+    let _ = version;
+    let version = updsig::verify_file(std::path::Path::new(&path)).map_err(|e| format!("обновление не установлено: {e}"))?;
+    if transfer::cmp_ver(&version, &app_version()) == std::cmp::Ordering::Less {
+        return Err(format!("это старая версия ({version}) — откат не ставим"));
     }
     if cfg!(not(windows)) {
         return Err("Обновление через SafeDrop работает только в Windows — поставь новую версию пакетом".into());
@@ -1881,7 +1890,8 @@ async fn own_installer() -> Result<Option<String>, String> {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&prefix) && name.to_ascii_lowercase().ends_with(".exe") {
+            // только подписанный: без .sig получатели обновление не примут
+            if name.starts_with(&prefix) && name.to_ascii_lowercase().ends_with(".exe") && updsig::sig_path(&entry.path()).exists() {
                 return Ok(Some(entry.path().to_string_lossy().to_string()));
             }
         }

@@ -25,6 +25,9 @@ pub(crate) struct Offer {
     pub(crate) resume: bool,
     #[serde(default)]
     pub(crate) fkey: String,
+    /// подпись установщика (`.sig`, только для kind = "update", с 0.3.31)
+    #[serde(default)]
+    pub(crate) sig: String,
 }
 
 /// С какой версии получатель понимает докачку (и всегда отвечает на заголовок).
@@ -517,15 +520,23 @@ pub(crate) async fn receive_stream(
     println!("received {} ({} bytes, sha256 {})", final_path.display(), done, hash);
     finish_transfer(&app, &id).await;
     if is_update {
-        let ver = if offer.version.is_empty() {
-            update_version(&safe_name).unwrap_or_default()
+        // подпись — рядом с установщиком: её же проверит apply_update перед запуском
+        let checked = if offer.sig.is_empty() {
+            Err("отправитель не приложил подпись".to_string())
         } else {
-            offer.version.clone()
+            let _ = std::fs::write(crate::updsig::sig_path(&final_path), offer.sig.as_bytes());
+            crate::updsig::verify_file(&final_path)
+        };
+        let ver = match &checked {
+            Ok(v) => v.clone(),
+            Err(_) if offer.version.is_empty() => update_version(&safe_name).unwrap_or_default(),
+            Err(_) => offer.version.clone(),
         };
         let _ = app.emit("safedrop-update-offer", serde_json::json!({
             "version": ver, "filename": safe_name,
             "path": final_path.to_string_lossy(),
             "size": done, "peer": peer_ip, "sha256": hash,
+            "signed": checked.is_ok(), "sig_error": checked.err().unwrap_or_default(),
         }));
         crate::signal::notify("⬆ Доступно обновление SafeDrop", &format!("{safe_name} — от {peer_ip}"), None);
         return Ok(());
@@ -538,6 +549,11 @@ pub(crate) async fn receive_stream(
     Ok(())
 }
 
+/// Сравнить версии «x.y.z» (нечисловые части — как 0).
+pub(crate) fn cmp_ver(a: &str, b: &str) -> std::cmp::Ordering {
+    parse_ver(a).unwrap_or((0, 0, 0)).cmp(&parse_ver(b).unwrap_or((0, 0, 0)))
+}
+
 /// Client: send local file to peer_ip:port (kind "file" or "update")
 pub async fn send_file_to(
     app: AppHandle,
@@ -548,6 +564,7 @@ pub async fn send_file_to(
     kind: String,
     require_confirmation: bool,
     version: String,
+    sig: String,
 ) -> Result<String, String> {
     let prep = prepare_upload(&file_path).await?;
     let resume = kind == "file" && peer_supports_resume(&app, &peer_ip).await;
@@ -555,7 +572,7 @@ pub async fn send_file_to(
     let mut attempt = 0u32;
     let result = loop {
         attempt += 1;
-        let r = send_attempt(&app, &peer_ip, port, &prep, &device_name, &kind, require_confirmation, &version, resume, &fkey, attempt > 1).await;
+        let r = send_attempt(&app, &peer_ip, port, &prep, &device_name, &kind, require_confirmation, &version, &sig, resume, &fkey, attempt > 1).await;
         match r {
             Ok(id) => break Ok(id),
             Err(SendErr::Retry(msg)) if resume && attempt < RESUME_ATTEMPTS => {
@@ -590,6 +607,7 @@ async fn send_attempt(
     kind: &str,
     require_confirmation: bool,
     version: &str,
+    sig: &str,
     resume: bool,
     fkey: &str,
     retrying: bool,
@@ -603,6 +621,9 @@ async fn send_attempt(
     if resume {
         offer["resume"] = serde_json::json!(true);
         offer["fkey"] = serde_json::json!(fkey);
+    }
+    if !sig.is_empty() {
+        offer["sig"] = serde_json::json!(sig);
     }
     let mut header = serde_json::to_string(&offer).map_err(|e| SendErr::Fatal(e.to_string()))?;
     header.push('\n');

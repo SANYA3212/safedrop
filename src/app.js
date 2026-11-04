@@ -4605,7 +4605,10 @@ try {
   });
   await listen("safedrop-key-changed", (e) => onKeyChanged(e.payload || {}));
   await listen("safedrop-update-offer", async (e) => {
-    const { version, path, peer, filename } = e.payload;
+    const { version, path, peer, filename, signed, sig_error } = e.payload;
+    // ставим только установщик с подписью SafeDrop (проверена в Rust); без неё —
+    // ни окна, ни кнопки «всё равно установить»
+    if (signed === false) { toast(`Обновление от ${peer || "?"} отклонено: ${sig_error || "нет подписи"}`, true); return; }
     let my = "0.0.0";
     try { my = (await invoke("get_build_info")).version; } catch {}
     if (!version) { toast(`<svg class='ic' viewBox='0 0 24 24'><path d='M21,8H17.17A5,5,0,0,0,13,4.17V3H11V4.17A5,5,0,0,0,6.83,8H3V20a2,2,0,0,0,2,2H19a2,2,0,0,0,2-2ZM12,6a3,3,0,0,1,3,3H9A3,3,0,0,1,12,6Z'/></svg> Пришёл пакет обновлений без версии от ${peer} — пропущен`, true); return; }

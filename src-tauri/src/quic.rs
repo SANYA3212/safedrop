@@ -315,12 +315,13 @@ pub async fn send_file_dual(
     kind: String,
     require_confirmation: bool,
     version: String,
+    sig: String,
 ) -> Result<String, String> {
     // QUIC fallback on a whole-file operation was unsafe: the 5s wrapper
     // cancelled a valid TCP upload mid-stream, then tried UDP even when the
     // remote peer had no QUIC listener. File data therefore always uses TCP.
     crate::transfer::send_file_to(
-        app.clone(), peer_ip, tcp_port, file_path, device_name, kind, require_confirmation, version,
+        app.clone(), peer_ip, tcp_port, file_path, device_name, kind, require_confirmation, version, sig,
     ).await
 }
 
@@ -329,7 +330,8 @@ mod tests {
     use super::*;
 
     /// QUIC plumbing smoke test: cert gen + endpoint bind + handshake +
-    /// bidi echo over loopback. No Tauri state involved.
+    /// bidi echo over loopback. No Tauri state involved. Each test uses its
+    /// own 127.0.0.x: remembered keys (tls.rs) are per address and shared.
     #[tokio::test]
     async fn quic_loopback_echo() {
         let dir = std::env::temp_dir().join("safedrop-quic-test");
@@ -340,7 +342,7 @@ mod tests {
         assert!(!c1.is_empty() && !k1.is_empty());
 
         let server_ep =
-            quinn::Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(crypto)), "127.0.0.1:0".parse().unwrap())
+            quinn::Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(crypto)), "127.0.0.2:0".parse().unwrap())
                 .expect("server bind");
         let port = server_ep.local_addr().unwrap().port();
 
@@ -358,7 +360,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
         });
 
-        let conn = connect("127.0.0.1", port).await.expect("client connect");
+        let conn = connect("127.0.0.2", port).await.expect("client connect");
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
         send.write_all(b"ping\n").await.expect("write");
         let _ = send.finish();
@@ -380,7 +382,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let crypto = server_crypto(&dir).expect("server crypto");
         let server_ep =
-            quinn::Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(crypto)), "127.0.0.1:0".parse().unwrap())
+            quinn::Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(crypto)), "127.0.0.3:0".parse().unwrap())
                 .expect("server bind");
         let port = server_ep.local_addr().unwrap().port();
 
@@ -415,7 +417,7 @@ mod tests {
 
         // fire-and-forget must return Ok(None) after server FIN
         let r = send_frame_quic(
-            "127.0.0.1",
+            "127.0.0.3",
             port,
             serde_json::json!({"kind": "ping"}),
             false,
@@ -426,7 +428,7 @@ mod tests {
 
         // request/reply must return the parsed reply
         let r = send_frame_quic(
-            "127.0.0.1",
+            "127.0.0.3",
             port,
             serde_json::json!({"kind": "hello"}),
             true,
