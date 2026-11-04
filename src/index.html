@@ -81,6 +81,7 @@
         <div id="chat-search-results" class="hidden"></div>
       </div>
       <div id="chat-pane">
+        <div id="pinned-strip" class="hidden"></div>
         <div id="messages"></div>
         <button id="chat-scroll-bottom" class="hidden" title="Перейти к новым сообщениям" aria-label="Перейти к новым сообщениям"><svg class="ic" viewBox="0 0 24 24"><path d="M12 16.5 4.5 9l1.4-1.4L12 13.7l6.1-6.1L19.5 9z"/></svg><span>К новым</span></button>
         <div id="pending-attachments" class="hidden"></div>
@@ -152,7 +153,12 @@
 
         <details class="set-sec" id="sec-call">
           <summary><span class="sec-arrow"></span>Звонки и звук</summary>
-          <div class="card"><h3>STUN</h3>
+          <div class="card"><h3>Push-to-talk</h3>
+              <label class="check" data-set-label="Push-to-talk"><input type="checkbox" id="set-ptt" /> Удерживать клавишу для разговора</label>
+              <label data-set-label="Клавиша Push-to-talk"><span>Клавиша</span><button type="button" id="set-ptt-key">Пробел</button></label>
+              <div class="muted">Включённый режим заглушает микрофон, пока клавиша не нажата. При потере фокуса окна микрофон заглушается.</div></div>
+            <div class="card"><h3>История звонков</h3><div id="call-history-list" class="call-history-list"></div><button id="clear-call-history">Очистить историю звонков</button></div>
+            <div class="card"><h3>STUN</h3>
             <label class="check" data-set-label="STUN сервер Google"><input type="checkbox" id="set-stun" /> Использовать STUN-сервер Google</label>
             <div class="muted">STUN-сервер Google увидит ваш публичный IP; для Radmin/LAN не нужен</div>
           </div>

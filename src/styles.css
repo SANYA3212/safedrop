@@ -700,3 +700,9 @@ details.set-sec > .card:first-of-type { border-top: 0; }
   .wt-vol { width: 64px; }
 }
 
+
+#pinned-strip { display:flex; align-items:center; gap:4px; padding:4px 12px; border-bottom:1px solid var(--line); background:var(--card); overflow-x:auto; }
+.pinned-item { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; text-align:left; border:0; background:transparent; color:var(--text); cursor:pointer; padding:5px; }
+.pinned-remove { border:0; background:transparent; color:var(--muted); cursor:pointer; font-size:18px; }
+.call-history-list { max-height:180px; overflow:auto; margin:6px 0; }
+.call-history-row { padding:6px 0; border-bottom:1px solid var(--line); font-size:12px; }
