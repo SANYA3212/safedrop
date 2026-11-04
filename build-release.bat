@@ -60,9 +60,12 @@ if not exist "update\%INSTALLER_NAME%.sig" (
   echo ERROR: signature was not produced
   goto :failed
 )
+REM Since 0.3.32 the signature lives inside the installer: one file to share, no .sig next to it.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%packaging\windows\embed-signature.ps1" -Installer "%ROOT%update\%INSTALLER_NAME%"
+if errorlevel 1 goto :failed
 
 echo.
-echo OK: dist\safedrop.exe, dist\safedrop-shell.dll, update\%INSTALLER_NAME% and its .sig
+echo OK: dist\safedrop.exe, dist\safedrop-shell.dll, update\%INSTALLER_NAME% (signature embedded)
 echo The installer embeds safedrop-shell.dll as a Tauri resource.
 echo On other PCs: keep safedrop.exe and safedrop-shell.dll together in dist.
 echo WebView2 Runtime and Radmin VPN may also be required.

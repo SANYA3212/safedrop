@@ -531,7 +531,8 @@ pub(crate) async fn receive_stream(
     if is_update {
         // подпись — рядом с установщиком: её же проверит apply_update перед запуском
         let checked = if offer.sig.is_empty() {
-            Err("отправитель не приложил подпись".to_string())
+            // подпись могла приехать встроенной в сам установщик
+            crate::updsig::verify_file(&final_path).map_err(|_| "отправитель не приложил подпись".to_string())
         } else {
             let _ = std::fs::write(crate::updsig::sig_path(&final_path), offer.sig.as_bytes());
             crate::updsig::verify_file(&final_path)

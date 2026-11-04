@@ -3,5 +3,6 @@ dist/
 update/
 node_modules/
 *.mjs
+!src/vendor/**/*.mjs
 src-shell/target/
 *.log

@@ -1137,15 +1137,58 @@ async fn send_update(
     }
     // получатели (0.3.31+) ставят только подписанный установщик — без подписи не шлём
     let path = std::path::Path::new(&file_path);
-    let sig = std::fs::read_to_string(updsig::sig_path(path))
-        .map_err(|_| "У установщика нет подписи (.sig рядом с .exe) — собери его через build-release.bat".to_string())?;
-    let ver = updsig::verify_file(path).map_err(|e| format!("Установщик не прошёл проверку подписи: {e}"))?;
+    if !updsig::has_signature(path) {
+        return Err("У установщика нет подписи SafeDrop — собери его через build-release.bat".into());
+    }
+    let signed = updsig::load_signed(path).map_err(|e| format!("Установщик не прошёл проверку подписи: {e}"))?;
+    let ver = signed.version.clone();
+    // по сети — установщик без хвоста и подпись отдельно (Offer.sig): 0.3.31
+    // проверяет .sig по всему полученному файлу
+    let send_path = if signed.embedded {
+        let name = path.file_name().ok_or("bad installer path")?.to_owned();
+        stage_unsigned_copy(&signed.data, &name)?.to_string_lossy().to_string()
+    } else {
+        file_path
+    };
     let (port, device) = {
         let s = state.settings.lock().await;
         (s.tcp_port, s.device_name.clone())
     };
-    let id = quic::send_file_dual(&app, peer_ip, port, file_path, device, "update".into(), false, ver.clone(), sig).await?;
+    let id = quic::send_file_dual(&app, peer_ip, port, send_path, device, "update".into(), false, ver.clone(), signed.sig).await?;
     Ok(format!("{id}:{ver}"))
+}
+
+/// Копия установщика без встроенной подписи для отправки. Папка — по хэшу
+/// содержимого: несколько одновременных отправок читают один и тот же файл,
+/// и он никогда не перезаписывается, пока его кто-то читает.
+fn stage_unsigned_copy(data: &[u8], name: &std::ffi::OsStr) -> Result<std::path::PathBuf, String> {
+    use sha2::Digest;
+    let root = std::env::temp_dir().join("safedrop-updates").join("outgoing");
+    let key: String = sha2::Sha256::digest(data)[..8].iter().map(|b| format!("{b:02x}")).collect();
+    // старые копии (другие версии) — убрать; занятые отправкой Windows не даст удалить
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            if e.file_name() != std::ffi::OsStr::new(&key) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    let dir = root.join(&key);
+    let out = dir.join(name);
+    if std::fs::metadata(&out).map(|m| m.len() == data.len() as u64).unwrap_or(false) {
+        return Ok(out);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let tmp = dir.join(format!(".part-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    if std::fs::rename(&tmp, &out).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        // другая отправка успела положить такой же файл
+        if !std::fs::metadata(&out).map(|m| m.len() == data.len() as u64).unwrap_or(false) {
+            return Err("не удалось подготовить установщик к отправке".into());
+        }
+    }
+    Ok(out)
 }
 
 /// Apply a downloaded update: run the installer exe directly.
@@ -1192,7 +1235,10 @@ try {{
     Start-Sleep -Milliseconds 200
   }}
   Write-Log 'Starting installer'
-  $process = Start-Process -FilePath $installer -ArgumentList @('/SILENT', "/DIR=`"$installDir`"") -Wait -PassThru
+  # ключи установщика Tauri (NSIS), как у его собственного обновлятора: /P — только
+  # полоса прогресса, /UPDATE — не трогать ярлыки, /D= — папка, всегда последним и
+  # без кавычек (NSIS читает её до конца строки). /SILENT и /DIR= NSIS не знает.
+  $process = Start-Process -FilePath $installer -ArgumentList @('/P', '/UPDATE', "/D=$installDir") -Wait -PassThru
   if ($process.ExitCode -ne 0) {{ throw "Installer exited with code $($process.ExitCode)" }}
   if (-not (Test-Path -LiteralPath $appExe)) {{ throw 'Installed executable was not found' }}
   Set-Content -LiteralPath (Join-Path $installDir 'version.txt') -Value $version -Encoding ascii
@@ -2027,8 +2073,8 @@ async fn own_installer() -> Result<Option<String>, String> {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            // только подписанный: без .sig получатели обновление не примут
-            if name.starts_with(&prefix) && name.to_ascii_lowercase().ends_with(".exe") && updsig::sig_path(&entry.path()).exists() {
+            // только подписанный: без подписи получатели обновление не примут
+            if name.starts_with(&prefix) && name.to_ascii_lowercase().ends_with(".exe") && updsig::has_signature(&entry.path()) {
                 return Ok(Some(entry.path().to_string_lossy().to_string()));
             }
         }
