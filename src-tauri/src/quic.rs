@@ -351,7 +351,6 @@ mod tests {
             let conn = incoming.await.expect("handshake");
             let (mut send, mut recv) = conn.accept_bi().await.expect("no stream");
             let mut buf = vec![0u8; 5];
-            use tokio::io::AsyncReadExt;
             recv.read_exact(&mut buf).await.expect("read");
             assert_eq!(&buf, b"ping\n");
             send.write_all(b"pong\n").await.expect("write");
@@ -401,7 +400,7 @@ mod tests {
                         };
                         let mut reader = BufReader::new(&mut recv);
                         let mut line = String::new();
-                        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                        use tokio::io::AsyncBufReadExt;
                         if reader.read_line(&mut line).await.is_err() {
                             break;
                         }

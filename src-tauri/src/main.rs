@@ -393,7 +393,9 @@ async fn stage_chat_audio(state: tauri::State<'_, AppState>, path: String) -> Re
     }
     let src = std::path::Path::new(&path);
     let name = src.file_name().and_then(|x| x.to_str()).unwrap_or("");
-    if name.starts_with("safedrop-voice-") {
+    let loaddrop = state.settings.lock().await.loaddrop_dir.clone();
+    // свои и принятые голосовые (safedrop-voice-<uuid> в LoadDrop) и так уникальны
+    if name.starts_with("safedrop-voice-") && src.parent() == Some(std::path::Path::new(&loaddrop)) {
         return Ok(path);
     }
     let stem = src.file_stem().and_then(|x| x.to_str()).unwrap_or("audio");
@@ -401,10 +403,30 @@ async fn stage_chat_audio(state: tauri::State<'_, AppState>, path: String) -> Re
     let ext = src.extension().and_then(|x| x.to_str()).unwrap_or("ogg").to_ascii_lowercase();
     let dir = state.app_dir.join("audio-out");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // копии старше месяца давно доставлены или уже не будут — убрать
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let month = std::time::Duration::from_secs(30 * 24 * 3600);
+        for e in rd.flatten() {
+            let old = e.metadata().and_then(|m| m.modified()).ok()
+                .and_then(|t| t.elapsed().ok()).map(|age| age > month).unwrap_or(false);
+            if old { let _ = std::fs::remove_file(e.path()); }
+        }
+    }
     let id = uuid::Uuid::new_v4().simple().to_string();
     let dst = dir.join(format!("{stem}-{}.{ext}", &id[..8]));
     std::fs::copy(src, &dst).map_err(|e| e.to_string())?;
     Ok(dst.to_string_lossy().to_string())
+}
+
+/// Копия из `stage_chat_audio`, которую так никому и не отправили.
+#[tauri::command]
+async fn discard_staged_audio(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if p.parent() != Some(state.app_dir.join("audio-out").as_path()) {
+        return Err("not a staged audio copy".into());
+    }
+    let _ = std::fs::remove_file(p);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2468,7 +2490,7 @@ fn main() {
             get_my_ips, get_my_adapters, get_peers, add_peer,
             rename_peer, remove_peer, toggle_trust, ping_peer, scan_network,
             get_call_history, clear_call_history, add_call_record,
-            get_chat, send_chat, send_group_chat, send_chat_read, save_voice_record, discard_voice_record, stage_chat_audio, chat_audio_size, chat_edit, chat_react, chat_typing, sig_send, delete_msgs, clear_chat, open_mic_settings, set_busy,
+            get_chat, send_chat, send_group_chat, send_chat_read, save_voice_record, discard_voice_record, stage_chat_audio, discard_staged_audio, chat_audio_size, chat_edit, chat_react, chat_typing, sig_send, delete_msgs, clear_chat, open_mic_settings, set_busy,
             get_groups, create_group, rename_group, set_group_avatar, delete_group, leave_group, group_add_member, group_remove_member,
             send_file, send_update, apply_update, open_url, open_notif_settings, get_transfers, clear_transfers, cancel_transfer, respond_file_offer, test_notify, open_loaddrop, move_loaddrop, get_loaddrop,
             pick_files, pick_image, pick_folder, pick_audio, read_image_dataurl,

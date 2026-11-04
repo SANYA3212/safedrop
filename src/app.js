@@ -4477,7 +4477,11 @@ async function sendAudioToChat(path, opts = {}) {
     try { await invoke("send_file", { peerIp: t, filePath: audio }); ok++; }
     catch (e) { toast("Не отправлено: " + e, true); }
   }
-  if (!ok) return null;
+  if (!ok) {
+    // копию никому не отдали — не копить её
+    if (audio !== path) invoke("discard_staged_audio", { path: audio }).catch(() => {});
+    return null;
+  }
   const images = opts.images || [];
   const payload = { text: caption, image: images[0] || "", images, audio };
   if (opts.replyTo) payload.replyTo = opts.replyTo;

@@ -1263,6 +1263,12 @@ const EXTRAS_MAX: usize = 30;
 
 /// Edits/reactions already re-sent in this session (peer ip -> marks): every
 /// hello (~30 s) used to re-send all of them again.
+/// Аудиофайлы, уже отправленные при досылке: (собеседник, путь).
+fn audio_sent() -> &'static std::sync::Mutex<std::collections::HashSet<(String, String)>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
 fn extras_sent() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>> {
     static SENT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>> = std::sync::OnceLock::new();
     SENT.get_or_init(Default::default)
@@ -1285,8 +1291,9 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
         .map(|g| (format!("g:{}", g.id), g.name.clone(), g.members.clone()))
         .collect();
     let mut jobs: Vec<serde_json::Value> = Vec::new();
-    // аудио недоставленных сообщений: сначала файл, иначе у получателя имя без файла
-    let mut audio_jobs: Vec<String> = Vec::new();
+    // аудио недоставленных сообщений (id сообщения → файл): сначала файл,
+    // иначе у получателя имя без файла
+    let mut audio_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut extras: Vec<(String, serde_json::Value)> = Vec::new();
     {
         let chats = state.chats.lock().await;
@@ -1296,7 +1303,7 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
             if !is_direct && group.is_none() { continue; }
             if is_direct {
                 for m in rows.iter().rev().filter(|m| m.from_me && m.status == "sent").take(100) {
-                    if !m.audio.is_empty() { audio_jobs.push(m.audio.clone()); }
+                    if !m.audio.is_empty() { audio_of.insert(m.id.clone(), m.audio.clone()); }
                     jobs.push(serde_json::json!({
                         "kind": "chat", "id": m.id, "sent_at": m.sent_at, "from": nick, "nickname": nick,
                         "text": m.text, "ts": m.ts, "image": m.image, "images": m.images,
@@ -1350,8 +1357,8 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
             }
         }
     }
-    let audio_jobs: Vec<String> = audio_jobs.into_iter().filter(|p| std::path::Path::new(p).is_file()).collect();
-    if audio_jobs.is_empty() {
+    audio_of.retain(|_, p| std::path::Path::new(p).is_file());
+    if audio_of.is_empty() {
         for v in jobs {
             let app2 = app.clone();
             let target = peer_ip.to_string();
@@ -1368,10 +1375,23 @@ async fn flush_pending_for_peer(app: &AppHandle, peer_ip: &str, include_extras: 
         let app2 = app.clone();
         let target = peer_ip.to_string();
         tokio::spawn(async move {
-            for path in audio_jobs {
-                let _ = crate::quic::send_file_dual(&app2, target.clone(), tcp_port, path, device.clone(), "file".into(), confirm, String::new(), String::new()).await;
-            }
             for v in jobs {
+                let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                if let Some(path) = audio_of.get(&id) {
+                    // файл уже ушёл этому собеседнику (в этом запуске) или уходит
+                    // сейчас из другой досылки — второй раз не шлём
+                    let mark = (target.clone(), path.clone());
+                    let fresh = audio_sent().lock().map(|mut s| s.insert(mark.clone())).unwrap_or(false);
+                    if fresh {
+                        let sent = crate::quic::send_file_dual(&app2, target.clone(), tcp_port, path.clone(), device.clone(), "file".into(), confirm, String::new(), String::new()).await;
+                        if sent.is_err() {
+                            // файл не ушёл — и сообщение пока не шлём: иначе его
+                            // подтвердят, и досылать будет нечего
+                            if let Ok(mut s) = audio_sent().lock() { s.remove(&mark); }
+                            continue;
+                        }
+                    }
+                }
                 let _ = crate::quic::send_frame_dual(&app2, &target, port, v, false).await;
             }
         });
