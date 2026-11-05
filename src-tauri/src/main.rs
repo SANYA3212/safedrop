@@ -2254,6 +2254,9 @@ fn focus_main(app: &tauri::AppHandle) {
 }
 
 fn main() {
+    // до запуска потоков и WebKit: в AppImage вернуть GStreamer системные плагины
+    #[cfg(target_os = "linux")]
+    linuxaudio::fix_appimage_gstreamer();
     let dir = settings::app_dir();
     let _ = std::fs::create_dir_all(&dir);
     tls::init(&dir);

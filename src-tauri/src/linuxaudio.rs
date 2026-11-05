@@ -124,6 +124,23 @@ fn running(names: &[&str]) -> Vec<bool> {
     found
 }
 
+/// Обычные системные папки плагинов GStreamer (Arch, Fedora, Debian/Ubuntu).
+const SYSTEM_PLUGIN_DIRS: [&str; 5] = [
+    "/usr/lib/gstreamer-1.0",
+    "/usr/lib64/gstreamer-1.0",
+    "/usr/lib/x86_64-linux-gnu/gstreamer-1.0",
+    "/usr/lib/aarch64-linux-gnu/gstreamer-1.0",
+    "/usr/local/lib/gstreamer-1.0",
+];
+
+/// Системный gst-plugin-scanner (Arch, Fedora, Debian/Ubuntu).
+const SYSTEM_SCANNERS: [&str; 4] = [
+    "/usr/lib/gstreamer-1.0/gst-plugin-scanner",
+    "/usr/libexec/gstreamer-1.0/gst-plugin-scanner",
+    "/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner",
+    "/usr/lib/aarch64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner",
+];
+
 /// Папки, где GStreamer ищет плагины: переменные окружения и обычные системные пути.
 fn plugin_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -132,16 +149,92 @@ fn plugin_dirs() -> Vec<PathBuf> {
             dirs.extend(std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()));
         }
     }
-    for d in [
-        "/usr/lib/gstreamer-1.0",
-        "/usr/lib64/gstreamer-1.0",
-        "/usr/lib/x86_64-linux-gnu/gstreamer-1.0",
-        "/usr/lib/aarch64-linux-gnu/gstreamer-1.0",
-        "/usr/local/lib/gstreamer-1.0",
-    ] {
-        dirs.push(PathBuf::from(d));
-    }
+    dirs.extend(SYSTEM_PLUGIN_DIRS.iter().map(PathBuf::from));
     dirs
+}
+
+/// Есть ли в папке хоть один плагин GStreamer.
+fn dir_has_plugins(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("libgst") && n.ends_with(".so")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Куда направить GStreamer в AppImage: `None` — ничего не менять (в текущих
+/// папках уже есть плагины), иначе — список системных папок с плагинами.
+fn appimage_plugin_path(current: &[PathBuf], system: &[PathBuf], has_plugins: impl Fn(&Path) -> bool) -> Option<Vec<PathBuf>> {
+    if current.iter().any(|d| has_plugins(d)) {
+        return None;
+    }
+    let found: Vec<PathBuf> = system.iter().filter(|d| has_plugins(d)).cloned().collect();
+    if found.is_empty() { None } else { Some(found) }
+}
+
+/// AppImage (linuxdeploy) при запуске подменяет GST_PLUGIN_SYSTEM_PATH на папку
+/// внутри образа, а плагинов GStreamer в нашем образе нет: WebKit не видел ни
+/// микрофона, ни камеры, ни динамиков. Возвращаем системные папки плагинов.
+/// Вызывать в самом начале main, пока не запущены другие потоки и WebKit.
+pub fn fix_appimage_gstreamer() {
+    if std::env::var_os("APPIMAGE").is_none() && std::env::var_os("APPDIR").is_none() {
+        return;
+    }
+    let current = effective_paths(std::env::var_os("GST_PLUGIN_SYSTEM_PATH_1_0"), std::env::var_os("GST_PLUGIN_SYSTEM_PATH"));
+    // без дублей (/usr/lib64 на Arch — ссылка на /usr/lib) и без папок чужой архитектуры
+    let mut system: Vec<PathBuf> = Vec::new();
+    let mut seen = Vec::new();
+    for d in SYSTEM_PLUGIN_DIRS.iter().filter(|d| for_this_arch(d)) {
+        let real = std::fs::canonicalize(d).unwrap_or_else(|_| PathBuf::from(d));
+        if !seen.contains(&real) {
+            seen.push(real);
+            system.push(PathBuf::from(d));
+        }
+    }
+    let Some(dirs) = appimage_plugin_path(&current, &system, dir_has_plugins) else { return };
+    let Ok(joined) = std::env::join_paths(&dirs) else { return };
+    std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", &joined);
+    std::env::set_var("GST_PLUGIN_SYSTEM_PATH", &joined);
+    let scanner_ok = std::env::var_os("GST_PLUGIN_SCANNER_1_0")
+        .or_else(|| std::env::var_os("GST_PLUGIN_SCANNER"))
+        .map(|s| Path::new(&s).is_file())
+        .unwrap_or(false);
+    if !scanner_ok {
+        if let Some(s) = SYSTEM_SCANNERS.iter().find(|s| for_this_arch(s) && Path::new(s).is_file()) {
+            std::env::set_var("GST_PLUGIN_SCANNER_1_0", s);
+            std::env::set_var("GST_PLUGIN_SCANNER", s);
+        }
+    }
+    // свой кэш плагинов: системный ~/.cache/gstreamer-1.0 общий с другими программами,
+    // и плагин, не загрузившийся под библиотеками AppImage, не должен портить его им
+    if std::env::var_os("GST_REGISTRY_1_0").is_none() && std::env::var_os("GST_REGISTRY").is_none() {
+        let cache = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+        if let Some(c) = cache {
+            let dir = c.join("safedrop");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                std::env::set_var("GST_REGISTRY_1_0", dir.join(format!("gst-registry-appimage.{}.bin", std::env::consts::ARCH)));
+            }
+        }
+    }
+}
+
+/// Как GStreamer: берёт `_1_0`, а обычную переменную — только если `_1_0` не задана.
+fn effective_paths(v1_0: Option<std::ffi::OsString>, plain: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    v1_0.or(plain)
+        .map(|v| std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Папки Debian/Ubuntu с триплетом (x86_64-linux-gnu, aarch64-linux-gnu) — только своей архитектуры.
+fn for_this_arch(path: &str) -> bool {
+    !path.contains("-linux-gnu") || path.contains(&format!("{}-linux-gnu", std::env::consts::ARCH))
 }
 
 fn has_plugin(dirs: &[PathBuf], file: &str) -> bool {
@@ -306,5 +399,43 @@ mod tests {
         let s = decide(base(), Family::Fedora);
         assert_eq!(s.server, "none");
         assert!(s.missing.is_empty());
+    }
+
+    #[test]
+    fn appimage_empty_plugin_dir_switches_to_system() {
+        let cur = vec![PathBuf::from("/tmp/.mount_x/usr/lib/gstreamer-1.0")];
+        let sys = vec![PathBuf::from("/usr/lib/gstreamer-1.0"), PathBuf::from("/usr/lib64/gstreamer-1.0")];
+        let r = appimage_plugin_path(&cur, &sys, |d| d == Path::new("/usr/lib/gstreamer-1.0"));
+        assert_eq!(r, Some(vec![PathBuf::from("/usr/lib/gstreamer-1.0")]));
+    }
+
+    #[test]
+    fn appimage_with_bundled_plugins_is_left_alone() {
+        let cur = vec![PathBuf::from("/tmp/.mount_x/usr/lib/gstreamer-1.0")];
+        let sys = vec![PathBuf::from("/usr/lib/gstreamer-1.0")];
+        assert_eq!(appimage_plugin_path(&cur, &sys, |_| true), None);
+    }
+
+    #[test]
+    fn appimage_without_any_plugins_changes_nothing() {
+        let cur = vec![PathBuf::from("/tmp/.mount_x/usr/lib/gstreamer-1.0")];
+        let sys = vec![PathBuf::from("/usr/lib/gstreamer-1.0")];
+        assert_eq!(appimage_plugin_path(&cur, &sys, |_| false), None);
+    }
+
+    #[test]
+    fn plugin_path_1_0_wins_over_plain() {
+        let r = effective_paths(Some("/tmp/.mount_x/usr/lib/gstreamer-1.0:".into()), Some("/usr/lib/gstreamer-1.0".into()));
+        assert_eq!(r, vec![PathBuf::from("/tmp/.mount_x/usr/lib/gstreamer-1.0")]);
+        assert_eq!(effective_paths(None, Some("/usr/lib/gstreamer-1.0".into())), vec![PathBuf::from("/usr/lib/gstreamer-1.0")]);
+        assert!(effective_paths(None, None).is_empty());
+    }
+
+    #[test]
+    fn foreign_arch_dirs_skipped() {
+        assert!(for_this_arch("/usr/lib/gstreamer-1.0"));
+        let other = if std::env::consts::ARCH == "aarch64" { "x86_64" } else { "aarch64" };
+        assert!(!for_this_arch(&format!("/usr/lib/{other}-linux-gnu/gstreamer-1.0")));
+        assert!(for_this_arch(&format!("/usr/lib/{}-linux-gnu/gstreamer-1.0", std::env::consts::ARCH)));
     }
 }
