@@ -10,6 +10,7 @@ license=('LicenseRef-MIT-CommonsClause')
 depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'gst-plugins-base' 'gst-plugins-good')
 optdepends=(
   'gst-plugins-bad: звонки и демонстрация экрана (WebRTC)'
+  'gst-plugin-pipewire: микрофон, если звуком управляет PipeWire'
   'gst-libav: видео в «Смотреть вместе»'
   'gst-plugin-rsaudiofx: шумоподавление микрофона в звонках'
   'zip: отправка папок'

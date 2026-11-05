@@ -17,19 +17,26 @@ let pendingFile = null;
 
 // ---------- helpers ----------
 function toast(msg, err = false) {
-  const d = document.createElement("div");
-  d.className = "toast" + (err ? " err" : "");
   // Toasts are plain text. Drop legacy inline icon markup instead of showing
   // raw SVG/HTML or interpreting untrusted message content as HTML.
-  d.textContent = String(msg ?? "")
+  const text = String(msg ?? "")
     .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, " ")
     .replace(/<\/?[a-z][^>]*>/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
   const host = $("#toast");
   if (!host) return;
-  host.appendChild(d);
-  setTimeout(() => d.remove(), err ? 7000 : 4500);
+  // то же сообщение уже на экране — продлеваем его, а не складываем стопкой
+  // (повторные звонки без микрофона давали десятки одинаковых ошибок)
+  const same = [...host.children].find((x) => x.textContent === text && x.classList.contains("err") === !!err);
+  const d = same || document.createElement("div");
+  if (!same) {
+    d.className = "toast" + (err ? " err" : "");
+    d.textContent = text;
+    host.appendChild(d);
+  }
+  clearTimeout(d._t);
+  d._t = setTimeout(() => d.remove(), err ? 7000 : 4500);
 }
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function fmtSpeed(bps) { if (!bps) return "—"; const u=["Б/с","КБ/с","МБ/с","ГБ/с"]; let i=0,v=bps; while(v>1024&&i<3){v/=1024;i++;} return `${v.toFixed(1)} ${u[i]}`; }
@@ -342,6 +349,10 @@ async function loadAll() {
     if (b.os && b.os !== "windows") {
       for (const sel of ["#btn-firewall", "#btn-notif-win", "#btn-mic-win"]) $(sel)?.style.setProperty("display", "none");
       $("#set-ctxmenu")?.closest("label")?.style.setProperty("display", "none");
+    }
+    if (b.os === "linux") {
+      document.documentElement.classList.add("os-linux");
+      refreshLinuxAudio();
     }
   } catch {}
 }
@@ -1862,13 +1873,64 @@ function setMicState(st) {
 }
 const MIC_HELP_LINUX = `<ol>
 <li>Проверь, что микрофон не выключен в настройках звука системы (PipeWire / PulseAudio, например pavucontrol).</li>
+<li>Если звуком управляет PipeWire, нужен плагин GStreamer для него (Arch: <code>gst-plugin-pipewire</code>, Ubuntu: <code>gstreamer1.0-pipewire</code>) — см. «Звук» в «Звонки и звук».</li>
 <li>Закрой программы, которые могут держать микрофон (Discord, OBS).</li>
 <li>Выбери микрофон заново в «Звонки и звук» и нажми «Запросить доступ».</li>
 </ol>`;
+// Звук на Linux: WebKitGTK ищет микрофоны через GStreamer. Если звуком управляет
+// PipeWire, а плагина GStreamer для него нет, список микрофонов пуст и getUserMedia
+// падает с «Invalid constraint» (или «заблокирован», хотя запрета нет).
+let linuxAudio = null;
+const LINUX_AUDIO_SERVER = { pipewire: "PipeWire", pulseaudio: "PulseAudio", none: "не найдена" };
+async function refreshLinuxAudio() {
+  const box = $("#linux-audio");
+  try { linuxAudio = await invoke("linux_audio_status"); }
+  catch { linuxAudio = null; box?.classList.add("hidden"); return null; }
+  if (!box) return linuxAudio;
+  const a = linuxAudio;
+  const via = a.via === "pipewire" ? "микрофон через PipeWire" : a.via === "pulse" ? "микрофон через PulseAudio" + (a.server === "pipewire" ? " (pipewire-pulse)" : "") : "";
+  let html = `<div class="muted">Звуковая система: <b>${esc(LINUX_AUDIO_SERVER[a.server] || a.server)}</b>${via ? " · " + esc(via) : ""}</div>`;
+  if (a.missing?.length) {
+    html += `<div class="linux-audio-warn">${a.via ? "Для звука через PipeWire нужен пакет" : "SafeDrop не видит микрофон: нужен пакет"} <code>${esc(a.missing.join(" "))}</code>.`
+      + (a.install ? ` Команда: <code>${esc(a.install)}</code>` : "") + `</div>`
+      + `<div class="row">${a.can_install ? `<button id="btn-linux-audio-install">Установить</button>` : ""}`
+      + (a.install ? `<button id="btn-linux-audio-copy">Скопировать команду</button>` : "") + `</div>`;
+  }
+  box.innerHTML = html;
+  box.classList.remove("hidden");
+  const ib = $("#btn-linux-audio-install");
+  if (ib) ib.onclick = installLinuxAudio;
+  const cb = $("#btn-linux-audio-copy");
+  if (cb) cb.onclick = () => navigator.clipboard.writeText(a.install).then(() => toast("Команда скопирована")).catch(() => toast(a.install));
+  return a;
+}
+async function installLinuxAudio() {
+  toast("Ставлю " + (linuxAudio?.missing || []).join(" ") + " — система спросит пароль…");
+  try {
+    const a = await invoke("linux_audio_install");
+    await refreshLinuxAudio();
+    $("#help-modal")?.classList.add("hidden");
+    if (a?.missing?.length) return toast("Пакет так и не нашёлся: " + a.missing.join(" "), true);
+    showHelp("Плагин установлен", "<p>Закрой SafeDrop полностью (значок в трее → «Выйти») и запусти снова — после этого микрофон появится в списке.</p>");
+  } catch (e) { toast("" + e, true); }
+}
 // Ошибка микрофона: запрет — окно с подсказкой, всё остальное (нет устройства,
 // устройство пропало, занято) — короткое сообщение с причиной, а не «заблокирован».
-function micFailed(e) {
+async function micFailed(e) {
   const name = e?.name || "";
+  if (hostOs === "linux") {
+    const a = await refreshLinuxAudio();
+    if (a?.missing?.length) {
+      const why = a.server === "pipewire"
+        ? "Звуком в системе управляет PipeWire, а плагина GStreamer для него нет, поэтому SafeDrop не видит ни одного микрофона."
+        : "В системе нет плагина GStreamer для PulseAudio, поэтому SafeDrop не видит ни одного микрофона.";
+      return showHelp("SafeDrop не видит микрофон",
+        `<p>${why}</p><p>Нужен пакет <code>${esc(a.missing.join(" "))}</code>.${a.install ? ` В терминале: <code>${esc(a.install)}</code>` : ""}</p><p>После установки перезапусти SafeDrop.</p>`,
+        a.can_install ? "Установить" : null, a.can_install ? installLinuxAudio : null);
+    }
+  }
+  // WebKit отвечает «Invalid constraint», когда система не отдала ни одного микрофона
+  if (name === "NotFoundError" || (name === "OverconstrainedError" && !e?.constraint)) return toast("Микрофон не найден: проверь, что он подключён и включён в настройках звука системы", true);
   if (name !== "NotAllowedError" && name !== "SecurityError") return toast("Микрофон: " + (e?.message || e), true);
   if (hostOs !== "windows") return showHelp("Микрофон заблокирован", MIC_HELP_LINUX);
   showHelp("Микрофон заблокирован", MIC_HELP, "<svg class='ic' viewBox='0 0 24 24'><path d='M20,11A8,8,0,0,0,5.64,6.64L4,8.29V4H8.29l1.59,1.59A10,10,0,0,1,22,13Z'/><path d='M4,13A8,8,0,0,0,18.36,17.36L20,15.71V20H15.71l-1.59-1.59A10,10,0,0,1,2,11Z'/></svg> Сбросить запрет (перезапуск)", async () => { toast("Перезапускаю для сброса…"); await invoke("fix_mic_blocked").catch((x) => toast("" + x, true)); });

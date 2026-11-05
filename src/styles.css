@@ -288,6 +288,15 @@ input[type="range"] { padding: 0; }
 .mic-state { font-size: 11px; font-weight: 700; border-radius: 99px; padding: 1px 8px; background: var(--hover); color: var(--muted); }
 .mic-state.ok { background: rgba(35,165,89,.2); color: #3ddc84; }
 .mic-state.no { background: rgba(218,55,60,.2); color: #ff8085; }
+/* звук на Linux (PipeWire / PulseAudio) */
+.linux-audio { margin-top: 8px; }
+.linux-audio-warn { margin-top: 6px; font-size: 12px; line-height: 1.45; color: #ffcf70; }
+.linux-audio code, #help-body code { background: var(--input); border: 1px solid var(--line); padding: 1px 6px; border-radius: 6px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; user-select: text; }
+/* WebKitGTK рисует <select> по теме GTK: светлый фон под светлым текстом темы.
+   Свой вид — фон и стрелка из темы SafeDrop (сам выпадающий список остаётся системным). */
+html.os-linux select { -webkit-appearance: none; appearance: none; background-color: var(--input); color: var(--text); padding-right: 28px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
 
 /* модалки */
 .overlay { position: fixed; inset: 0; z-index: 90; background: rgba(0,0,0,.6); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; }

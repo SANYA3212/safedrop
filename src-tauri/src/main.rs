@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod discovery;
+#[cfg(target_os = "linux")]
+mod linuxaudio;
 mod peers_cmd;
 mod quic;
 mod settings;
@@ -2082,6 +2084,32 @@ async fn own_installer() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Звук на Linux: какой сервер запущен и видит ли GStreamer микрофоны (см. linuxaudio.rs).
+#[tauri::command]
+async fn linux_audio_status() -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "linux")]
+    let r = {
+        let s = tokio::task::spawn_blocking(linuxaudio::status).await.map_err(|e| e.to_string())?;
+        serde_json::to_value(s).map_err(|e| e.to_string())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let r: Result<serde_json::Value, String> = Err("только для Linux".into());
+    r
+}
+
+/// Ставит недостающий плагин GStreamer через pkexec; пароль спрашивает система.
+#[tauri::command]
+async fn linux_audio_install() -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "linux")]
+    let r = {
+        let s = tokio::task::spawn_blocking(linuxaudio::install_missing).await.map_err(|e| e.to_string())??;
+        serde_json::to_value(s).map_err(|e| e.to_string())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let r: Result<serde_json::Value, String> = Err("только для Linux".into());
+    r
+}
+
 /// Build identity: proves which exe is actually running (kills "old exe" ambiguity).
 #[tauri::command]
 async fn get_build_info() -> Result<serde_json::Value, String> {
@@ -2542,7 +2570,7 @@ fn main() {
             pick_files, pick_image, pick_folder, pick_audio, read_image_dataurl,
             clear_peers, scan_debug, factory_reset, open_firewall, set_ctx_menu, refresh_ctx_menu, get_pending_send,
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
-            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, own_installer, get_key_info, trust_new_key, forget_key,
+            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, linux_audio_status, linux_audio_install, own_installer, get_key_info, trust_new_key, forget_key,
             ytbrowse::ytb_open, ytbrowse::ytb_go, ytbrowse::ytb_nav, ytbrowse::ytb_watch, ytbrowse::ytb_notify, ytbrowse::ytb_state,
             ytbrowse::ytb_set_share, ytbrowse::ytb_remote_nav, ytbrowse::ytb_pause_media, ytbrowse::ytb_media_apply, ytbrowse::ytb_duck, ytbrowse::ytb_chat_send, ytbrowse::ytb_chat_show, ytbrowse::ytb_chat_toggle, ytbrowse::ytb_chat_request, ytbrowse::ytb_chat_history,
             ytbrowse::ytb_close, ytbrowse::ytb_close_all, ytbrowse::ytb_remote_cursor, ytbrowse::ytb_remote_scroll, ytbrowse::ytb_people,

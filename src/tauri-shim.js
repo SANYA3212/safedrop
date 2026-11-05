@@ -59,9 +59,14 @@ export async function invoke(cmd, args = {}) {
     case "scan_debug": return { my_ips: ["демо"], radmin_ips: [], tcp_port: 47831, sig_port: 47832, contacts_total: 0, online: [] };
     case "factory_reset": localStorage.clear(); location.reload(); return;
     case "read_image_dataurl": throw "демо-режим";
+    // демо подсказок для Linux: index.html?linux
+    case "get_build_info": return DEMO_LINUX ? { version: "demo", build_time: "?", exe: "", os: "linux" } : null;
+    case "linux_audio_status": return { server: "pipewire", pipewire: true, pipewire_pulse: false, pulseaudio: false, pulse_socket: false, gst_pipewire: false, gst_pulse: true, via: "", missing: ["gst-plugin-pipewire"], install: "sudo pacman -S --needed gst-plugin-pipewire", can_install: true, distro: "Arch Linux" };
+    case "linux_audio_install": throw "демо-режим: запусти приложение";
     default: return null;
   }
 }
+const DEMO_LINUX = /[?&]linux\b/.test(location.search);
 
 export async function listen(event, handler) {
   if (window.__TAURI__?.event?.listen) return window.__TAURI__.event.listen(event, handler);
