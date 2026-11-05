@@ -1,7 +1,7 @@
 # SafeDrop для Arch Linux из исходников (ветка linux на GitHub). Сборка: makepkg -si
 # Звонкам нужен WebKit с WebRTC: сначала собери ../webkit2gtk-4.1-webrtc.
 pkgname=safedrop
-pkgver=0.3.33
+pkgver=0.3.34
 pkgrel=1
 pkgdesc="SafeDrop — P2P обмен файлами, чаты и звонки по локальной сети и Radmin VPN"
 arch=('x86_64')

@@ -1,7 +1,7 @@
 # Пакет для Arch Linux из готового .deb (собирается `cargo tauri build` в src-tauri).
 # Положи SafeDrop_<версия>_amd64.deb рядом с этим файлом и выполни: makepkg -si
 pkgname=safedrop-bin
-pkgver=0.3.33
+pkgver=0.3.34
 pkgrel=1
 pkgdesc="SafeDrop — P2P обмен файлами, чаты и звонки по локальной сети и Radmin VPN"
 arch=('x86_64')
