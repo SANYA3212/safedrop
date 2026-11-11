@@ -1,0 +1,41 @@
+[Unit]
+Description=SafeDrop Server (ретранслятор для режима «через сервер»)
+Documentation=https://github.com/SANYA3212/safedrop/blob/master/docs/server.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# пароль и параметры: /etc/safedrop-server.env (создаёт install.sh)
+EnvironmentFile=-/etc/safedrop-server.env
+ExecStart=/usr/local/bin/safedrop-server --data /var/lib/safedrop-server $SAFEDROP_SERVER_ARGS
+Restart=on-failure
+RestartSec=3
+# отдельный пользователь без прав; ключ сервера — в /var/lib/safedrop-server
+DynamicUser=yes
+StateDirectory=safedrop-server
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

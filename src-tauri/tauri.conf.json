@@ -38,11 +38,13 @@
     "resources": {
       "../src/icons/*": "icons/",
       "../src/logo.png": "logo.png",
-      "../src-shell/target/release/safedrop_shell.dll": "shell/safedrop-shell-0.3.35.dll"
+      "../src-shell/target/release/safedrop_shell.dll": "shell/safedrop-shell-0.3.35.dll",
+      "shellpkg/SafeDropMenu.msix": "shell/SafeDropMenu.msix"
     },
     "windows": {
       "nsis": {
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "installerHooks": "./windows/hooks.nsh"
       }
     }
   }

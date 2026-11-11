@@ -177,9 +177,18 @@ pub async fn run_signal_server(app: AppHandle, port: u16) {
 }
 
 async fn handle_frame(app: AppHandle, sock: TcpStream, ip: String) -> Result<(), String> {
-    let (mut sock, auth) = crate::tls::accept(sock).await.map_err(|e| e.to_string())?;
+    let (sock, auth) = match crate::tls::accept(sock).await {
+        Ok(x) => x,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()), // tcp_ping
+        Err(e) => return Err(e.to_string()),
+    };
     // контакт с запомненным ключом: чужой ключ или соединение без ключа не разбираем
     crate::tls::check_inbound(&ip, &auth)?;
+    serve_frame(app, sock, ip).await
+}
+
+/// Один кадр с уже установленного соединения (напрямую или через сервер).
+pub(crate) async fn serve_frame(app: AppHandle, mut sock: crate::tls::Stream, ip: String) -> Result<(), String> {
     let mut reader = BufReader::new(&mut sock);
     // one JSON line per connection, size- and time-limited
     let buf = crate::quic::read_line_limited(&mut reader, crate::quic::MAX_LINE, std::time::Duration::from_secs(60)).await?;
@@ -675,7 +684,9 @@ pub(crate) async fn process_frame(
             let body = if !text.is_empty() {
                 text.chars().take(120).collect()
             } else if !msg.audio.is_empty() {
-                "🎵 аудио".to_string()
+                let ext = std::path::Path::new(&msg.audio).extension()
+                    .and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                if matches!(ext.as_str(), "mp4" | "m4v" | "mov" | "mkv") { "🎬 видео".to_string() } else { "🎵 аудио".to_string() }
             } else {
                 "📷 картинка".to_string()
             };

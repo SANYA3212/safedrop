@@ -6,6 +6,14 @@
 //! (gst-plugins-good). Если подходящего плагина нет, список микрофонов пуст, и
 //! getUserMedia падает с «Invalid constraint» или «Permission denied», хотя запрета нет.
 //! Когда плагин pipewire есть и PipeWire запущен, он сам прячет дубли от pulse.
+//!
+//! Звонкам нужен ещё WebRTC GStreamer: webrtcbin (плагин webrtc, gst-plugins-bad)
+//! и nicesrc/nicesink (плагин nice из libnice). Без webrtc WebKit не создаёт
+//! RTCPeerConnection: «InvalidAccessError: Bad Configuration Parameters».
+//!
+//! И совсем основа: gst-plugins-base (opus, audioconvert) и gst-plugins-good (vpx,
+//! rtp, v4l2 для камеры). Пакет для Arch тянет их сам, а AppImage берёт плагины
+//! из системы — на чистом KDE/GNOME их может не быть, и тогда нет ни звука, ни видео.
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -20,11 +28,20 @@ pub struct Status {
     pub pulse_socket: bool,
     pub gst_pipewire: bool,
     pub gst_pulse: bool,
+    /// gst-plugins-base (opus, audioconvert) — без него WebKit не работает со звуком вовсе
+    pub gst_base: bool,
+    /// gst-plugins-good (vpx, rtp, v4l2) — видео, камера и сами звонки
+    pub gst_good: bool,
+    pub gst_webrtc: bool,
+    pub gst_nice: bool,
     /// через что WebKit возьмёт микрофон: "pipewire" | "pulse" | ""
     pub via: &'static str,
     /// пакеты, которых не хватает для звука через этот сервер
     pub missing: Vec<&'static str>,
-    /// команда установки для этого дистрибутива ("" — дистрибутив не узнали)
+    /// пакеты, без которых не работают звонки и демонстрация экрана (WebRTC)
+    pub call_missing: Vec<&'static str>,
+    /// команда установки всего недостающего ("" — ничего не нужно); если
+    /// дистрибутив не узнали — просто имена пакетов
     pub install: String,
     /// можно поставить кнопкой: есть pkexec и известный менеджер пакетов
     pub can_install: bool,
@@ -48,6 +65,26 @@ fn packages(f: Family) -> (&'static str, &'static str) {
         Family::Fedora => ("pipewire-gstreamer", "gstreamer1-plugins-good"),
         Family::Suse => ("gstreamer-plugin-pipewire", "gstreamer-plugins-good"),
         Family::Unknown => ("gst-plugin-pipewire", "gst-plugins-good"),
+    }
+}
+
+/// Пакеты с основными плагинами: (base, good).
+fn core_packages(f: Family) -> (&'static str, &'static str) {
+    match f {
+        Family::Arch | Family::Unknown => ("gst-plugins-base", "gst-plugins-good"),
+        Family::Debian => ("gstreamer1.0-plugins-base", "gstreamer1.0-plugins-good"),
+        Family::Fedora => ("gstreamer1-plugins-base", "gstreamer1-plugins-good"),
+        Family::Suse => ("gstreamer-plugins-base", "gstreamer-plugins-good"),
+    }
+}
+
+/// Пакеты с плагинами для звонков: (webrtc, nice).
+fn call_packages(f: Family) -> (&'static str, &'static str) {
+    match f {
+        Family::Arch | Family::Unknown => ("gst-plugins-bad", "libnice"),
+        Family::Debian => ("gstreamer1.0-plugins-bad", "gstreamer1.0-nice"),
+        Family::Fedora => ("gstreamer1-plugins-bad-free", "libnice-gstreamer1"),
+        Family::Suse => ("gstreamer-plugins-bad", "gstreamer-plugins-libnice"),
     }
 }
 
@@ -261,6 +298,9 @@ fn decide(mut s: Status, family: Family) -> Status {
         _ => "",
     };
     s.missing.clear();
+    // основа нужна и микрофону, и звонкам; если её нет, остальное уже не поможет
+    let (base_pkg, good_pkg) = core_packages(family);
+    if !s.gst_base { s.missing.push(base_pkg); }
     match s.server {
         // при PipeWire микрофон берём через его собственный плагин — даже если
         // pipewire-pulse есть, так надёжнее (и это то, о чём просили)
@@ -268,12 +308,26 @@ fn decide(mut s: Status, family: Family) -> Status {
         "pulseaudio" if !s.gst_pulse => s.missing.push(pulse_pkg),
         _ => {}
     }
-    s.install = match (installer(family), s.missing.is_empty()) {
-        (Some((_, _, shown)), false) => format!("{shown} {}", s.missing.join(" ")),
-        (None, false) => s.missing.join(" "),
+    let (webrtc_pkg, nice_pkg) = call_packages(family);
+    s.call_missing.clear();
+    // в Arch gst-plugins-good — ещё и плагин pulse: не просим его дважды
+    if !s.gst_good && !s.missing.contains(&good_pkg) { s.call_missing.push(good_pkg); }
+    if !s.gst_webrtc { s.call_missing.push(webrtc_pkg); }
+    if !s.gst_nice { s.call_missing.push(nice_pkg); }
+    let all = s.all_missing();
+    s.install = match (installer(family), all.is_empty()) {
+        (Some((_, _, shown)), false) => format!("{shown} {}", all.join(" ")),
+        (None, false) => all.join(" "),
         _ => String::new(),
     };
     s
+}
+
+impl Status {
+    /// Всё, что надо поставить: для звука и для звонков.
+    fn all_missing(&self) -> Vec<&'static str> {
+        self.missing.iter().chain(&self.call_missing).copied().collect()
+    }
 }
 
 pub fn status() -> Status {
@@ -295,11 +349,15 @@ pub fn status() -> Status {
         pulse_socket,
         gst_pipewire: has_plugin(&dirs, "libgstpipewire.so"),
         gst_pulse: has_plugin(&dirs, "libgstpulseaudio.so"),
+        gst_base: has_plugin(&dirs, "libgstopus.so") && has_plugin(&dirs, "libgstaudioconvert.so"),
+        gst_good: has_plugin(&dirs, "libgstvpx.so") && has_plugin(&dirs, "libgstrtpmanager.so"),
+        gst_webrtc: has_plugin(&dirs, "libgstwebrtc.so"),
+        gst_nice: has_plugin(&dirs, "libgstnice.so"),
         distro,
         ..Default::default()
     };
     let mut s = decide(s, family);
-    s.can_install = !s.missing.is_empty()
+    s.can_install = !s.all_missing().is_empty()
         && installer(family).is_some_and(|(pm, _, _)| Path::new(pm).exists())
         && Path::new("/usr/bin/pkexec").exists();
     s
@@ -309,7 +367,8 @@ pub fn status() -> Status {
 /// берутся только из status(), а не из интерфейса.
 pub fn install_missing() -> Result<Status, String> {
     let s = status();
-    if s.missing.is_empty() {
+    let all = s.all_missing();
+    if all.is_empty() {
         return Ok(s);
     }
     let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
@@ -321,7 +380,7 @@ pub fn install_missing() -> Result<Status, String> {
     let out = std::process::Command::new("/usr/bin/pkexec")
         .arg(pm)
         .args(args)
-        .args(&s.missing)
+        .args(&all)
         .output()
         .map_err(|e| format!("pkexec: {e}"))?;
     if !out.status.success() {
@@ -341,8 +400,9 @@ pub fn install_missing() -> Result<Status, String> {
 mod tests {
     use super::*;
 
+    /// плагины звонков на месте: проверяем только звук
     fn base() -> Status {
-        Status::default()
+        Status { gst_base: true, gst_good: true, gst_webrtc: true, gst_nice: true, ..Default::default() }
     }
 
     #[test]
@@ -376,6 +436,30 @@ mod tests {
         let s = decide(Status { pipewire: true, gst_pipewire: true, gst_pulse: true, ..base() }, Family::Arch);
         assert_eq!(s.via, "pipewire");
         assert!(s.missing.is_empty() && s.install.is_empty());
+    }
+
+    #[test]
+    fn calls_need_webrtc_and_nice() {
+        let s = decide(Status { pipewire: true, gst_pipewire: true, gst_webrtc: false, gst_nice: false, ..base() }, Family::Arch);
+        assert!(s.missing.is_empty());
+        assert_eq!(s.call_missing, vec!["gst-plugins-bad", "libnice"]);
+        assert_eq!(s.install, "sudo pacman -S --needed gst-plugins-bad libnice");
+        // и звук, и звонки — одной командой
+        let s = decide(Status { pipewire: true, gst_nice: false, ..base() }, Family::Debian);
+        assert_eq!(s.all_missing(), vec!["gstreamer1.0-pipewire", "gstreamer1.0-nice"]);
+        assert_eq!(s.install, "sudo apt install gstreamer1.0-pipewire gstreamer1.0-nice");
+    }
+
+    #[test]
+    fn bare_gstreamer_asks_for_base_and_good() {
+        // AppImage на чистой системе: есть только gstreamer и плагин pipewire
+        let s = decide(Status { pipewire: true, gst_pipewire: true, ..Default::default() }, Family::Arch);
+        assert_eq!(s.missing, vec!["gst-plugins-base"]);
+        assert_eq!(s.call_missing, vec!["gst-plugins-good", "gst-plugins-bad", "libnice"]);
+        assert_eq!(s.install, "sudo pacman -S --needed gst-plugins-base gst-plugins-good gst-plugins-bad libnice");
+        // Arch + PulseAudio: gst-plugins-good — тот же пакет, что и плагин pulse
+        let s = decide(Status { pulseaudio: true, pulse_socket: true, gst_base: true, ..Default::default() }, Family::Arch);
+        assert_eq!(s.all_missing(), vec!["gst-plugins-good", "gst-plugins-bad", "libnice"]);
     }
 
     #[test]

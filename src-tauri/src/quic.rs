@@ -23,9 +23,33 @@ fn cert_paths(app_dir: &std::path::Path) -> (PathBuf, PathBuf) {
 /// Load our self-signed QUIC cert, generating it once on first use.
 pub(crate) fn load_or_gen_cert(app_dir: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>), String> {
     let (cert_path, key_path) = cert_paths(app_dir);
-    if let (Ok(c), Ok(k)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
-        if !c.is_empty() && !k.is_empty() {
-            return Ok((c, k));
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&key_path) {
+            if !meta.is_file() {
+                return Err("device key is not a regular file".into());
+            }
+            if meta.permissions().mode() & 0o7777 != 0o600 {
+                if let Err(e) = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)) {
+                    eprintln!("SafeDrop: не удалось установить права 0600 на ключ устройства: {e}");
+                }
+            }
+        }
+    }
+    let cert = std::fs::read(&cert_path);
+    let key = std::fs::read(&key_path);
+    #[cfg(target_os = "linux")]
+    for file in [&cert, &key] {
+        if let Err(e) = file {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e.to_string());
+            }
+        }
+    }
+    if let (Ok(cert), Ok(key)) = (cert, key) {
+        if !cert.is_empty() && !key.is_empty() {
+            return Ok((cert, key));
         }
     }
     let key = rcgen::generate_simple_self_signed(vec!["safedrop".into()])
@@ -33,8 +57,19 @@ pub(crate) fn load_or_gen_cert(app_dir: &std::path::Path) -> Result<(Vec<u8>, Ve
     let cert_der = key.cert.der().to_vec();
     let key_der = key.key_pair.serialize_der();
     let _ = std::fs::create_dir_all(app_dir);
-    std::fs::write(&cert_path, &cert_der).map_err(|e| e.to_string())?;
-    std::fs::write(&key_path, &key_der).map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
+            .open(&key_path).and_then(|mut file| file.write_all(&key_der)).map_err(|e| e.to_string())?;
+        std::fs::write(&cert_path, &cert_der).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::fs::write(&cert_path, &cert_der).map_err(|e| e.to_string())?;
+        std::fs::write(&key_path, &key_der).map_err(|e| e.to_string())?;
+    }
     Ok((cert_der, key_der))
 }
 
@@ -87,6 +122,9 @@ pub async fn client_endpoint() -> Result<quinn::Endpoint, String> {
 }
 
 async fn connect(ip: &str, port: u16) -> Result<quinn::Connection, String> {
+    if crate::relay::active() || crate::relay::is_relay(ip) {
+        return Err("QUIC в режиме «через сервер» не используется".into());
+    }
     let ep = client_endpoint().await?;
     let addr: SocketAddr = format!("{ip}:{port}").parse().map_err(|e| format!("bad addr: {e}"))?;
     let connecting = ep
@@ -291,7 +329,8 @@ pub async fn send_frame_dual(
             Err(_) => (false, 47833),
         }
     };
-    if !udp_on {
+    // через сервер QUIC не ходит: только каналы TCP
+    if !udp_on || crate::relay::active() || crate::relay::is_relay(ip) {
         return crate::signal::send_frame(ip, sig_port, value, wait_reply).await;
     }
     match tokio::time::timeout(
@@ -328,6 +367,30 @@ pub async fn send_file_dual(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_key_has_private_mode_without_changing_identity() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let original = load_or_gen_cert(dir.path()).unwrap();
+        let (_, key_path) = cert_paths(dir.path());
+        let mode = || std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(), 0o600);
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode(), 0o644);
+        assert_eq!(load_or_gen_cert(dir.path()).unwrap(), original);
+        assert_eq!(mode(), 0o600);
+
+        let alias = dir.path().join("alias.der");
+        std::fs::rename(&key_path, &alias).unwrap();
+        symlink(&alias, &key_path).unwrap();
+        std::fs::set_permissions(&alias, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load_or_gen_cert(dir.path()).unwrap(), original);
+        assert_eq!(mode(), 0o600);
+    }
 
     /// QUIC plumbing smoke test: cert gen + endpoint bind + handshake +
     /// bidi echo over loopback. No Tauri state involved. Each test uses its

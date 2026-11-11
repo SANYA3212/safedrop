@@ -1,18 +1,22 @@
 // Shim: в Tauri — настоящие invoke/listen, в браузере — демо (сеть недоступна).
 // Детект по обоим мостам: window.__TAURI__ (нужен withGlobalTauri)
 // и низкоуровневый window.__TAURI_INTERNALS__ (есть всегда).
+// Linux: окно — Electron, мост — window.safedropElectron (electron/preload.js).
 const T = () => window.__TAURI__;
 const TI = () => window.__TAURI_INTERNALS__;
+const E = () => window.safedropElectron;
+export const isElectron = !!E();
 const hasInvoke = () =>
-  !!(T()?.core?.invoke || TI()?.invoke);
+  !!(E() || T()?.core?.invoke || TI()?.invoke);
 export const isDemo = !hasInvoke();
 export const bridgeInfo = () =>
-  `__TAURI__=${!!T()} core=${!!T()?.core?.invoke} event=${!!T()?.event?.listen} internals=${!!TI()}`;
+  `electron=${isElectron} __TAURI__=${!!T()} core=${!!T()?.core?.invoke} event=${!!T()?.event?.listen} internals=${!!TI()}`;
 
 export function tauriFile(path) {
   try {
     if (!path) return "";
     if (isDemo && DEMO_AUDIO_PATHS.includes(path)) return demoAudioUrl(path);
+    if (E()) return E().fileUrl(path);
     if (TI()?.convertFileSrc) return TI().convertFileSrc(path);
     if (T()?.core?.convertFileSrc) return T().core.convertFileSrc(path);
   } catch {}
@@ -20,6 +24,7 @@ export function tauriFile(path) {
 }
 
 export async function invoke(cmd, args = {}) {
+  if (E()) return E().invoke(cmd, args || {});
   if (T()?.core?.invoke) return T().core.invoke(cmd, args);
   if (TI()?.invoke) return TI().invoke(cmd, args || {});
   // --- demo: всё локально, сети нет ---
@@ -61,7 +66,7 @@ export async function invoke(cmd, args = {}) {
     case "read_image_dataurl": throw "демо-режим";
     // демо подсказок для Linux: index.html?linux
     case "get_build_info": return DEMO_LINUX ? { version: "demo", build_time: "?", exe: "", os: "linux" } : null;
-    case "linux_audio_status": return { server: "pipewire", pipewire: true, pipewire_pulse: false, pulseaudio: false, pulse_socket: false, gst_pipewire: false, gst_pulse: true, via: "", missing: ["gst-plugin-pipewire"], install: "sudo pacman -S --needed gst-plugin-pipewire", can_install: true, distro: "Arch Linux" };
+    case "linux_audio_status": return { server: "pipewire", pipewire: true, pipewire_pulse: false, pulseaudio: false, pulse_socket: false, gst_pipewire: false, gst_pulse: true, gst_webrtc: true, gst_nice: true, via: "", missing: ["gst-plugin-pipewire"], call_missing: [], install: "sudo pacman -S --needed gst-plugin-pipewire", can_install: true, distro: "Arch Linux" };
     case "linux_audio_install": throw "демо-режим: запусти приложение";
     default: return null;
   }
@@ -69,6 +74,7 @@ export async function invoke(cmd, args = {}) {
 const DEMO_LINUX = /[?&]linux\b/.test(location.search);
 
 export async function listen(event, handler) {
+  if (E()) return E().listen(event, handler);
   if (window.__TAURI__?.event?.listen) return window.__TAURI__.event.listen(event, handler);
   return () => {};
 }
@@ -76,6 +82,7 @@ export async function listen(event, handler) {
 // Только события, адресованные этому окну. Обычный listen получает и то, что
 // Rust шлёт другим окнам через emit_to (например, панели браузера) — дубли.
 export async function listenHere(event, handler) {
+  if (E()) return E().listen(event, handler); // в Electron одно окно
   const ev = window.__TAURI__?.event;
   if (!ev?.listen) return () => {};
   const label = window.__TAURI_INTERNALS__?.metadata?.currentWebview?.label || "main";

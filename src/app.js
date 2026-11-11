@@ -1,4 +1,6 @@
-import { invoke, listen, listenHere, isDemo, tauriFile, bridgeInfo } from "./tauri-shim.js";
+import { invoke, listen, listenHere, isDemo, isElectron, tauriFile, bridgeInfo } from "./tauri-shim.js";
+
+if (isElectron) document.documentElement.classList.add("electron");
 
 // все немые падения — сразу тостом на экран
 window.addEventListener("error", (e) => {
@@ -42,7 +44,9 @@ function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;"
 function fmtSpeed(bps) { if (!bps) return "—"; const u=["Б/с","КБ/с","МБ/с","ГБ/с"]; let i=0,v=bps; while(v>1024&&i<3){v/=1024;i++;} return `${v.toFixed(1)} ${u[i]}`; }
 function fmtSize(b) { const u=["Б","КБ","МБ","ГБ","ТБ"]; let i=0,v=b||0; while(v>1024&&i<4){v/=1024;i++;} return `${v.toFixed(1)} ${u[i]}`; }
 function fileName(p) { return String(p || "").split(/[\\/]/).pop(); }
-function dispName(p) { if (p.name && p.name !== p.ip) return p.nickname ? `${p.name} · ${p.nickname}` : p.name; return p.nickname || p.name || p.ip; }
+function dispName(p) { if (p.name && p.name !== p.ip) return p.nickname ? `${p.name} · ${p.nickname}` : p.name; return p.nickname || p.name || showAddr(p.ip); }
+// адрес для показа: контакт через сервер — коротко, а не 64 знака ключа
+function showAddr(ip) { const s = String(ip ?? ""); return s.startsWith("sd-") ? `сервер · ${s.slice(3, 11)}` : s; }
 function dispAva(p) { return p.custom_avatar || p.avatar || ""; }
 // Avatars and chat images come from peers: accept only a base64 image data URL
 // (or a local file URL we built ourselves), always escaped.
@@ -232,7 +236,14 @@ function bindCallUiControls() {
 bindCallUiControls();
 
 // ---------- load ----------
-let hostOs = "windows"; // из get_build_info; на Linux другие подсказки и нет «сброса запрета»
+const bootBuild = await invoke("get_build_info").catch(() => null);
+let hostOs = bootBuild?.os || "windows";
+const webkitLinux = () => hostOs === "linux" && !isElectron;
+function hideExplorerOptions() {
+  $("#set-ctxmenu")?.closest("label")?.style.setProperty("display", "none");
+  $("#btn-ctx-refresh")?.style.setProperty("display", "none");
+}
+if (hostOs !== "windows") hideExplorerOptions();
 async function loadAll() {
   settings = await invoke("get_settings");
   try { profile = await invoke("get_profile"); } catch { profile = { nickname: "", avatar: "" }; }
@@ -269,6 +280,7 @@ async function loadAll() {
   $("#set-autostart").checked = settings.autostart;
   $("#set-tray").checked = settings.minimize_to_tray;
   $("#set-ctxmenu").checked = !!settings.ctx_menu;
+  if (hostOs === "windows") refreshWin11Menu();
   const st = $("#set-show-typing");
   if (st) st.checked = settings.show_typing !== false;
   const rr = $("#set-read-receipts");
@@ -325,11 +337,7 @@ async function loadAll() {
   syncCallUiControls(); applyCallUi();
   renderMyAvatar();
   applyTheme(); renderAll();
-  try {
-    const ips = await invoke("get_my_ips");
-    $("#me-ip").textContent = ips.join(" · ");
-    myIp = ips.find((x) => x.startsWith("26.")) || ips[0] || "";
-  } catch {}
+  await refreshMyIp();
   try { groups = await invoke("get_groups"); normalizeGroups(); } catch { groups = []; }
   renderGroups();
   $("#me-nick").textContent = profile.nickname || settings.device_name;
@@ -348,9 +356,12 @@ async function loadAll() {
     hostOs = b.os || "windows";
     if (b.os && b.os !== "windows") {
       for (const sel of ["#btn-firewall", "#btn-notif-win", "#btn-mic-win"]) $(sel)?.style.setProperty("display", "none");
-      $("#set-ctxmenu")?.closest("label")?.style.setProperty("display", "none");
+      hideExplorerOptions();
     }
     if (b.os === "linux") {
+      $("#updates-pane").classList.add("hidden");
+      linuxInstalledVersion = b.version;
+      checkLinuxPeerVersions();
       document.documentElement.classList.add("os-linux");
       refreshLinuxAudio();
     }
@@ -385,7 +396,7 @@ function renderContacts() {
     d.className = "contact" + (p.ip === selectedIp ? " active" : "");
     const typingKey = p.ip; // личный чат
     const typingLabelText = typingPeers.has(typingKey) && typingPeers.get(typingKey)?.size ? typingLabel(typingKey) : "";
-    d.innerHTML = `${avaHTML(p, "sm")}<div class="meta"><b><span class="nm">${esc(dispName(p))}</span>${typingLabelText ? `<span class="typing-badge" style="margin-left:6px;font-size:11px;color:#3ddc84;">${esc(typingLabelText)}</span>` : ""}${p.trusted ? '<svg class="ic" viewBox="0 0 24 24" style="color:#f5c518"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z"/></svg>' : ""}</b><small>${p.online ? `<span style="color:#3ddc84">●</span> ${p.ping_ms ?? "?"} мс · ${esc(p.ip)}` : `<span style="color:#666">●</span> ${esc(p.ip)}`}${stateBadge(p.state)}${(p.state && p.state !== "idle" && p.detail) ? ` · ${esc(p.detail)}` : ""}</small></div>${unread[p.ip] ? `<span class="unread">${unread[p.ip]}</span>` : ""}`;
+    d.innerHTML = `${avaHTML(p, "sm")}<div class="meta"><b><span class="nm">${esc(dispName(p))}</span>${typingLabelText ? `<span class="typing-badge" style="margin-left:6px;font-size:11px;color:#3ddc84;">${esc(typingLabelText)}</span>` : ""}${p.trusted ? '<svg class="ic" viewBox="0 0 24 24" style="color:#f5c518"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z"/></svg>' : ""}</b><small>${p.online ? `<span style="color:#3ddc84">●</span> ${p.ping_ms ?? "?"} мс · ${esc(showAddr(p.ip))}` : `<span style="color:#666">●</span> ${esc(showAddr(p.ip))}`}${stateBadge(p.state)}${(p.state && p.state !== "idle" && p.detail) ? ` · ${esc(p.detail)}` : ""}</small></div>${unread[p.ip] ? `<span class="unread">${unread[p.ip]}</span>` : ""}`;
     d.onclick = () => selectPeer(p.ip);
     box.appendChild(d);
   }
@@ -421,7 +432,7 @@ function renderConv() {
     return;
   }
   $("#conv-name").textContent = dispName(p);
-  $("#conv-sub").textContent = `${p.ip} · ${p.online ? `в сети · ${p.ping_ms ?? "?"} мс` : "не в сети"}`;
+  $("#conv-sub").textContent = `${showAddr(p.ip)} · ${p.online ? `в сети · ${p.ping_ms ?? "?"} мс` : "не в сети"}`;
   $("#conv-ava").outerHTML = avaHTML(p, "md").replace('class="ava md', 'id="conv-ava" class="ava md');
   $("#btn-hangup").classList.toggle("hidden", !currentCall);
 }
@@ -455,7 +466,7 @@ function renderPeerCard() {
   const p = sel();
   if (!p) { $("#rc-nick").textContent = "—"; $("#rc-sub").textContent = "Выбери контакт слева"; $("#rc-ping").textContent = "—"; $("#rc-avatar").outerHTML = '<span id="rc-avatar" class="ava lg"><span>?</span></span>'; return; } // сброс аватарки/счётчика от прежней группы
   $("#rc-nick").textContent = dispName(p);
-  $("#rc-sub").textContent = p.nickname ? `ник: ${p.nickname} · ${p.ip}` : p.ip;
+  $("#rc-sub").textContent = p.nickname ? `ник: ${p.nickname} · ${showAddr(p.ip)}` : showAddr(p.ip);
   $("#rc-ping").innerHTML = p.online ? `<span style="color:#3ddc84">●</span> в сети · ${p.ping_ms ?? "?"} мс` : `<span style="color:#666">●</span> не в сети`;
   $("#rc-avatar").outerHTML = avaHTML(p, "lg").replace('class="ava lg', 'id="rc-avatar" class="ava lg');
   $("#rc-trust").innerHTML = p.trusted ? '<svg class="ic" viewBox="0 0 24 24" style="color:#f5c518"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
@@ -565,7 +576,7 @@ function openGroupModal(g) {
   const inG = new Set(g?.members || []);
   for (const p of peers) {
     const l = document.createElement("label");
-    l.innerHTML = `<input type="checkbox" data-ip="${esc(p.ip)}" ${inG.has(p.ip) ? "checked" : ""} /> ${esc(dispName(p))} <span class="muted">${esc(p.ip)}</span>`;
+    l.innerHTML = `<input type="checkbox" data-ip="${esc(p.ip)}" ${inG.has(p.ip) ? "checked" : ""} /> ${esc(dispName(p))} <span class="muted">${esc(showAddr(p.ip))}</span>`;
     box.appendChild(l);
   }
   if (!peers.length) box.innerHTML = `<div class="empty-hint">Нет контактов — сначала добавь.</div>`;
@@ -768,6 +779,26 @@ function requestAudioWave(src, path, wanted) {
   audioWaveQueue = job.catch(() => {});
   return job;
 }
+// Видео в чате идёт тем же путём, что и аудио: поле `audio` сообщения — его медиафайл.
+// webm — видео, если это не голосовое (голосовые называются safedrop-voice-*).
+function isChatVideo(path) {
+  return /\.(mp4|m4v|webm|mov|mkv)$/i.test(path || "") && !/^safedrop-voice-/i.test(fileName(path));
+}
+function mediaLabel(path) { return isChatVideo(path) ? "Видео" : "Аудио"; }
+function createVideoPlayer(path) {
+  const root = document.createElement("div");
+  root.className = "chat-video";
+  root.innerHTML = `<video controls preload="metadata" playsinline></video><div class="chat-video-error hidden" role="status"><span>Видео ещё не загрузилось или этот формат не поддерживается.</span><button type="button">Повторить</button></div><div class="audio-name"></div>`;
+  const video = root.querySelector("video"), error = root.querySelector(".chat-video-error");
+  root.querySelector(".audio-name").textContent = fileName(path);
+  video.setAttribute("aria-label", "Видео " + fileName(path));
+  // файл приходит отдельной передачей и может появиться позже сообщения
+  video.onerror = () => { error.classList.remove("hidden"); video.classList.add("hidden"); };
+  video.onloadedmetadata = () => { error.classList.add("hidden"); video.classList.remove("hidden"); };
+  error.querySelector("button").onclick = () => { video.load(); };
+  video.src = tauriFile(path);
+  return root;
+}
 function createAudioPlayer(path, { src = tauriFile(path), voice = /^safedrop-voice-/i.test(fileName(path)), preview = false } = {}) {
   const root = document.createElement("div");
   root.className = "audio-player";
@@ -918,7 +949,7 @@ function quoteOf(m) {
   let text;
   if (src.text && src.text.trim()) text = src.text.trim().split("\n")[0].slice(0, 80);
   else if (msgImages(src).length) text = "Фото";
-  else if (src.audio) text = "Аудио";
+  else if (src.audio) text = mediaLabel(src.audio);
   else if (src.text && src.text.trim() === "") text = "Файл";
   else text = src.text || "Файл";
   return { removed: false, author, text, id: src.id };
@@ -990,7 +1021,7 @@ function buildRow(m, p, g, myLetter, myNick) {
   d.dataset.mid = m.id;
   d.innerHTML = `<span class="ava sm"><span>${avaInner(av, letter)}</span></span><div class="mbody"><div class="mhead"><b>${esc(me ? myNick : m.from_nick)}</b><time>${esc(msgTime(m))}</time>${editMark}${msgStatusHTML(m)}</div>${m.forwarded_from ? `<div class="forwarded-mark">Переслано от ${esc(m.forwarded_from)}</div>` : ""}${quoteHTML(quoteOf(m))}${imgsHTML}<p data-raw="${esc(m.text || "")}">${renderMsgText(m.text)}</p>${reactionsHTML(m, myNick)}</div><button class="mdel" title="Удалить"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button>`;
   d.querySelectorAll(".chat-img").forEach((img) => { img.onclick = () => openImg(images[Number(img.dataset.i)]); });
-  if (m.audio) d.querySelector(".mbody").insertBefore(createAudioPlayer(m.audio), d.querySelector(".mbody > p"));
+  if (m.audio) d.querySelector(".mbody").insertBefore(isChatVideo(m.audio) ? createVideoPlayer(m.audio) : createAudioPlayer(m.audio), d.querySelector(".mbody > p"));
   d.querySelector(".mdel").onclick = () => openDel({ mode: "msg", id: m.id, mine: me });
   d.oncontextmenu = (e) => { e.preventDefault(); openMsgMenu(e, m); };
   const q = d.querySelector(".mquote");
@@ -1454,7 +1485,7 @@ async function saveEdit() {
 function msgPreview(m) {
   if (m.text && m.text.trim()) return m.text.trim().split("\n")[0].slice(0, 80);
   if (msgImages(m).length) return "Фото";
-  if (m.audio) return "Аудио";
+  if (m.audio) return mediaLabel(m.audio);
   return "Файл";
 }
 
@@ -1871,12 +1902,12 @@ function setMicState(st) {
   el.className = "mic-state" + (st === "ok" ? " ok" : st === "no" ? " no" : "");
   el.textContent = st === "ok" ? "микрофон OK" : st === "no" ? "заблокирован" : "проверка…";
 }
-const MIC_HELP_LINUX = `<ol>
+function micHelpLinux() { return `<ol>
 <li>Проверь, что микрофон не выключен в настройках звука системы (PipeWire / PulseAudio, например pavucontrol).</li>
-<li>Если звуком управляет PipeWire, нужен плагин GStreamer для него (Arch: <code>gst-plugin-pipewire</code>, Ubuntu: <code>gstreamer1.0-pipewire</code>) — см. «Звук» в «Звонки и звук».</li>
+${webkitLinux() ? '<li>Если звуком управляет PipeWire, нужен плагин GStreamer для него (Arch: <code>gst-plugin-pipewire</code>, Ubuntu: <code>gstreamer1.0-pipewire</code>) — см. «Звук» в «Звонки и звук».</li>' : ""}
 <li>Закрой программы, которые могут держать микрофон (Discord, OBS).</li>
 <li>Выбери микрофон заново в «Звонки и звук» и нажми «Запросить доступ».</li>
-</ol>`;
+</ol>`; }
 // Звук на Linux: WebKitGTK ищет микрофоны через GStreamer. Если звуком управляет
 // PipeWire, а плагина GStreamer для него нет, список микрофонов пуст и getUserMedia
 // падает с «Invalid constraint» (или «заблокирован», хотя запрета нет).
@@ -1888,11 +1919,14 @@ async function refreshLinuxAudio() {
   catch { linuxAudio = null; box?.classList.add("hidden"); return null; }
   if (!box) return linuxAudio;
   const a = linuxAudio;
-  const via = a.via === "pipewire" ? "микрофон через PipeWire" : a.via === "pulse" ? "микрофон через PulseAudio" + (a.server === "pipewire" ? " (pipewire-pulse)" : "") : "";
+  const via = !webkitLinux() ? "" : a.via === "pipewire" ? "микрофон через PipeWire" : a.via === "pulse" ? "микрофон через PulseAudio" + (a.server === "pipewire" ? " (pipewire-pulse)" : "") : "";
   let html = `<div class="muted">Звуковая система: <b>${esc(LINUX_AUDIO_SERVER[a.server] || a.server)}</b>${via ? " · " + esc(via) : ""}</div>`;
-  if (a.missing?.length) {
-    html += `<div class="linux-audio-warn">${a.via ? "Для звука через PipeWire нужен пакет" : "SafeDrop не видит микрофон: нужен пакет"} <code>${esc(a.missing.join(" "))}</code>.`
-      + (a.install ? ` Команда: <code>${esc(a.install)}</code>` : "") + `</div>`
+  if (webkitLinux() && a.missing?.length)
+    html += `<div class="linux-audio-warn">${a.gst_base === false ? "Для звука нужны основные плагины GStreamer, пакет" : a.via ? "Для звука через PipeWire нужен пакет" : "SafeDrop не видит микрофон: нужен пакет"} <code>${esc(a.missing.join(" "))}</code>.</div>`;
+  if (webkitLinux() && a.call_missing?.length)
+    html += `<div class="linux-audio-warn">Для звонков и демонстрации экрана (WebRTC) нужен пакет <code>${esc(a.call_missing.join(" "))}</code>.</div>`;
+  if (webkitLinux() && (a.missing?.length || a.call_missing?.length)) {
+    html += (a.install ? `<div class="muted">Команда: <code>${esc(a.install)}</code></div>` : "")
       + `<div class="row">${a.can_install ? `<button id="btn-linux-audio-install">Установить</button>` : ""}`
       + (a.install ? `<button id="btn-linux-audio-copy">Скопировать команду</button>` : "") + `</div>`;
   }
@@ -1905,23 +1939,27 @@ async function refreshLinuxAudio() {
   return a;
 }
 async function installLinuxAudio() {
-  toast("Ставлю " + (linuxAudio?.missing || []).join(" ") + " — система спросит пароль…");
+  if (!webkitLinux()) return;
+  const need = (a) => [...(a?.missing || []), ...(a?.call_missing || [])];
+  toast("Ставлю " + need(linuxAudio).join(" ") + " — система спросит пароль…");
   try {
     const a = await invoke("linux_audio_install");
     await refreshLinuxAudio();
     $("#help-modal")?.classList.add("hidden");
-    if (a?.missing?.length) return toast("Пакет так и не нашёлся: " + a.missing.join(" "), true);
-    showHelp("Плагин установлен", "<p>Закрой SafeDrop полностью (значок в трее → «Выйти») и запусти снова — после этого микрофон появится в списке.</p>");
+    if (need(a).length) return toast("Пакет так и не нашёлся: " + need(a).join(" "), true);
+    showHelp("Плагины установлены", "<p>Закрой SafeDrop полностью (значок в трее → «Выйти») и запусти снова — после этого заработают микрофон и звонки.</p>");
   } catch (e) { toast("" + e, true); }
 }
 // Ошибка микрофона: запрет — окно с подсказкой, всё остальное (нет устройства,
 // устройство пропало, занято) — короткое сообщение с причиной, а не «заблокирован».
 async function micFailed(e) {
   const name = e?.name || "";
-  if (hostOs === "linux") {
+  if (webkitLinux()) {
     const a = await refreshLinuxAudio();
     if (a?.missing?.length) {
-      const why = a.server === "pipewire"
+      const why = a.gst_base === false
+        ? "В системе нет основных плагинов GStreamer: без них SafeDrop не может ни записывать, ни воспроизводить звук в звонках."
+        : a.server === "pipewire"
         ? "Звуком в системе управляет PipeWire, а плагина GStreamer для него нет, поэтому SafeDrop не видит ни одного микрофона."
         : "В системе нет плагина GStreamer для PulseAudio, поэтому SafeDrop не видит ни одного микрофона.";
       return showHelp("SafeDrop не видит микрофон",
@@ -1932,7 +1970,7 @@ async function micFailed(e) {
   // WebKit отвечает «Invalid constraint», когда система не отдала ни одного микрофона
   if (name === "NotFoundError" || (name === "OverconstrainedError" && !e?.constraint)) return toast("Микрофон не найден: проверь, что он подключён и включён в настройках звука системы", true);
   if (name !== "NotAllowedError" && name !== "SecurityError") return toast("Микрофон: " + (e?.message || e), true);
-  if (hostOs !== "windows") return showHelp("Микрофон заблокирован", MIC_HELP_LINUX);
+  if (hostOs !== "windows") return showHelp("Микрофон заблокирован", micHelpLinux());
   showHelp("Микрофон заблокирован", MIC_HELP, "<svg class='ic' viewBox='0 0 24 24'><path d='M20,11A8,8,0,0,0,5.64,6.64L4,8.29V4H8.29l1.59,1.59A10,10,0,0,1,22,13Z'/><path d='M4,13A8,8,0,0,0,18.36,17.36L20,15.71V20H15.71l-1.59-1.59A10,10,0,0,1,2,11Z'/></svg> Сбросить запрет (перезапуск)", async () => { toast("Перезапускаю для сброса…"); await invoke("fix_mic_blocked").catch((x) => toast("" + x, true)); });
 }
 // getUserMedia с запасными вариантами: сохранённый deviceId может устареть (в WebKit
@@ -2112,7 +2150,7 @@ async function startMicNow() {
     const noiseEngine = settings.noise_filter || "rnnoise";
     const proc = {
       echoCancellation: { ideal: settings.echo_cancellation !== false },
-      noiseSuppression: { ideal: noiseEngine === "webrtc" },
+      noiseSuppression: { ideal: noiseEngine === "webrtc" || (webkitLinux() && noiseEngine !== "off") }, // в WebKitGTK RNNoise в звонок не попадает (см. micTracks)
       autoGainControl: { ideal: settings.auto_gain_control !== false },
     };
     const id = settings.mic_id;
@@ -2200,6 +2238,11 @@ async function startMicNow() {
 }
 let micCtx = null, micGain = null, micDest = null, gateNode = null, rnnoiseNode = null, rnnoiseWetGain = null, rnnoiseDryGain = null, micCompressor = null;
 function micTracks() {
+  // WebKitGTK (GStreamer) не умеет отправлять в WebRTC трек из WebAudio
+  // (MediaStreamAudioDestinationNode): уходит пара пакетов, дальше тишина, и
+  // собеседник не слышит. В WebKitGTK шлём сам микрофон — эхо- и шумоподавление
+  // WebRTC (webrtcdsp) работают и на нём.
+  if (webkitLinux() && localStream) return localStream.getAudioTracks();
   try {
     const live = micDest?.stream?.getAudioTracks().filter((t) => t.readyState === "live");
     if (live?.length) return live;
@@ -2207,6 +2250,7 @@ function micTracks() {
   return localStream ? localStream.getAudioTracks() : [];
 }
 function micTrackStream() {
+  if (webkitLinux() && localStream) return localStream; // в звонок идёт сам микрофон (см. micTracks)
   const processed = micDest?.stream;
   return processed?.getAudioTracks().some((t) => t.readyState === "live") ? processed : localStream;
 }
@@ -2603,6 +2647,23 @@ function saveCallRecord({ direction, peer, group = false, status = "completed", 
 let pc = null, currentCall = null, callTimer = null, callSec = 0, pendingOffer = null, callSetupPeer = null;
 let activeCallStartedAt = 0, activeCallDirection = "outgoing", activeCallAnsweredAt = 0;
 let iceOutBuf = [], iceInBuf = []; // кандидаты, пришедшие раньше готовности
+// ICE-кандидаты, пришедшие раньше, чем есть кому их отдать: звонок ещё звенит
+// или кандидат обогнал само предложение (через сервер кадры идут разными
+// каналами). Без них TURN не пустит пакеты собеседника: напрямую соединение
+// находилось и по встречным проверкам, через сервер — нет. Ждут до минуты.
+const earlyIce = {};
+function earlyIcePush(key, cand) {
+  const now = Date.now();
+  for (const k of Object.keys(earlyIce)) if (now - earlyIce[k].at > 60000) delete earlyIce[k];
+  if (!earlyIce[key] && Object.keys(earlyIce).length >= 32) return;
+  const e = earlyIce[key] || (earlyIce[key] = { at: now, list: [] });
+  if (e.list.length < 64) e.list.push(cand);
+}
+function takeEarlyIce(key) {
+  const e = earlyIce[key];
+  delete earlyIce[key];
+  return e && Date.now() - e.at <= 60000 ? e.list : [];
+}
 function sendIce(peerIp, cand) {
   invoke("sig_send", { peerIp, payload: { kind: "ice", from: profile.nickname || settings.device_name, candidate: JSON.stringify(cand) } }).catch(() => {});
 }
@@ -2631,7 +2692,7 @@ function ensurePC(peerIp) {
   pc.ontrack = (e) => { attachRemoteVoice(peerIp, e.streams?.[0] || new MediaStream([e.track])); };
   pc.onconnectionstatechange = () => {
     const st = pc?.connectionState;
-    if (st === "failed") toast("Прямое соединение не установилось — проверь Radmin и firewall", true);
+    if (st === "failed") toast(srvIce.mode === "server" ? "Звонок через сервер не соединился — проверь, открыты ли на сервере UDP-порты TURN" : "Прямое соединение не установилось — проверь Radmin и firewall", true);
     if (st === "connected") { toast("Голосовое соединение установлено <svg class='ic' viewBox='0 0 24 24'><path d='M9,16.17,4.83,12l-1.42,1.41L9,19,21,7l-1.41-1.41Z'/></svg>"); }
   };
   const audioStream = micTrackStream();
@@ -2672,13 +2733,177 @@ function hideCallUI() {
 }
 // max-bundle: весь звонок одним транспортом. WebKitGTK (GStreamer webrtcbin) не умеет
 // политику balanced по умолчанию и без этого не соединяется; Chromium/WebView2 — умеет.
+// SDP собеседника. WebKitGTK (Linux) объявляет расширение RTP «MID», но в видео
+// пишет его не так, как договорились, и строк a=ssrc не даёт. Chromium (WebView2),
+// увидев MID в договорённости, перестаёт узнавать пакеты по типу полезной нагрузки
+// и выбрасывает всё видео с Linux: камера и экран были чёрными. Если секция одна,
+// собеседник собирается слать, а a=ssrc нет (так делает только WebKit), убираем
+// MID — Chromium узнаёт поток по PT. Обычный SDP Chromium содержит a=ssrc, так что
+// звонки Windows ↔ Windows это не задевает. Нужно для Linux-версий до этой правки.
+// Electron тоже принимает видео от старого WebKitGTK, поэтому использует тот же обход.
+function remoteDesc(raw) {
+  const desc = typeof raw === "string" ? JSON.parse(raw) : raw;
+  try {
+    if ((hostOs !== "windows" && !isElectron) || typeof desc?.sdp !== "string") return desc;
+    const lines = desc.sdp.split(/\r?\n/);
+    if (lines.filter((l) => l.startsWith("m=")).length !== 1) return desc;
+    if (lines.some((l) => /^a=(ssrc|ssrc-group|rid|simulcast):/.test(l))) return desc;
+    if (!lines.some((l) => /^a=(sendrecv|sendonly)$/.test(l))) return desc;
+    const mid = /^a=extmap:\d+(\/\w+)?[ \t]+urn:ietf:params:rtp-hdrext:sdes:mid\b/;
+    const kept = lines.filter((l) => !mid.test(l));
+    return kept.length === lines.length ? desc : { type: desc.type, sdp: kept.join("\r\n") };
+  } catch { return desc; }
+}
+// Своё SDP. На Linux (WebKitGTK) сразу не договариваемся о MID: тогда WebKit его
+// не пишет, а любой Chromium — и старые версии SafeDrop на Windows — узнаёт поток
+// по типу кодека (см. remoteDesc).
+const MID_EXTMAP = /^a=extmap:\d+(\/\w+)?[ \t]+urn:ietf:params:rtp-hdrext:sdes:mid\b/;
+function localDesc(desc) {
+  try {
+    if (!webkitLinux() || typeof desc?.sdp !== "string") return desc;
+    const lines = desc.sdp.split(/\r?\n/);
+    const first = lines.findIndex((l) => l.startsWith("m="));
+    // только одна отправляющая секция: в recvonly-ответе и в нескольких секциях MID нужен
+    if (first < 0 || lines.slice(first + 1).some((l) => l.startsWith("m="))) return desc;
+    const media = lines.slice(first);
+    if (!/^m=(audio|video) [1-9]\d* UDP\/TLS\/RTP\/SAVPF /.test(media[0])
+      || !media.some((l) => /^a=(sendrecv|sendonly)$/.test(l))
+      || media.some((l) => /^a=(rid|simulcast):/.test(l))) return desc;
+    const kept = lines.filter((l) => !MID_EXTMAP.test(l));
+    return kept.length === lines.length ? desc : { type: desc.type, sdp: kept.join("\r\n") };
+  } catch { return desc; }
+}
+// Голосовой offer от Chromium для Linux. WebKitGTK сверяет a=msid чужой секции со
+// своим треком, не находит совпадения и строит ответ из своих кодеков: Opus у него
+// PT 96, у Chromium 111 — не пересекаются, и звонок с Windows шёл в G722. Если тот
+// же msid записан ещё и в a=ssrc, строку a=msid секции убираем: WebKit берёт поток
+// по виду (audio) и кодеки — из предложения. Номера PT, ssrc, mid не трогаем.
+function linuxVoiceOffer(desc) {
+  try {
+    if (!webkitLinux() || desc?.type !== "offer" || typeof desc.sdp !== "string") return desc;
+    const lines = desc.sdp.split(/\r?\n/);
+    const first = lines.findIndex((l) => l.startsWith("m="));
+    if (first < 0 || lines.slice(first + 1).some((l) => l.startsWith("m="))) return desc;
+    const media = lines.slice(first);
+    const audio = /^m=audio [1-9]\d* UDP\/TLS\/RTP\/SAVPF ([\d ]+)$/.exec(media[0]);
+    if (!audio || !media.includes("a=sendrecv")) return desc;
+    const opus = media.map((l) => /^a=rtpmap:(\d+) opus\/48000\/2$/i.exec(l)).find((m) => m && audio[1].split(" ").includes(m[1]));
+    if (!opus) return desc;
+    const msid = media.filter((l) => l.startsWith("a=msid:"));
+    if (msid.length !== 1 || !/^a=msid:\S+ \S+$/.test(msid[0])) return desc;
+    const dup = media.some((l) => /^a=ssrc:\d+ /.test(l) && l.slice(l.indexOf(" ") + 1) === msid[0].slice(2));
+    if (!dup) return desc;
+    return { type: desc.type, sdp: lines.filter((l, i) => i < first || l !== msid[0]).join("\r\n") };
+  } catch { return desc; }
+}
 function rtcConfig() {
+  // через сервер: только TURN этого сервера (relay), прямых путей не ищем
+  if (srvIce.mode === "server") {
+    if (srvIce.urls) return { iceServers: [{ urls: srvIce.urls, username: srvIce.username, credential: srvIce.credential }], iceTransportPolicy: "relay", bundlePolicy: "max-bundle" };
+    return { iceServers: [], bundlePolicy: "max-bundle" };
+  }
   return { iceServers: settings?.stun_enabled ? [{ urls: "stun:stun.l.google.com:19302" }] : [], bundlePolicy: "max-bundle" };
 }
+
+// ---------- режим «через сервер» (вкладка «Сервер») ----------
+let srv = { mode: "p2p", state: "off", peers: [] };
+let srvIce = { mode: "p2p" };
+function srvShort(id) { return String(id || "").slice(0, 8); }
+function fpGroups(fp) { return (String(fp || "").match(/.{1,4}/g) || []).join(" "); }
+async function refreshSrvIce() { try { srvIce = (await invoke("server_ice")) || { mode: "p2p" }; } catch { srvIce = { mode: "p2p" }; } }
+async function refreshMyIp() {
+  try {
+    const ips = await invoke("get_my_ips");
+    const viaServer = ips.filter((x) => x.startsWith("sd-"));
+    $("#me-ip").textContent = (viaServer.length ? viaServer : ips).map(showAddr).join(" · ");
+    myIp = ips.find((x) => x.startsWith("sd-")) || ips.find((x) => x.startsWith("26.")) || ips[0] || "";
+  } catch {}
+}
+function renderServer(st) {
+  const prevMode = srv.mode;
+  if (st) srv = st;
+  const server = srv.mode === "server";
+  $("#srv-mode-p2p").checked = !server;
+  $("#srv-mode-server").checked = server;
+  if (document.activeElement !== $("#srv-addr")) $("#srv-addr").value = srv.addr || "";
+  if (document.activeElement !== $("#srv-pass")) $("#srv-pass").value = srv.pass || "";
+  const labels = { off: "нет связи", connecting: "подключение…", online: "подключён", error: "ошибка" };
+  const badge = $("#srv-badge");
+  badge.textContent = server ? (labels[srv.state] || srv.state || "") : "";
+  badge.className = "srv-badge" + (!server ? "" : srv.state === "online" ? " on" : srv.state === "connecting" ? " wait" : " err");
+  const brand = $("#brand-mode");
+  brand.textContent = server ? "Сервер" : "P2P";
+  brand.classList.toggle("srv", server);
+  let text = "", cls = "";
+  if (!server) text = "Сервер не используется: SafeDrop работает напрямую (LAN, Radmin).";
+  else if (srv.state === "online") {
+    cls = "on";
+    text = `Подключён к ${esc(srv.addr)}${srv.server_ver ? ` · сервер ${esc(srv.server_ver)}` : ""}${srv.rtt_ms != null ? ` · ${srv.rtt_ms} мс` : ""}`
+      + (srv.turn ? "" : "<br><span class='key-warn'>На сервере выключен TURN — звонки и демонстрации через сервер не пройдут.</span>");
+  } else if (srv.state === "connecting") text = `Подключение к ${esc(srv.addr)}…${srv.error ? `<br><span class="muted">прошлая попытка: ${esc(srv.error)}</span>` : ""}`;
+  else {
+    cls = "err";
+    // отказ сервера (пароль) и смена его ключа сами не пройдут — нужен пользователь
+    const waits = !!srv.pending_fp || /^Сервер отказал/.test(srv.error || "");
+    const next = srv.pending_fp ? "сверь ключ с владельцем сервера и нажми «Доверять новому ключу»" : waits ? "исправь и нажми «Подключиться»" : "повтор автоматически";
+    text = `${esc(srv.error || "Нет связи с сервером")} — ${next}`;
+  }
+  const se = $("#srv-state");
+  se.innerHTML = text;
+  se.className = "srv-state" + (cls ? " " + cls : "");
+  const mine = srv.my_id ? `Мой ID: <code>${esc(srvShort(srv.my_id))}</code>` : "";
+  $("#srv-key").innerHTML = srv.fp
+    ? `Ключ сервера: <code>${esc(fpGroups(srv.fp.slice(0, 32)))}…</code>${mine ? " · " + mine : ""}`
+      + (srv.pending_fp ? `<br><span class="key-warn">Сервер показал другой ключ: <code>${esc(fpGroups(srv.pending_fp.slice(0, 32)))}…</code>. Подтверждай, только если сервер переустанавливали.</span>` : "")
+    : (server ? mine : "");
+  $("#srv-trust-row").classList.toggle("hidden", !srv.pending_fp);
+  const list = srv.peers || [];
+  const live = server && srv.state === "online";
+  $("#srv-count").textContent = live ? String(list.length) : "";
+  $("#srv-peers").innerHTML = !live ? "—" : list.length
+    ? list.map((p) => `<div class="srv-peer"><b>${esc(p.name || "без имени")}</b><span class="muted">${esc(srvShort(p.id))}${p.ver ? " · " + esc(p.ver) : ""}</span></div>`).join("")
+    : "Кроме тебя — никого";
+  $("#srv-disconnect").disabled = !server;
+  if (prevMode !== srv.mode) refreshMyIp();
+  refreshSrvIce();
+}
+async function srvApply(mode) {
+  const addr = $("#srv-addr").value.trim(), pass = $("#srv-pass").value;
+  if (mode === "server" && !addr) { toast("Впиши адрес сервера", true); $("#srv-addr").focus(); renderServer(); return; }
+  try {
+    renderServer(await invoke("server_configure", { mode, addr, pass }));
+    toast(mode === "server" ? "Режим: через сервер" : "Режим: напрямую (P2P)");
+  } catch (e) { toast("" + e, true); renderServer(); }
+}
+$("#srv-mode-p2p").onchange = () => srvApply("p2p");
+$("#srv-mode-server").onchange = () => srvApply("server");
+$("#srv-connect").onclick = () => srvApply("server");
+$("#srv-disconnect").onclick = () => srvApply("p2p");
+$("#srv-addr").onkeydown = (e) => { if (e.key === "Enter") srvApply("server"); };
+$("#srv-trust").onclick = async () => {
+  const fp = srv.pending_fp;
+  if (!fp) return;
+  const ok = await askConfirm("Новый ключ сервера", `Сервер ${srv.addr} показал другой ключ (${fpGroups(fp.slice(0, 16))}…). Если сервер переустанавливали — подтверди. Если нет, это может быть подмена: лучше спроси владельца сервера.`, "Доверять");
+  if (!ok) return;
+  try { await invoke("server_trust_key", { fp }); toast("Новый ключ сервера принят"); } catch (e) { toast("" + e, true); }
+};
+async function loadServer() { try { renderServer(await invoke("server_status")); } catch {} }
 // WebKit на Linux бывает собран без WebRTC — тогда звонков и демонстраций нет вовсе.
+// Без плагина webrtc GStreamer WebKit не создаёт соединение звонка и отвечает
+// «InvalidAccessError: Bad Configuration Parameters» — объясняем заранее.
 function noRtc() {
-  if (typeof RTCPeerConnection !== "undefined") return false;
-  toast("Звонки недоступны: WebKit в системе собран без WebRTC. На Arch поставь webkit2gtk-4.1-webrtc из packaging/arch.", true);
+  if (typeof RTCPeerConnection === "undefined") {
+    toast(isElectron ? "Звонки недоступны: Chromium не предоставил WebRTC. Перезапусти SafeDrop и проверь установку Electron." : "Звонки недоступны: WebKit в системе собран без WebRTC. На Arch поставь webkit2gtk-4.1-webrtc из packaging/arch.", true);
+    return true;
+  }
+  const a = linuxAudio;
+  // без gst-plugins-base звонок тоже не выйдет: нет ни opus, ни преобразования звука
+  const need = a?.gst_base === false ? [...(a.missing || []), ...(a.call_missing || [])] : (a?.call_missing || []);
+  if (!webkitLinux() || !need.length) return false;
+  showHelp("Звонкам не хватает плагинов GStreamer",
+    `<p>Звонки и демонстрация экрана на Linux идут через WebRTC GStreamer, а в системе нет пакета <code>${esc(need.join(" "))}</code>.</p>`
+    + (a.install ? `<p>В терминале: <code>${esc(a.install)}</code></p>` : "") + "<p>После установки перезапусти SafeDrop.</p>",
+    a.can_install ? "Установить" : null, a.can_install ? installLinuxAudio : null);
   return true;
 }
 async function startCall(peerIp) {
@@ -2690,7 +2915,7 @@ async function startCall(peerIp) {
   try { await startMic(); } catch (e) { callSetupPeer = null; activeCallStartedAt = 0; micFailed(e); return; }
   try {
     ensurePC(peerIp);
-    const offer = await pc.createOffer();
+    const offer = localDesc(await pc.createOffer());
     await pc.setLocalDescription(offer);
     showCallUI(peerIp);
     ringbackStart();
@@ -2718,9 +2943,10 @@ async function acceptCall() {
   }
   try {
     ensurePC(ip);
-    await pc.setRemoteDescription(JSON.parse(sdp));
+    await pc.setRemoteDescription(linuxVoiceOffer(remoteDesc(sdp)));
+    iceInBuf.push(...takeEarlyIce(ip)); // пришли, пока звонок звенел
     await flushInIce();
-    const ans = await pc.createAnswer();
+    const ans = localDesc(await pc.createAnswer());
     await pc.setLocalDescription(ans);
     await invoke("sig_send", { peerIp: ip, payload: { kind: "call-answer", from: profile.nickname || settings.device_name, sdp: JSON.stringify(ans) } });
     showCallUI(ip);
@@ -2743,7 +2969,7 @@ function openPicker(file) {
   for (const p of peers) {
     const d = document.createElement("div");
     d.className = "pick-row";
-    d.innerHTML = `${avaHTML(p, "sm")}<div><b>${esc(dispName(p))}</b><div class="muted">${esc(p.ip)} · ${p.online ? "в сети" : "не в сети"}</div></div>`;
+    d.innerHTML = `${avaHTML(p, "sm")}<div><b>${esc(dispName(p))}</b><div class="muted">${esc(showAddr(p.ip))} · ${p.online ? "в сети" : "не в сети"}</div></div>`;
     d.onclick = async () => { $("#pick-modal").classList.add("hidden"); await selectPeer(p.ip); sendPaths(p.ip, [pendingFile]); };
     box.appendChild(d);
   }
@@ -3190,6 +3416,45 @@ document.addEventListener("pointerdown", (e) => {
   if (!e.target.closest?.("#cs-menu") && !e.target.closest?.("#cs-more")) menu.classList.add("hidden");
 });
 
+// ---------- отладка WebRTC (SAFEDROP_RTC_DEBUG=1): сводка getStats в лог ----------
+async function rtcStatsLine(name, c) {
+  if (!c || c.connectionState === "closed" || c.signalingState === "closed") return "";
+  let out = `${name}: ${c.connectionState}/${c.iceConnectionState}`;
+  try {
+    const st = await c.getStats();
+    const codecs = {};
+    st.forEach((r) => { if (r.type === "codec") codecs[r.id] = r.mimeType; });
+    st.forEach((r) => {
+      if (r.type === "outbound-rtp" || r.type === "inbound-rtp") {
+        const dir = r.type === "outbound-rtp" ? "out" : "in";
+        const fr = r.type === "outbound-rtp" ? r.framesEncoded : r.framesDecoded;
+        out += ` | ${dir} ${r.kind} ${codecs[r.codecId] || "?"} ${r.bytesSent ?? r.bytesReceived ?? 0}B`
+          + (r.kind === "video" ? ` fr=${fr ?? "-"} ${r.frameWidth || 0}x${r.frameHeight || 0}` : "")
+          + (r.packetsLost ? ` lost=${r.packetsLost}` : "");
+      }
+      if (r.type === "candidate-pair" && r.nominated && r.state === "succeeded") out += ` | pair ok`;
+    });
+  } catch (e) { out += ` | stats: ${e}`; }
+  return out;
+}
+// WebKitGTK: getStats во время закрытия соединения может намертво повесить
+// страницу — опрашиваем по одному разу за раз и только живые соединения.
+let rtcDebugBusy = false;
+async function rtcDebugTick() {
+  if (rtcDebugBusy) return;
+  rtcDebugBusy = true;
+  try { await rtcDebugCollect(); } finally { rtcDebugBusy = false; }
+}
+async function rtcDebugCollect() {
+  const lines = [];
+  if (pc) lines.push(await rtcStatsLine("call", pc));
+  for (const [ip, g] of Object.entries(gpc || {})) lines.push(await rtcStatsLine("group " + ip, g.pc));
+  for (const [sid, s] of Object.entries(myShares)) for (const [ip, c] of Object.entries(s.pcs)) lines.push(await rtcStatsLine(`share ${s.kind} ${sid}->${ip}`, c));
+  for (const [sid, v] of Object.entries(views)) lines.push(await rtcStatsLine(`view ${sid}<-${v.ip}`, v.pc));
+  for (const l of lines.filter(Boolean)) invoke("rtc_debug", { msg: l }).catch(() => {});
+}
+invoke("rtc_debug_on").then((on) => { if (on) setInterval(rtcDebugTick, 4000); }).catch(() => {});
+
 // ---------- group voice mesh ----------
 let gpc = {}, groupCall = null;
 let ginBuf = {};
@@ -3213,12 +3478,12 @@ function ensureGPC(peerIp) {
 async function flushGin(ip) {
   const g = gpc[ip];
   if (!g?.pc?.remoteDescription) return;
-  const buf = ginBuf[ip] || []; ginBuf[ip] = [];
+  const buf = [...takeEarlyIce(ip), ...(ginBuf[ip] || [])]; ginBuf[ip] = [];
   for (const cd of buf) { try { await g.pc.addIceCandidate(JSON.parse(cd)); } catch {} }
 }
 async function offerTo(peerIp, group) {
   const c = ensureGPC(peerIp);
-  const offer = await c.createOffer();
+  const offer = localDesc(await c.createOffer());
   await c.setLocalDescription(offer);
   await invoke("sig_send", { peerIp, payload: { kind: "call-offer", from: myNick(), sdp: JSON.stringify(offer), group: { id: group.id, name: group.name, members: group.members, initiator: group.initiator || myIp } } });
 }
@@ -3264,10 +3529,10 @@ function showGroupUI() {
 }
 async function acceptMeshOffer(ip, sdp) {
   const c = ensureGPC(ip);
-  await c.setRemoteDescription(JSON.parse(sdp));
+  await c.setRemoteDescription(linuxVoiceOffer(remoteDesc(sdp)));
   if (groupCall && !activeCallAnsweredAt) activeCallAnsweredAt = Date.now(); // кто-то вошёл в звонок
   await flushGin(ip);
-  const ans = await c.createAnswer();
+  const ans = localDesc(await c.createAnswer());
   await c.setLocalDescription(ans);
   await invoke("sig_send", { peerIp: ip, payload: { kind: "call-answer", from: myNick(), sdp: JSON.stringify(ans) } });
 }
@@ -3429,7 +3694,7 @@ async function startScreen() {
   const picker = (audio) => navigator.mediaDevices.getDisplayMedia({ video: videoC, audio });
   try {
     if (hostOs !== "windows") {
-      // WebKitGTK не захватывает системный звук — сразу без звука, без вопроса про WebView2
+      // Linux: WebKitGTK и Electron не захватывают системный звук; Electron выбирает экран в main/портале.
       stream = await picker(false);
       audioMode = "no-audio-linux";
     } else if (navigator.mediaDevices.getSupportedConstraints?.().restrictOwnAudio) {
@@ -3455,7 +3720,8 @@ async function startScreen() {
       console.info("[share] аудиотрек демонстрации:", audioMode);
     }
   } catch (e) {
-    if (e?.name === "NotAllowedError") return toast("Демонстрация отменена", true);
+    // Electron на отмену выбора экрана отвечает AbortError
+    if (e?.name === "NotAllowedError" || (isElectron && e?.name === "AbortError")) return toast("Демонстрация отменена", true);
     console.warn("[share] getDisplayMedia с ограничением аудио не сработал:", e);
     try {
       stream = await picker(false);
@@ -3486,6 +3752,22 @@ function updateCameraBtn() {
   b.classList.toggle("off", on);
   b.title = on ? "Выключить камеру" : "Включить камеру";
   syncCallScreenControls();
+}
+// Видео — VP8 первым. WebKitGTK (GStreamer) сам предлагает H264, а его поток
+// WebView2 на Windows не показывал. VP8 одинаково умеют обе стороны; Chromium и
+// так ставит его первым. Звук не трогаем: после setCodecPreferences WebKitGTK
+// пишет Opus как «opus/48000» без каналов, Chromium его отвергает и уходит в G722.
+function preferCodecs(conn) {
+  try {
+    const caps = RTCRtpSender.getCapabilities?.("video")?.codecs || [];
+    const vp8 = caps.filter((c) => /\/vp8$/i.test(c.mimeType));
+    if (!vp8.length) return;
+    const order = [...vp8, ...caps.filter((c) => !/\/vp8$/i.test(c.mimeType))];
+    for (const t of conn.getTransceivers()) {
+      const k = t.sender?.track?.kind || t.receiver?.track?.kind;
+      if (k === "video") { try { t.setCodecPreferences(order); } catch {} }
+    }
+  } catch {}
 }
 async function startShareStream(stream, label, withAudio, kind = "screen", audioMode = "") {
   const targets = shareTargets();
@@ -3521,7 +3803,8 @@ async function startShareStream(stream, label, withAudio, kind = "screen", audio
       c.onicecandidate = (e) => {
         if (e.candidate) invoke("sig_send", { peerIp: ip, payload: { kind: "screen-ice", from: myNick(), share_id: shareId, candidate: JSON.stringify(e.candidate) } }).catch(() => {});
       };
-      const offer = await c.createOffer();
+      if (webkitLinux()) preferCodecs(c);
+      const offer = localDesc(await c.createOffer());
       await c.setLocalDescription(offer);
       await invoke("sig_send", { peerIp: ip, payload: { kind: "screen-offer", from: myNick(), sdp: JSON.stringify(offer), share_id: shareId, label, with_audio: withAudio, call_id: callId } });
     } catch (e) { toast(`${ip}: ${e}`, true); }
@@ -3579,7 +3862,7 @@ async function acceptScreenView({ ip, sdp, share_id, label, call_id }) {
   if (views[share_id]) return;
   const c = new RTCPeerConnection(rtcConfig());
   const stream = new MediaStream();
-  views[share_id] = { pc: c, ip, label: label || `Экран • ${ip}`, callId: call_id || "", stream, volume: 100, muted: false, inbuf: [], createdAt: Date.now(), firstTrackAt: 0 };
+  views[share_id] = { pc: c, ip, label: label || `Экран • ${ip}`, callId: call_id || "", stream, volume: 100, muted: false, inbuf: takeEarlyIce("s:" + share_id), createdAt: Date.now(), firstTrackAt: 0 };
   c.ontrack = (e) => {
     try { stream.addTrack(e.track); } catch {}
     if (e.track.kind === "audio") {
@@ -3601,10 +3884,10 @@ async function acceptScreenView({ ip, sdp, share_id, label, call_id }) {
   c.onicecandidate = (e) => {
     if (e.candidate) invoke("sig_send", { peerIp: ip, payload: { kind: "screen-ice", from: myNick(), share_id, candidate: JSON.stringify(e.candidate) } }).catch(() => {});
   };
-  await c.setRemoteDescription(JSON.parse(sdp));
+  await c.setRemoteDescription(remoteDesc(sdp));
   const buf = views[share_id].inbuf; views[share_id].inbuf = [];
   for (const cd of buf) { try { await c.addIceCandidate(JSON.parse(cd)); } catch {} }
-  const ans = await c.createAnswer();
+  const ans = localDesc(await c.createAnswer());
   await c.setLocalDescription(ans);
   await invoke("sig_send", { peerIp: ip, payload: { kind: "screen-answer", from: myNick(), share_id, sdp: JSON.stringify(ans) } });
   renderStages();
@@ -3664,7 +3947,7 @@ function openWatch(id, fullscreen) {
   $("#watch-label").textContent = V.label;
   const mv = video;
   mv.muted = true;
-  mv.srcObject = V.stream;
+  if (mv.srcObject !== V.stream) mv.srcObject = V.stream;
   applyViewVolume(id);
   const modal = $("#watch-modal");
   modal.classList.remove("hidden");
@@ -3672,7 +3955,7 @@ function openWatch(id, fullscreen) {
     modal.classList.toggle("watch-fullscreen", !!fullscreen);
     $("#watch-fs").title = fullscreen ? "Выйти из полноэкранного" : "На весь экран";
   }
-  mv.play().catch((e) => toast("Не удалось воспроизвести: " + e, true));
+  mv.play().catch((e) => { if (e?.name !== "AbortError") toast("Не удалось воспроизвести: " + e, true); });
   const ctx = ampEnsure();
   try { if (settings.speaker_id && typeof ctx?.setSinkId === "function") ctx.setSinkId(settings.speaker_id).catch(() => {}); } catch {}
   if (ctx?.state === "suspended") ctx.resume().catch(() => {});
@@ -3912,7 +4195,25 @@ async function pickAndSend() {
 $("#btn-sendfile").onclick = pickAndSend;
 $("#rc-send").onclick = pickAndSend;
 $("#btn-pick-files").onclick = pickAndSend;
-$("#btn-attach").onclick = pickAndSend;
+// скрепка в чате: аудио, видео и картинки — сообщением прямо в чат, остальное — файлом
+async function pickAndAttach() {
+  if (!selectedIp && !selGroup) return toast("Сначала выбери контакт или группу", true);
+  try {
+    const paths = await invoke("pick_files");
+    if (!paths?.length) return;
+    const media = paths.filter((p) => AUDIO_EXT.test(p) || isChatVideo(p));
+    const pics = paths.filter((p) => !media.includes(p) && IMAGE_EXT.test(p));
+    const others = paths.filter((p) => !media.includes(p) && !pics.includes(p));
+    for (const p of media) {
+      try { await sendAudioToChat(p); } catch (err) { toast("" + err, true); }
+    }
+    for (const p of pics) {
+      try { await sendImageDataUrl(await invoke("read_image_dataurl", { path: p })); } catch (err) { toast("" + err, true); }
+    }
+    if (others.length) await sendPaths(selectedIp, others);
+  } catch (e) { toast("" + e, true); }
+}
+$("#btn-attach").onclick = pickAndAttach;
 $("#btn-image").onclick = pickAndSendImage;
 $("#chat-input").addEventListener("paste", async (e) => {
   const files = [...(e.clipboardData?.files || [])].filter((x) => x.type.startsWith("image/"));
@@ -4091,7 +4392,7 @@ $("#btn-save").onclick = async () => {
   settings = { ...settings, device_name: $("#set-device").value, tcp_port: parseInt($("#set-port").value) || 47831, udp_enabled: $("#set-udp").checked, udp_port: parseInt($("#set-udpport").value) || 47833, stun_enabled: $("#set-stun").checked, auto_accept_trusted: $("#set-autotrust").checked, auto_accept_limit_mb: parseInt($("#set-limit").value) || 500, autostart: $("#set-autostart").checked, minimize_to_tray: $("#set-tray").checked, ctx_menu: $("#set-ctxmenu").checked, theme: collectTheme() };
   try {
     await invoke("save_settings", { settings });
-    if ($("#set-ctxmenu").checked !== undefined) { try { await invoke("set_ctx_menu", { enabled: $("#set-ctxmenu").checked }); } catch (e) { toast("Меню проводника: " + e, true); } }
+    if (hostOs === "windows") { try { await invoke("set_ctx_menu", { enabled: $("#set-ctxmenu").checked }); } catch (e) { toast("Меню проводника: " + e, true); } }
     toast((oldPort !== settings.tcp_port || oldUdp !== settings.udp_port) ? "Сохранено. Порты сменятся после перезапуска." : "Настройки сохранены <svg class='ic' viewBox='0 0 24 24'><path d='M9,16.17,4.83,12l-1.42,1.41L9,19,21,7l-1.41-1.41Z'/></svg>");
   } catch (e) { toast("" + e, true); }
 };
@@ -4104,9 +4405,35 @@ $("#btn-firewall").onclick = async () => {
   catch (e) { showHelp("Нужно разрешение администратора", `<div class="muted left">Автоматически не вышло: ${esc(e)}<br><br>Вручную в CMD <b>от администратора</b>:<br><code>netsh advfirewall firewall add rule name="SafeDrop files" dir=in action=allow protocol=TCP localport=${settings.tcp_port}</code><br><code>netsh advfirewall firewall add rule name="SafeDrop signal" dir=in action=allow protocol=TCP localport=${settings.sig_port}</code>${settings.udp_enabled ? `<br><code>netsh advfirewall firewall add rule name="SafeDrop QUIC" dir=in action=allow protocol=UDP localport=${settings.udp_port}</code>` : ""}</div>`); }
 };
 $("#set-ctxmenu").onchange = async (e) => {
+  if (hostOs !== "windows") return;
   try { await invoke("set_ctx_menu", { enabled: e.target.checked }); settings.ctx_menu = e.target.checked; await invoke("save_settings", { settings }); toast(e.target.checked ? "Пункт в проводнике включён" : "Пункт в проводнике убран"); }
   catch (err) { toast("" + err, true); e.target.checked = false; }
+  // выключили меню — убрать и пункт из основного меню Windows 11
+  if (!e.target.checked && $("#set-win11menu")?.checked) await setWin11Menu(false);
+  refreshWin11Menu();
 };
+// Пункт в основном меню Windows 11: пакет MSIX, регистрируется один раз с правами администратора.
+async function refreshWin11Menu() {
+  const row = $("#win11-menu-row"), box = $("#set-win11menu");
+  if (!row || !box || hostOs !== "windows") return;
+  try {
+    const st = await invoke("win11_menu_status");
+    row.classList.toggle("hidden", !st.supported);
+    box.checked = !!st.enabled;
+    box.disabled = !settings?.ctx_menu && !st.enabled;
+  } catch { row.classList.add("hidden"); }
+}
+async function setWin11Menu(enabled) {
+  const box = $("#set-win11menu");
+  if (box) box.disabled = true;
+  toast(enabled ? "Windows спросит разрешение администратора…" : "Убираю пункт из основного меню…");
+  try {
+    await invoke("win11_menu_set", { enabled });
+    toast(enabled ? "Готово: «Отправить в SafeDrop» теперь в основном меню. Если не видно — перезапусти проводник." : "Пункт убран из основного меню");
+  } catch (err) { toast("Основное меню Windows 11: " + err, true); }
+  await refreshWin11Menu();
+}
+$("#set-win11menu").onchange = (e) => setWin11Menu(e.target.checked);
 $("#btn-clear-peers").onclick = async () => {
   if (!await askConfirm("Удалить ВСЕ контакты?", "Дебаг-действие.", "Удалить")) return;
   try { await invoke("clear_peers"); peers = []; selectedIp = null; renderAll(); renderChat(); toast("Контакты очищены"); }
@@ -4116,7 +4443,11 @@ $("#btn-factory-reset").onclick = async () => {
   if (!await askConfirm("ПОЛНЫЙ СБРОС?", "Стереть контакты, чаты, настройки, оформление. Папка LoadDrop с файлами останется.", "Сбросить")) return;
   if (!await askConfirm("Точно-точно?", "Всё вернётся как при первом запуске.", "Да, сбросить")) return;
   try { await invoke("factory_reset"); } catch (e) { toast("" + e, true); return; }
-  try { localStorage.removeItem(PIN_STORE); } catch {}
+  try {
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith("safedrop-") || key.startsWith("sd.") || key.startsWith("sd-")) localStorage.removeItem(key);
+    }
+  } catch {}
   location.reload();
 };
 $("#btn-clear-cache").onclick = async () => {
@@ -4126,6 +4457,7 @@ $("#btn-clear-cache").onclick = async () => {
 $("#btn-test-notify").onclick = () => invoke("test_notify").then((r) => toast(r)).catch((e) => toast("" + e, true));
 $("#btn-notif-win").onclick = () => invoke("open_notif_settings").catch((e) => toast("" + e, true));
 $("#btn-ctx-refresh").onclick = async () => {
+  if (hostOs !== "windows") return;
   try {
     const n = await invoke("refresh_ctx_menu");
     toast(settings.ctx_menu ? `Контактов в подменю: ${n}` : "Меню выключено — включи галочку выше");
@@ -4336,7 +4668,7 @@ async function saveMicProcessingSettings() {
     await invoke("save_settings", { settings });
     const constraints = {
       echoCancellation: { ideal: settings.echo_cancellation !== false },
-      noiseSuppression: { ideal: (settings.noise_filter || "rnnoise") === "webrtc" },
+      noiseSuppression: { ideal: (settings.noise_filter || "rnnoise") === "webrtc" || (webkitLinux() && (settings.noise_filter || "rnnoise") !== "off") },
       autoGainControl: { ideal: settings.auto_gain_control !== false },
     };
     await Promise.all(localStream?.getAudioTracks().map((track) => track.applyConstraints(constraints).catch(() => {})) || []);
@@ -4484,6 +4816,24 @@ function cmpVer(a, b) {
 }
 let updPath = null, updVer = "", updOffer = null;
 const updSkip = new Set();
+let linuxInstalledVersion = hostOs === "linux" ? bootBuild.version : "";
+let linuxLatestVersion = "";
+if (hostOs === "linux") $("#updates-pane").classList.add("hidden");
+function noteLinuxUpdate(version) {
+  if (!linuxInstalledVersion || typeof version !== "string" || !/^\d{1,9}\.\d{1,9}\.\d{1,9}$/.test(version)) return;
+  if (cmpVer(version, linuxLatestVersion || linuxInstalledVersion) <= 0) return;
+  linuxLatestVersion = version;
+  const message = `Есть новая версия SafeDrop ${version}. Обновите пакет или AppImage.`;
+  const info = $("#linux-update-info");
+  info.textContent = message;
+  info.classList.remove("hidden");
+  toast(message);
+}
+function checkLinuxPeerVersions() {
+  if (hostOs !== "linux" || !linuxInstalledVersion) return;
+  const versions = peers.filter((p) => p.online && typeof p.version === "string").map((p) => p.version);
+  versions.sort((a, b) => cmpVer(b, a)).forEach(noteLinuxUpdate);
+}
 async function refreshMyVer() {
   try {
     const b = await invoke("get_build_info");
@@ -4492,6 +4842,7 @@ async function refreshMyVer() {
   } catch { return "0.0.0"; }
 }
 $("#btn-upd-pick").onclick = async () => {
+  if (hostOs === "linux") return;
   try {
     const paths = await invoke("pick_files");
     const p = (paths || [])[0]; if (!p) return;
@@ -4500,6 +4851,7 @@ $("#btn-upd-pick").onclick = async () => {
   } catch (e) { toast("" + e, true); }
 };
 $("#btn-upd-send").onclick = async () => {
+  if (hostOs === "linux") return;
   if (!updPath) return toast("Сначала выбери установщик SafeDrop (.exe)", true);
   if (!/\.exe$/i.test(fileName(updPath))) return toast("Для обновления выбери установщик SafeDrop (.exe)", true);
   const targets = peers.filter((p) => p.online);
@@ -4521,6 +4873,7 @@ $("#btn-upd-send").onclick = async () => {
 };
 $("#upd-no").onclick = () => { if (updOffer) updSkip.add(updOffer.version + updOffer.path); $("#update-modal").classList.add("hidden"); updOffer = null; };
 $("#upd-yes").onclick = async () => {
+  if (hostOs === "linux") return;
   const o = updOffer; $("#update-modal").classList.add("hidden"); updOffer = null;
   if (!o) return;
   toast("Запускаю установщик…");
@@ -4535,7 +4888,7 @@ $("#upd-yes").onclick = async () => {
 const updAsked = new Set();
 let updMyVer = "";
 async function updCheckCallPeers() {
-  if (isDemo || typeof inVoice !== "function" || !inVoice()) return;
+  if (hostOs === "linux" || isDemo || typeof inVoice !== "function" || !inVoice()) return;
   if (!$("#confirm-modal").classList.contains("hidden")) return;
   if (!updMyVer) updMyVer = await refreshMyVer();
   const ips = currentCall ? [currentCall] : (groupCall ? groupCall.members : []);
@@ -4577,7 +4930,7 @@ async function updOfferSend(p, theirs) {
   const tb = $("#topbar");
   const interactive = (e) => e.target.closest("input,button,select,textarea,a");
   const bindDrag = (el) => {
-    if (!el) return;
+    if (!el || isElectron) return; // в Electron drag и двойной щелчок обрабатывает ОС через CSS
     el.addEventListener("mousedown", (e) => {
       if (e.button !== 0 || interactive(e)) return;
       invoke("win_drag").catch(() => {});
@@ -4591,7 +4944,8 @@ async function updOfferSend(p, theirs) {
   bindDrag($("#call-screen .cs-top"));
 })();
 $("#btn-min").onclick = () => invoke("win_min").catch((e) => toast("" + e, true));
-$("#btn-close").onclick = () => closeAppWindow(false);
+// «Сворачивать в трей» выключено — крестик закрывает программу
+$("#btn-close").onclick = () => closeAppWindow(settings?.minimize_to_tray === false);
 $("#btn-max").onclick = () => invoke("win_max_toggle").catch((e) => toast("" + e, true));
 $("#cm-accept").onclick = async () => {
   if (pendingOffer?.group) {
@@ -4726,7 +5080,7 @@ async function sendAudioToChat(path, opts = {}) {
   if (!targets.length) { toast("Нет получателей в сети", true); return null; }
   let audio = path;
   try { audio = await invoke("stage_chat_audio", { path }); } catch {}
-  toast(`Отправка аудио ${fileName(audio)}…`);
+  toast(`Отправка ${isChatVideo(audio) ? "видео" : "аудио"} ${fileName(audio)}…`);
   let ok = 0;
   for (const t of targets) {
     try { await invoke("send_file", { peerIp: t, filePath: audio }); ok++; }
@@ -4763,7 +5117,8 @@ try {
     if (!selectedIp && !selGroup) return toast("Сначала выбери контакт или группу", true);
     if (!paths.length) return;
     const onChat = dropOnChat(e.payload?.position);
-    const audioFiles = onChat ? paths.filter((p) => AUDIO_EXT.test(p)) : [];
+    // аудио и видео на чат — сообщением с проигрывателем, остальное — обычной передачей
+    const audioFiles = onChat ? paths.filter((p) => AUDIO_EXT.test(p) || isChatVideo(p)) : [];
     const imageFiles = onChat ? paths.filter((p) => IMAGE_EXT.test(p)) : [];
     const others = paths.filter((p) => !audioFiles.includes(p) && !imageFiles.includes(p));
     for (const p of audioFiles) {
@@ -5073,6 +5428,7 @@ try {
   await listen("safedrop-quit-requested", () => closeAppWindow(true));
   await listen("safedrop-peers", async (e) => {
     peers = Array.isArray(e.payload) ? e.payload : await invoke("get_peers").catch(() => peers);
+    checkLinuxPeerVersions();
     if (!sel() && !selGroup && peers.length) { selectedIp = peers[0].ip; try { chats[selectedIp] = await invoke("get_chat", { peerIp: selectedIp }); chats[selectedIp].forEach((m) => seenIds.add(m.id)); } catch {} }
     renderAll(); renderChat(); renderCallStage();
   });
@@ -5189,7 +5545,7 @@ try {
     const t = e.payload;
     if (pc && currentCall === t.ip) {
       try {
-        await pc.setRemoteDescription(JSON.parse(t.sdp));
+        await pc.setRemoteDescription(remoteDesc(t.sdp));
         await flushInIce();
         if (!activeCallAnsweredAt) activeCallAnsweredAt = Date.now();
         ringbackStop();
@@ -5200,7 +5556,7 @@ try {
     const g = gpc[t.ip];
     if (g) {
       try {
-        await g.pc.setRemoteDescription(JSON.parse(t.sdp));
+        await g.pc.setRemoteDescription(remoteDesc(t.sdp));
         await flushGin(t.ip);
         if (groupCall && !activeCallAnsweredAt) activeCallAnsweredAt = Date.now();
         ringbackStop();
@@ -5219,7 +5575,10 @@ try {
     if (g) {
       if (g.pc.remoteDescription) { try { await g.pc.addIceCandidate(JSON.parse(t.candidate)); } catch {} }
       else { ginBuf[t.ip] = ginBuf[t.ip] || []; ginBuf[t.ip].push(t.candidate); }
+      return;
     }
+    // звонок ещё звенит (или приглашение не дошло): кандидат подождёт ответа
+    earlyIcePush(t.ip, t.candidate);
   });
   await listen("safedrop-hangup", (e) => {
     const ip = e.payload?.ip;
@@ -5254,7 +5613,11 @@ try {
     if (selGroup && !curGroup()) { selGroup = null; renderConv(); renderPeerCard(); renderChat(); }
   });
   await listen("safedrop-key-changed", (e) => onKeyChanged(e.payload || {}));
+  await listen("safedrop-server", (e) => renderServer(e.payload));
+  loadServer();
+  await listen("safedrop-linux-update-available", (e) => noteLinuxUpdate(e.payload));
   await listen("safedrop-update-offer", async (e) => {
+    if (hostOs === "linux") return;
     const { version, path, peer, filename, signed, sig_error } = e.payload;
     // ставим только установщик с подписью SafeDrop (проверена в Rust); без неё —
     // ни окна, ни кнопки «всё равно установить»
@@ -5278,7 +5641,7 @@ try {
   await listen("safedrop-screen-answer", async (e) => {
     const t = e.payload;
     const c = myShares[t.share_id]?.pcs[t.ip];
-    if (c && !c.remoteDescription) { try { await c.setRemoteDescription(JSON.parse(t.sdp)); } catch {} }
+    if (c && !c.remoteDescription) { try { await c.setRemoteDescription(remoteDesc(t.sdp)); } catch {} }
     const buf = sinBuf[t.share_id + t.ip] || []; delete sinBuf[t.share_id + t.ip];
     for (const cd of buf) { try { await c?.addIceCandidate(JSON.parse(cd)); } catch {} }
   });
@@ -5294,7 +5657,10 @@ try {
     if (v) {
       if (v.pc.remoteDescription) { try { await v.pc.addIceCandidate(JSON.parse(t.candidate)); } catch {} }
       else v.inbuf.push(t.candidate);
+      return;
     }
+    // кандидат обогнал само предложение показа (через сервер — разные каналы)
+    earlyIcePush("s:" + t.share_id, t.candidate);
   });
   await listen("safedrop-screen-stop", async (e) => {
     const t = e.payload;
@@ -5943,7 +6309,7 @@ async function wtRenderChat() {
   await wtChatEnsure(key);
   const rows = (chats[key] || []).slice(-50);
   list.innerHTML = rows.length ? rows.map((m) => {
-    const text = m.text || ((m.images && m.images.length) || m.image ? "🖼 картинка" : m.audio ? "🎵 аудио" : "");
+    const text = m.text || ((m.images && m.images.length) || m.image ? "🖼 картинка" : m.audio ? (isChatVideo(m.audio) ? "🎬 видео" : "🎵 аудио") : "");
     return `<div class="wt-cm${m.from_me ? " me" : ""}"><b>${esc(m.from_me ? "Ты" : (m.from_nick || "?"))}</b><span>${esc(text)}</span></div>`;
   }).join("") : '<div class="wt-chat-empty">Сообщений пока нет — напишите первым.</div>';
   list.scrollTop = list.scrollHeight;
@@ -5990,7 +6356,7 @@ async function wtChatSendHistory() {
     else { const p = callPeerByIp(currentCall); title = p ? dispName(p) : currentCall; }
     messages = (chats[key] || []).slice(-80).map((m) => ({
       from: m.from_nick || "", mine: !!m.from_me, ts: m.ts || "",
-      text: m.text || ((m.images && m.images.length) || m.image ? "🖼 картинка" : m.audio ? "🎵 аудио" : ""),
+      text: m.text || ((m.images && m.images.length) || m.image ? "🖼 картинка" : m.audio ? (isChatVideo(m.audio) ? "🎬 видео" : "🎵 аудио") : ""),
     }));
   }
   invoke("ytb_chat_history", { data: { inCall: !!key, title, messages } }).catch(() => {});

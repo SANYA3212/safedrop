@@ -238,6 +238,7 @@ pub async fn run_server(app: AppHandle, port: u16) {
                     Ok(()) => s,
                     Err(e) => { eprintln!("conn error: {e}"); return; }
                 },
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return,
                 Err(e) => { eprintln!("conn error: {e}"); return; }
             };
             if let Err(e) = handle_conn(app2, sock, peer_addr.to_string(), drop_dir).await {
@@ -245,6 +246,12 @@ pub async fn run_server(app: AppHandle, port: u16) {
             }
         });
     }
+}
+
+/// Входящий файл по каналу через сервер (TLS и ключ уже проверены).
+pub(crate) async fn serve_relayed(app: AppHandle, sock: crate::tls::Stream, peer_ip: String) -> Result<(), String> {
+    let drop_dir = app.state::<crate::state::AppState>().settings.lock().await.loaddrop_dir.clone();
+    handle_conn(app, sock, peer_ip, drop_dir).await.map_err(|e| e.to_string())
 }
 
 async fn handle_conn(
@@ -307,6 +314,14 @@ pub(crate) async fn authorize_offer(app: &AppHandle, offer: &Offer, peer_ip: &st
         let settings = state.settings.lock().await;
         (settings.auto_accept_trusted, settings.auto_accept_limit_mb)
     };
+    #[cfg(target_os = "linux")]
+    if offer.kind == "update" {
+        // Only the version is useful on Linux. Reject before reading the installer.
+        if offer.size <= MAX_UPDATE_SIZE && state.peers.lock().await.contains_key(peer_ip) {
+            let _ = app.emit("safedrop-linux-update-available", &offer.version);
+        }
+        return false;
+    }
     let trusted = state.peers.lock().await.get(peer_ip).map(|p| p.trusted).unwrap_or(false);
     // An update offer is followed by a separate, explicit install prompt after
     // download. Do not block the transfer behind the generic file approval UI.
@@ -326,11 +341,8 @@ pub(crate) async fn authorize_offer(app: &AppHandle, offer: &Offer, peer_ip: &st
         "id": offer.id, "filename": sanitize(&offer.name), "size": offer.size,
         "peer": peer_ip, "sender": sender,
     }));
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
+    // в Linux через Electron окно показывает Electron (main.rs: focus_main)
+    crate::focus_main(app);
     let response = tokio::time::timeout(std::time::Duration::from_secs(120), rx).await;
     state.incoming_file_requests.lock().await.remove(&offer.id);
     matches!(response, Ok(Ok(true)))
@@ -360,21 +372,14 @@ pub(crate) async fn receive_stream(
     };
     let _ = tokio::fs::create_dir_all(&target_dir).await;
     let final_path = Path::new(&target_dir).join(&safe_name);
-    // avoid overwrite: file (1).ext
-    let final_path = unique_path(final_path);
     let resumable = resume.is_some();
     let (part_path, offset) = match resume {
         Some((p, have)) => {
             if let Some(dir) = p.parent() { let _ = tokio::fs::create_dir_all(dir).await; }
             (p, have)
         }
-        // named after the transfer, not the file: photo.jpg and photo.png
-        // arriving together used to share one temp file
-        None => {
-            let tag: String = offer.id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect();
-            let tag = if tag.is_empty() { safe_name.clone() } else { tag };
-            (Path::new(&target_dir).join(format!(".{tag}.safedrop-part")), 0)
-        }
+        // Each non-resumable receive owns its partial even if offer IDs coincide.
+        None => (Path::new(&target_dir).join(format!(".{}.safedrop-part", uuid::Uuid::new_v4())), 0),
     };
     static NEXT_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let owner = NEXT_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -512,18 +517,28 @@ pub(crate) async fn receive_stream(
         return Ok(());
     }
     part_owners().lock().unwrap_or_else(|e| e.into_inner()).remove(&part_path);
-    // another download may have taken this name while we were receiving
-    let final_path = unique_path(final_path);
-    if tokio::fs::rename(&part_path, &final_path).await.is_err() {
-        // antivirus/file lock can hold the fresh file briefly — one retry
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
+    let publish = || {
+        let part = part_path.clone();
+        let requested = final_path.clone();
+        tokio::task::spawn_blocking(move || publish_received(&part, &requested))
+    };
+    let published = match publish().await? {
+        Ok(path) => Ok(path),
+        Err(_) => {
+            // Antivirus or a file lock can hold the fresh file briefly.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            publish().await?
+        }
+    };
+    let final_path = match published {
+        Ok(path) => path,
+        Err(e) => {
             let msg = format!("can't move into place: {e}");
             remove_partial(&part_path).await;
             set_transfer_error(&app, &id, &msg).await;
             return Err(anyhow::anyhow!(msg));
         }
-    }
+    };
     if resumable { let _ = tokio::fs::remove_file(partial_meta_path(&part_path)).await; }
     let hash = hex::encode(hasher.finalize());
     println!("received {} ({} bytes, sha256 {})", final_path.display(), done, hash);
@@ -580,7 +595,7 @@ pub async fn send_file_to(
     let resume = kind == "file" && peer_supports_resume(&app, &peer_ip).await;
     let fkey = if resume { file_key(&prep) } else { String::new() };
     let mut attempt = 0u32;
-    let result = loop {
+    loop {
         attempt += 1;
         let r = send_attempt(&app, &peer_ip, port, &prep, &device_name, &kind, require_confirmation, &version, &sig, resume, &fkey, attempt > 1).await;
         match r {
@@ -596,9 +611,7 @@ pub async fn send_file_to(
             }
             Err(SendErr::Retry(msg)) | Err(SendErr::Fatal(msg)) => break Err(msg),
         }
-    };
-    if let Some(z) = &prep.tmp_zip { let _ = std::fs::remove_file(z); }
-    result
+    }
 }
 
 /// Ошибка попытки отправки: Retry — связь, имеет смысл повторить; Fatal — нет.
@@ -671,12 +684,25 @@ pub(crate) struct UploadPrep {
     pub total: u64,
     pub fname: String,
     pub id: String,
-    pub tmp_zip: Option<std::path::PathBuf>,
+    tmp_zip: Option<PathBuf>,
+}
+
+impl Drop for UploadPrep {
+    fn drop(&mut self) {
+        if let Some(zip) = &self.tmp_zip {
+            let _ = std::fs::remove_file(zip);
+        }
+    }
 }
 
 /// Shared upload preparation (exists check, dir zip, metadata).
 pub(crate) async fn prepare_upload(file_path: &str) -> Result<UploadPrep, String> {
-    let path = Path::new(&file_path);
+    let path = PathBuf::from(file_path);
+    tokio::task::spawn_blocking(move || prepare_upload_blocking(&path))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn prepare_upload_blocking(path: &Path) -> Result<UploadPrep, String> {
     if !path.exists() { return Err("file not found".into()); }
     // directory -> zip it first
     let mut tmp_zip: Option<std::path::PathBuf> = None;
@@ -786,16 +812,125 @@ pub(crate) fn sanitize(name: &str) -> String {
     base.chars().map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c }).collect()
 }
 
-fn unique_path(p: std::path::PathBuf) -> std::path::PathBuf {
-    if !p.exists() { return p; }
-    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_string();
-    let ext = p.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
-    let parent = p.parent().map(|x| x.to_path_buf()).unwrap_or(std::path::PathBuf::from("."));
-    for i in 1..1000 {
-        let cand = parent.join(format!("{stem} ({i}){ext}"));
-        if !cand.exists() { return cand; }
+fn publish_received(part: &Path, requested: &Path) -> std::io::Result<PathBuf> {
+    let stem = requested.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = requested.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    for suffix in 0..=u32::MAX {
+        let path = if suffix == 0 {
+            requested.to_path_buf()
+        } else {
+            requested.with_file_name(format!("{stem} ({suffix}){ext}"))
+        };
+        match move_without_replacing(part, &path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
     }
-    p
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no unused filename"))
+}
+
+#[cfg(target_os = "linux")]
+fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    use rustix::io::Errno;
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(Errno::NOSYS | Errno::INVAL | Errno::NOTSUP | Errno::XDEV) => link_or_copy_without_replacing(from, to),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(windows))]
+fn link_or_copy_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    match std::fs::hard_link(from, to) {
+        Ok(()) => {}
+        Err(e) if matches!(e.kind(), ErrorKind::Unsupported | ErrorKind::PermissionDenied | ErrorKind::CrossesDevices) => {
+            // Some shared folders support neither RENAME_NOREPLACE nor hard links.
+            let mut source = std::fs::File::open(from)?;
+            let mut dest = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+            if let Err(e) = std::io::copy(&mut source, &mut dest) {
+                drop(dest);
+                let _ = std::fs::remove_file(to);
+                return Err(e);
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+use link_or_copy_without_replacing as move_without_replacing;
+
+#[cfg(windows)]
+fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use windows::{core::HSTRING, Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS}};
+
+    // Canonicalize only the parent to retain extended-length path support.
+    let wide_path = |path: &Path| {
+        if path.as_os_str().as_encoded_bytes().contains(&0) {
+            return Err(Error::new(ErrorKind::InvalidInput, "file path contains NUL"));
+        }
+        let name = path.file_name().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "missing filename"))?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        Ok(HSTRING::from(std::fs::canonicalize(parent)?.join(name).as_path()))
+    };
+    if to.symlink_metadata().is_ok() {
+        return Err(ErrorKind::AlreadyExists.into());
+    }
+    let from = wide_path(from)?;
+    let to = wide_path(to)?;
+    // With zero flags, an existing destination makes the move fail.
+    unsafe { MoveFileExW(&from, &to, MOVE_FILE_FLAGS(0)) }.map_err(|e| {
+        let code = e.code().0 as u32;
+        if code & 0xffff0000 == 0x80070000 {
+            Error::from_raw_os_error((code & 0xffff) as i32)
+        } else {
+            Error::other(e)
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn write_folder_zip(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+
+    let mut temp = tempfile::NamedTempFile::new_in(dst.parent().unwrap_or(Path::new(".")))?;
+    let archive = temp.as_file().metadata()?;
+    let mut writer = ZipWriter::new(temp.as_file_mut());
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    // Match the old zip -r: paths are relative to the folder, including dotfiles
+    // and empty directories, and symlinks to files/directories are dereferenced.
+    for entry in walkdir::WalkDir::new(src).min_depth(1).follow_links(true) {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if (meta.dev(), meta.ino()) == (archive.dev(), archive.ino()) {
+            continue; // The user can select a folder containing our temp archive.
+        }
+        let relative = entry.path().strip_prefix(src)?;
+        let name = relative.to_str().ok_or_else(|| anyhow::anyhow!("Имя файла в папке должно быть в UTF-8"))?;
+        if name.contains(['\\', ':']) {
+            anyhow::bail!("Имя файла в папке содержит символ, несовместимый с ZIP на Windows: {name}");
+        }
+        let options = options.unix_permissions(meta.mode() & 0o777);
+        if meta.is_dir() {
+            writer.add_directory(name, options)?;
+        } else if meta.is_file() {
+            writer.start_file(name, options.large_file(meta.len() >= u32::MAX as u64))?;
+            std::io::copy(&mut std::fs::File::open(entry.path())?, &mut writer)?;
+        } else {
+            anyhow::bail!("В папке есть специальный файл, который нельзя отправить: {name}");
+        }
+    }
+    writer.finish()?;
+    temp.persist_noclobber(dst)?;
+    Ok(())
 }
 
 fn zip_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
@@ -810,7 +945,11 @@ fn zip_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
         if st.success() { return Ok(()); }
         anyhow::bail!("Compress-Archive failed");
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        write_folder_zip(src, dst)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let st = std::process::Command::new("zip")
             .arg("-qr").arg(dst).arg(".")
@@ -901,7 +1040,56 @@ mod hex {
 
 #[cfg(test)]
 mod resume_tests {
-    use super::{parse_ver, part_meta_matches, partial_meta_path, partial_path, valid_fkey, RESUME_SINCE};
+    use super::{parse_ver, part_meta_matches, partial_meta_path, partial_path, publish_received, valid_fkey, RESUME_SINCE};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn folder_zip_has_relative_paths_and_empty_directories() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        std::fs::create_dir(root.join("вложено")).unwrap();
+        std::fs::write(root.join("вложено/.hidden"), b"data").unwrap();
+        let archive = root.join("out.zip");
+        super::zip_dir(root, &archive).unwrap();
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(archive).unwrap()).unwrap();
+        assert_eq!(zip.len(), 3);
+        assert!(zip.by_name("empty/").unwrap().is_dir());
+        let mut data = Vec::new();
+        zip.by_name("вложено/.hidden").unwrap().read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"data");
+    }
+
+    #[test]
+    fn simultaneous_downloads_keep_both_files_and_existing_name() {
+        let dir = std::env::temp_dir().join(format!("safedrop-publish-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("same.txt");
+        std::fs::write(&target, b"original").unwrap();
+        let first = dir.join("first.part");
+        let second = dir.join("second.part");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+
+        let start = std::sync::Barrier::new(2);
+        let (one, two) = std::thread::scope(|scope| {
+            let one = scope.spawn(|| {
+                start.wait();
+                publish_received(&first, &target).unwrap()
+            });
+            start.wait();
+            let two = publish_received(&second, &target).unwrap();
+            (one.join().unwrap(), two)
+        });
+        assert_ne!(one, two);
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read(one).unwrap(), b"first");
+        assert_eq!(std::fs::read(two).unwrap(), b"second");
+        assert!(!first.exists() && !second.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn resume_only_for_the_same_accepted_file() {

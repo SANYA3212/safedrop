@@ -34,6 +34,8 @@ body { font-family: var(--font); color: var(--text); overflow: hidden; backgroun
 
 /* топбар */
 #topbar { display: flex; align-items: center; gap: 12px; background: var(--panel); backdrop-filter: blur(var(--blur)); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px 8px 16px; }
+html.electron :is(#topbar, #call-screen .cs-top) { -webkit-app-region: drag; }
+html.electron :is(#topbar, #call-screen .cs-top) :is(button, input, select, textarea, a, label, [role="button"], [tabindex], [contenteditable], .cs-ico) { -webkit-app-region: no-drag; }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 17px; white-space: nowrap; }
 .brand-logo { width: 30px; height: 30px; border-radius: 50%; object-fit: cover; filter: drop-shadow(0 2px 6px rgba(91,140,255,.6)); }
 .brand-ver { font-size: 10px; font-weight: 700; color: #fff; background: linear-gradient(135deg,var(--accent),var(--accent2)); border-radius: 99px; padding: 2px 8px; }
@@ -214,6 +216,10 @@ body:not(.details-open) #details { display: none; }
 #group-members { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow-y: auto; margin: 6px 0; }
 #group-members label { background: var(--card); border-radius: 10px; padding: 6px 10px; margin: 0; cursor: pointer; }
 #group-members input { width: auto; }
+.chat-video { width: 420px; max-width: 100%; margin: 6px 0; }
+.chat-video video { display: block; width: 100%; max-height: 320px; border-radius: 12px; border: 1px solid var(--line); background: #000; }
+.chat-video-error { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--muted); border-radius: 12px; background: var(--panel2); color: var(--text); }
+.chat-video-error.hidden, .chat-video video.hidden { display: none; }
 .chat-img { max-width: 320px; max-height: 240px; border-radius: 12px; margin-top: 6px; cursor: zoom-in; border: 1px solid var(--line); display: block; }
 #img-full { max-width: 70vw; max-height: 70vh; border-radius: 14px; }
 /* оверлей просмотра демонстрации */
@@ -294,7 +300,7 @@ input[type="range"] { padding: 0; }
 .linux-audio code, #help-body code { background: var(--input); border: 1px solid var(--line); padding: 1px 6px; border-radius: 6px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; user-select: text; }
 /* WebKitGTK рисует <select> по теме GTK: светлый фон под светлым текстом темы.
    Свой вид — фон и стрелка из темы SafeDrop (сам выпадающий список остаётся системным). */
-html.os-linux select { -webkit-appearance: none; appearance: none; background-color: var(--input); color: var(--text); padding-right: 28px;
+html.os-linux:not(.electron) select { -webkit-appearance: none; appearance: none; background-color: var(--input); color: var(--text); padding-right: 28px;
   background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
   background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
 
@@ -763,3 +769,19 @@ details.set-sec > .card:first-of-type { border-top: 0; }
 .forward-targets button { text-align:left; }
 .mstatus.read { color: var(--accent); }
 #btn-record-audio.rec { color: #ff6b6b; }
+
+/* вкладка «Сервер» */
+.srv-badge { font-size: 10px; font-weight: 700; border-radius: 99px; padding: 1px 7px; margin-left: 6px; background: var(--hover); color: var(--muted); }
+.srv-badge:empty { display: none; }
+.srv-badge.on { background: rgba(35,165,89,.2); color: #3ddc84; }
+.srv-badge.wait { background: rgba(245,197,24,.18); color: #f5c518; }
+.srv-badge.err { background: rgba(218,55,60,.2); color: #ff8085; }
+.srv-state { margin-top: 6px; line-height: 1.45; word-break: break-word; }
+.srv-state.on { color: #3ddc84; }
+.srv-state.err { color: #ff8085; }
+.srv-key { margin-top: 4px; line-height: 1.5; word-break: break-all; }
+.srv-key:empty { display: none; }
+.srv-key code { color: var(--text); font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+.srv-peer { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; }
+.srv-peer b { color: var(--text); font-weight: 600; }
+.brand-ver.srv { background: linear-gradient(135deg,#23a559,#1a7f8f); }

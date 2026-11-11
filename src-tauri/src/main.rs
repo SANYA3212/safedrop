@@ -2,9 +2,12 @@
 
 mod discovery;
 #[cfg(target_os = "linux")]
+mod electron;
+#[cfg(target_os = "linux")]
 mod linuxaudio;
 mod peers_cmd;
 mod quic;
+mod relay;
 mod settings;
 mod signal;
 mod state;
@@ -40,10 +43,13 @@ async fn save_settings(
         let mut s = settings;
         s.profile = g.profile.clone();
         s.loaddrop_dir = g.loaddrop_dir.clone();
+        #[cfg(target_os = "linux")]
+        settings::apply_autostart(s.autostart).map_err(|e| format!("Автозапуск: {e}"))?;
         *g = s.clone();
         s
     };
     settings::persist_settings(&state);
+    #[cfg(not(target_os = "linux"))]
     let _ = settings::apply_autostart(settings.autostart);
     let _ = app.emit("safedrop-settings", settings);
     Ok(())
@@ -81,6 +87,8 @@ async fn save_profile(
     }
     settings::persist_settings(&state);
     let _ = app.emit("safedrop-profile", p.clone());
+    let shown = if p.nickname.is_empty() { state.settings.lock().await.device_name.clone() } else { p.nickname.clone() };
+    relay::send_name(&shown);
     // push to everyone
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -248,6 +256,21 @@ async fn refresh_live(app: &tauri::AppHandle, state: &tauri::State<'_, AppState>
 }
 
 async fn refresh_live_inner(app: &tauri::AppHandle, state: &tauri::State<'_, AppState>) -> Vec<Peer> {
+    // режим «через сервер»: кто в сети — знает сервер, сеть не сканируем,
+    // а контакты LAN/Radmin в этом режиме недоступны
+    if relay::active() {
+        {
+            let mut g = state.peers.lock().await;
+            for p in g.values_mut().filter(|p| !relay::is_relay(&p.ip)) {
+                p.online = false;
+                p.ping_ms = None;
+            }
+        }
+        relay::apply_presence(app).await;
+        let peers: Vec<Peer> = state.peers.lock().await.values().cloned().collect();
+        let _ = app.emit("safedrop-peers", peers.clone());
+        return peers;
+    }
     // adapters for the scan: user filter (settings.scan_adapters, empty = all),
     // signature stored so loop-level code can notice network changes too
     let ads_all = discovery::my_adapters();
@@ -416,7 +439,11 @@ async fn stage_chat_audio(state: tauri::State<'_, AppState>, path: String) -> Re
     }
     let id = uuid::Uuid::new_v4().simple().to_string();
     let dst = dir.join(format!("{stem}-{}.{ext}", &id[..8]));
-    std::fs::copy(src, &dst).map_err(|e| e.to_string())?;
+    // видео бывают по нескольку ГБ: на том же диске — жёсткая ссылка без копирования,
+    // иначе копия без блокировки потоков рантайма
+    if std::fs::hard_link(src, &dst).is_err() {
+        tokio::fs::copy(src, &dst).await.map_err(|e| e.to_string())?;
+    }
     Ok(dst.to_string_lossy().to_string())
 }
 
@@ -460,8 +487,17 @@ fn audio_ext_ok(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
         .and_then(|s| s.to_str())
-        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "mp3" | "wav" | "ogg" | "m4a" | "flac" | "webm"))
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            matches!(e.as_str(), "mp3" | "wav" | "ogg" | "m4a" | "flac" | "webm") || video_ext(&e)
+        })
         .unwrap_or(false)
+}
+
+/// Видео в чате идёт тем же путём, что и аудио (поле `audio` — «медиафайл сообщения»):
+/// сначала файл обычной передачей, потом сообщение с его именем.
+fn video_ext(ext: &str) -> bool {
+    matches!(ext, "mp4" | "m4v" | "mov" | "mkv")
 }
 
 fn audio_file_name(path: &str) -> String {
@@ -1132,6 +1168,9 @@ async fn send_update(
     peer_ip: String,
     file_path: String,
 ) -> Result<String, String> {
+    if cfg!(target_os = "linux") {
+        return Err("На Linux обновите пакет или AppImage".into());
+    }
     let extension = std::path::Path::new(&file_path)
         .extension().and_then(|s| s.to_str()).unwrap_or("");
     if !extension.eq_ignore_ascii_case("exe") {
@@ -1391,10 +1430,23 @@ async fn open_notif_settings() -> Result<(), String> {
 
 // ---------- native dialogs (real paths for Tauri WebView) ----------
 
+/// Диалог выбора поверх окна SafeDrop. Без владельца Windows открывал его на
+/// другом мониторе или под окнами. На Linux его и так ставит портал рабочего стола.
+fn file_dialog(app: &tauri::AppHandle) -> rfd::FileDialog {
+    let d = rfd::FileDialog::new();
+    #[cfg(windows)]
+    if let Some(w) = app.get_webview_window("main") {
+        return d.set_parent(&w);
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+    d
+}
+
 #[tauri::command]
-async fn pick_files() -> Result<Vec<String>, String> {
-    tokio::task::spawn_blocking(|| {
-        rfd::FileDialog::new()
+async fn pick_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        file_dialog(&app)
             .set_title("Выбери файлы для отправки")
             .pick_files()
             .map(|v| v.into_iter().map(|p| p.to_string_lossy().to_string()).collect())
@@ -1405,9 +1457,9 @@ async fn pick_files() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn pick_image() -> Result<Option<String>, String> {
-    tokio::task::spawn_blocking(|| {
-        rfd::FileDialog::new()
+async fn pick_image(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        file_dialog(&app)
             .set_title("Выбери картинку")
             .add_filter("image", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
             .pick_file()
@@ -1418,9 +1470,9 @@ async fn pick_image() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-async fn pick_folder() -> Result<Option<String>, String> {
-    tokio::task::spawn_blocking(|| {
-        rfd::FileDialog::new()
+async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        file_dialog(&app)
             .set_title("Выбери папку")
             .pick_folder()
             .map(|p| p.to_string_lossy().to_string())
@@ -1430,9 +1482,9 @@ async fn pick_folder() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-async fn pick_audio() -> Result<Option<String>, String> {
-    tokio::task::spawn_blocking(|| {
-        rfd::FileDialog::new()
+async fn pick_audio(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        file_dialog(&app)
             .set_title("Выбери мелодию звонка")
             .add_filter("audio", &["mp3", "wav", "ogg", "m4a", "flac"])
             .pick_file()
@@ -1530,6 +1582,16 @@ async fn factory_reset(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if let Some(cache) = dirs::cache_dir() {
+        match std::fs::remove_dir_all(cache.join("safedrop")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Не удалось очистить кэш SafeDrop: {e}")),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    settings::apply_autostart(false).map_err(|e| format!("Автозапуск: {e}"))?;
     for f in [
         state.settings_path(),
         state.peers_path(),
@@ -1538,6 +1600,7 @@ async fn factory_reset(
         state.groups_path(),
         state.group_sync_path(),
         state.call_history_path(),
+        state.app_dir.join("rtc-debug.log"),
     ] {
         let _ = std::fs::remove_file(f);
     }
@@ -1565,10 +1628,23 @@ async fn factory_reset(
         let _ = reg(&["delete", ctx_base(), "/f"]);
         let _ = reg(&["delete", &clsid_key(), "/f"]);
     }
+    // пункт в основном меню Windows 11 (пакет) — тоже убрать
+    #[cfg(windows)]
+    {
+        let log = state.app_dir.join("win11-menu.log");
+        let registered = { let l = log.clone(); tokio::task::spawn_blocking(move || win11() && menu_package_registered(&l)).await.unwrap_or(false) };
+        if registered {
+            let _ = win11_menu_set(app.clone(), state.clone(), false).await;
+        }
+        let _ = std::fs::remove_file(&log);
+    }
+    #[cfg(not(target_os = "linux"))]
     let _ = settings::apply_autostart(false);
     // ключи контактов забываем вместе с контактами; свой ключ остаётся,
     // чтобы друзьям не пришлось заново подтверждать этот ПК
     tls::clear_pins();
+    // сервер SafeDrop (server.json) и его запомненный ключ
+    relay::reset();
     let fresh = Settings::default();
     let _ = std::fs::create_dir_all(&fresh.loaddrop_dir);
     *state.settings.lock().await = fresh;
@@ -1730,6 +1806,171 @@ async fn set_ctx_menu(
     }
     write_ctx_menu(&app)?;
     Ok(())
+}
+
+// ---------- пункт в основном меню Проводника Windows 11 ----------
+// Основное (новое) меню Windows 11 показывает расширения только из пакетов MSIX.
+// SafeDrop регистрирует маленький разреженный пакет (shellpkg/AppxManifest.xml):
+// внутри только манифест, а DLL меню — из папки программы. Пакет неподписанный,
+// поэтому регистрация — один раз с правами администратора (запрос UAC).
+
+#[cfg(windows)]
+const MENU_PACKAGE: &str = "SafeDrop.ExplorerMenu";
+
+/// Строка для PowerShell в одинарных кавычках.
+#[cfg(windows)]
+fn quote_ps(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Пакет ссылается на DLL по постоянному имени shell\safedrop-shell.dll; держим там
+/// копию расширения своей версии. Если старую DLL держит открытой Проводник
+/// (dllhost), копия обновится при следующем запуске.
+#[cfg(windows)]
+fn sync_menu_dll(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let src = std::path::PathBuf::from(shell_dll_path(app)?);
+    let dir = src.parent().ok_or("нет папки DLL")?.to_path_buf();
+    let dst = dir.join("safedrop-shell.dll");
+    if dst != src {
+        let same = std::fs::read(&src).ok().zip(std::fs::read(&dst).ok()).is_some_and(|(a, b)| a == b);
+        if !same {
+            std::fs::copy(&src, &dst).map_err(|e| format!("не удалось обновить {}: {e}", dst.display()))?;
+        }
+    }
+    Ok(dir)
+}
+
+/// Выполнить PowerShell-скрипт (UTF-16 base64: пути с кириллицей не портятся).
+/// elevated — через Start-Process -Verb RunAs; итог пишется в лог-файл, потому что
+/// вывод процесса администратора сюда не попадает.
+#[cfg(windows)]
+fn run_ps(script: &str, elevated: bool, log: &std::path::Path) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    use base64::Engine;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let enc = |s: &str| {
+        let bytes: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
+    let _ = std::fs::remove_file(log);
+    let body = format!(
+        "$ErrorActionPreference='Stop'; try {{ {script}; 'OK' | Out-File -Encoding utf8 {log} }} catch {{ ('ERR: ' + $_.Exception.Message) | Out-File -Encoding utf8 {log} }}",
+        log = quote_ps(&log.to_string_lossy()),
+    );
+    let outer = if elevated {
+        format!(
+            "try {{ Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-EncodedCommand','{}' }} catch {{ exit 3 }}",
+            enc(&body)
+        )
+    } else {
+        body
+    };
+    let st = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &enc(&outer)])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if st.code() == Some(3) {
+        return Err("нужно разрешение администратора — запрос отклонён".into());
+    }
+    let out = std::fs::read_to_string(log).unwrap_or_default();
+    let out = out.trim_start_matches('\u{feff}').trim().to_string();
+    match out.strip_prefix("ERR: ") {
+        Some(e) => Err(e.to_string()),
+        None if out == "OK" => Ok(out),
+        None => Err("PowerShell не сообщил результат".into()),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ps_tests {
+    #[test]
+    fn run_ps_reports_ok_and_cyrillic_errors() {
+        let dir = std::env::temp_dir().join("safedrop-ps-тест");
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("журнал.log");
+        assert_eq!(super::run_ps("$x = 1", false, &log), Ok("OK".to_string()));
+        assert_eq!(super::run_ps("throw 'нет пакета'", false, &log), Err("нет пакета".to_string()));
+        assert_eq!(super::quote_ps("C:\\Папка O'Neil"), "'C:\\Папка O''Neil'");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Windows 11 (сборка 22000+): только там есть новое меню и неподписанные пакеты.
+#[cfg(windows)]
+fn win11() -> bool {
+    reg(&["query", "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "/v", "CurrentBuildNumber"])
+        .ok()
+        .and_then(|o| o.split_whitespace().last().and_then(|n| n.parse::<u32>().ok()))
+        .is_some_and(|b| b >= 22000)
+}
+
+#[cfg(windows)]
+fn menu_package_registered(log: &std::path::Path) -> bool {
+    run_ps(&format!("if (-not (Get-AppxPackage {MENU_PACKAGE})) {{ throw 'нет' }}"), false, log).is_ok()
+}
+
+/// Есть ли пункт в основном меню Windows 11: {supported, enabled}.
+#[tauri::command]
+async fn win11_menu_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        let log = state.app_dir.join("win11-menu.log");
+        let r = tokio::task::spawn_blocking(move || {
+            let supported = win11();
+            serde_json::json!({ "supported": supported, "enabled": supported && menu_package_registered(&log) })
+        }).await.map_err(|e| e.to_string())?;
+        Ok(r)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Ok(serde_json::json!({ "supported": false, "enabled": false }))
+    }
+}
+
+/// Добавить пункт в основное меню Windows 11 или убрать его (запрос UAC).
+#[tauri::command]
+async fn win11_menu_set(app: tauri::AppHandle, state: tauri::State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if !win11() {
+            return Err("Основное меню с пакетами есть только в Windows 11".into());
+        }
+        let log = state.app_dir.join("win11-menu.log");
+        let (msix, dir) = if enabled {
+            let dir = sync_menu_dll(&app)?;
+            let msix = dir.join("SafeDropMenu.msix");
+            if !msix.is_file() {
+                return Err(format!("не найден пакет меню {}", msix.display()));
+            }
+            // ExternalLocation — папка программы (там safedrop.exe и shell\)
+            (msix, dir.parent().ok_or("нет папки программы")?.to_path_buf())
+        } else {
+            (std::path::PathBuf::new(), std::path::PathBuf::new())
+        };
+        tokio::task::spawn_blocking(move || {
+            let remove = format!("Get-AppxPackage -AllUsers {MENU_PACKAGE} | Remove-AppxPackage -AllUsers");
+            if enabled {
+                // старая регистрация (другая папка программы) убирается перед новой
+                let script = format!(
+                    "{remove}; Add-AppxPackage -Path {} -ExternalLocation {} -AllowUnsigned",
+                    quote_ps(&msix.to_string_lossy()),
+                    quote_ps(&dir.to_string_lossy()),
+                );
+                run_ps(&script, true, &log).map(|_| ())
+            } else {
+                // своя регистрация снимается без прав; пакет «для всех» — с ними
+                let _ = run_ps(&format!("Get-AppxPackage {MENU_PACKAGE} | Remove-AppxPackage"), false, &log);
+                if menu_package_registered(&log) { run_ps(&remove, true, &log).map(|_| ()) } else { Ok(()) }
+            }
+        }).await.map_err(|e| e.to_string())?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, state, enabled);
+        Err("Меню «Отправить в SafeDrop» есть только в Проводнике Windows".into())
+    }
 }
 
 /// Contact count for the menu button (submenu itself is live via COM).
@@ -2110,6 +2351,29 @@ async fn linux_audio_install() -> Result<serde_json::Value, String> {
     r
 }
 
+/// Отладка звонков: SAFEDROP_RTC_DEBUG=1 в окружении — интерфейс раз в несколько
+/// секунд присылает сводку WebRTC (кодеки, байты, кадры); пишем её в stderr и в
+/// rtc-debug.log в папке программы. Без переменной ничего не пишется.
+fn rtc_debug_enabled() -> bool {
+    std::env::var_os("SAFEDROP_RTC_DEBUG").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+#[tauri::command]
+fn rtc_debug_on() -> bool {
+    rtc_debug_enabled()
+}
+
+#[tauri::command]
+fn rtc_debug(state: tauri::State<'_, AppState>, msg: String) {
+    if !rtc_debug_enabled() { return; }
+    let msg: String = msg.chars().take(8000).collect();
+    eprintln!("[rtc] {msg}");
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(state.app_dir.join("rtc-debug.log")) {
+        let _ = writeln!(f, "{} {msg}", chrono::Local::now().format("%H:%M:%S"));
+    }
+}
+
 /// Build identity: proves which exe is actually running (kills "old exe" ambiguity).
 #[tauri::command]
 async fn get_build_info() -> Result<serde_json::Value, String> {
@@ -2151,6 +2415,36 @@ async fn trust_new_key(ip: String, fp: String) -> Result<String, String> {
 async fn forget_key(ip: String) -> Result<(), String> {
     tls::forget_key(&ip);
     Ok(())
+}
+
+/// Вкладка «Сервер»: режим, адрес, состояние подключения, кто на сервере.
+#[tauri::command]
+async fn server_status() -> Result<relay::Status, String> {
+    Ok(relay::status())
+}
+
+/// Сохранить режим (p2p | server), адрес и пароль сервера; переподключиться.
+#[tauri::command]
+async fn server_configure(app: tauri::AppHandle, mode: String, addr: String, pass: String) -> Result<relay::Status, String> {
+    let st = relay::configure(&app, &mode, &addr, &pass)?;
+    // сразу показать, кто теперь в сети (не ждать периодического скана)
+    tauri::async_runtime::spawn(async move {
+        let state: tauri::State<'_, AppState> = app.state();
+        refresh_live(&app, &state).await;
+    });
+    Ok(st)
+}
+
+/// Подтвердить новый ключ сервера (после переустановки сервера).
+#[tauri::command]
+async fn server_trust_key(app: tauri::AppHandle, fp: String) -> Result<(), String> {
+    relay::trust_key(&app, &fp)
+}
+
+/// Как WebRTC соединяться сейчас: напрямую или через TURN сервера.
+#[tauri::command]
+async fn server_ice() -> Result<serde_json::Value, String> {
+    Ok(relay::ice())
 }
 
 /// Local call history, stored separately from file transfer history.
@@ -2244,13 +2538,52 @@ fn parse_ctx_args(args: &[String]) -> Option<PendingSend> {
     None
 }
 
-/// Bring main window forward (used for context-menu arrivals).
-fn focus_main(app: &tauri::AppHandle) {
+/// Linux: интерфейс показывает Electron, а окно Tauri скрыто (см. electron.rs).
+fn electron_mode() -> bool {
+    #[cfg(target_os = "linux")]
+    return electron::active();
+    #[cfg(not(target_os = "linux"))]
+    return false;
+}
+
+/// Bring main window forward (context menu, incoming file, "watch together").
+pub(crate) fn focus_main(app: &tauri::AppHandle) {
+    #[cfg(target_os = "linux")]
+    if electron::active() {
+        electron::control("focus");
+        return;
+    }
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
     }
+}
+
+/// Уменьшить окно до размера экрана (с полями под панель задач), если оно больше.
+fn fit_to_screen(w: &tauri::WebviewWindow) {
+    // Wayland: до показа окна current_monitor() пуст — берём основной экран
+    let mon = w.current_monitor().ok().flatten()
+        .or_else(|| w.primary_monitor().ok().flatten())
+        .or_else(|| w.available_monitors().ok().and_then(|m| m.into_iter().next()));
+    let (Some(mon), Ok(size)) = (mon, w.outer_size()) else {
+        eprintln!("fit_to_screen: монитор или размер окна неизвестны");
+        return;
+    };
+    let scr = mon.size();
+    eprintln!("fit_to_screen: экран {}x{}, окно {}x{}", scr.width, scr.height, size.width, size.height);
+    let margin = (48.0 * mon.scale_factor()) as u32;
+    let max_w = scr.width.saturating_sub(margin / 2);
+    let max_h = scr.height.saturating_sub(margin);
+    if size.width <= max_w && size.height <= max_h { return; }
+    let nw = size.width.min(max_w);
+    let nh = size.height.min(max_h);
+    // minWidth/minHeight из tauri.conf.json иначе не дадут сжать окно
+    let _ = w.set_min_size(Some(tauri::PhysicalSize::new(nw.min(640), nh.min(480))));
+    let _ = w.set_size(tauri::PhysicalSize::new(nw, nh));
+    let _ = w.center();
+    // GTK/KWin могут не дать уменьшить окно — тогда развернуть на весь экран
+    let _ = w.maximize();
 }
 
 fn main() {
@@ -2260,6 +2593,7 @@ fn main() {
     let dir = settings::app_dir();
     let _ = std::fs::create_dir_all(&dir);
     tls::init(&dir);
+    relay::init(&dir);
     let st = AppState::new(dir);
     settings::load_settings(&st);
     settings::load_peers(&st);
@@ -2363,17 +2697,22 @@ fn main() {
                 let _ = window.app_handle().emit("safedrop-quit-requested", ());
             }
         })
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            // launched from Explorer while already running:
-            // forward the file to the open window instead of a 2nd window
-            if let Some(p) = parse_ctx_args(&args) {
-                let _ = app.emit(
-                    "safedrop-ctx-send",
-                    serde_json::json!({"contact": p.contact, "file": p.file}),
-                );
-            }
-            focus_main(app);
-        }))
+        // проверочный экземпляр (SAFEDROP_DATA_DIR) живёт рядом с обычным
+        .plugin(if settings::test_instance_dir().is_some() {
+            tauri::plugin::Builder::new("safedrop-test-instance").build()
+        } else {
+            tauri_plugin_single_instance::init(|app, args, _cwd| {
+                // launched from Explorer while already running:
+                // forward the file to the open window instead of a 2nd window
+                if let Some(p) = parse_ctx_args(&args) {
+                    let _ = app.emit(
+                        "safedrop-ctx-send",
+                        serde_json::json!({"contact": p.contact, "file": p.file}),
+                    );
+                }
+                focus_main(app);
+            })
+        })
         .plugin(tauri_plugin_notification::init())
         // microphone is core feature: grant it outright so an accidental
         // "deny" can never silently break calls (no prompt at all)
@@ -2386,7 +2725,18 @@ fn main() {
             _ => PermissionResponse::Default,
         })
         .setup(|app| {
+            // Linux через Electron: окно WebKit прячем, команды и события идут в Electron
+            #[cfg(target_os = "linux")]
+            if electron::active() {
+                electron::start(app.handle());
+            }
             settings::init_chat_saver(app.handle());
+            #[cfg(target_os = "linux")]
+            if app.state::<AppState>().settings.try_lock().is_ok_and(|s| s.autostart) {
+                if let Err(e) = settings::apply_autostart(true) {
+                    eprintln!("SafeDrop: не удалось обновить автозапуск: {e}");
+                }
+            }
             // контакт показал не тот ключ — спросить пользователя
             let key_app = app.handle().clone();
             tls::set_key_notifier(Box::new(move |ip, old, new| {
@@ -2395,7 +2745,7 @@ fn main() {
             // WebRTC в WebKitGTK выключен, пока его не включат в настройках (и есть,
             // только если WebKit собран с ним — см. packaging/arch/webkit2gtk-4.1-webrtc)
             #[cfg(target_os = "linux")]
-            if let Some(w) = app.get_webview_window("main") {
+            if let Some(w) = app.get_webview_window("main").filter(|_| !electron::active()) {
                 let _ = w.with_webview(|wv| {
                     use webkit2gtk::{glib::prelude::*, DeviceInfoPermissionRequest, PermissionRequestExt, SettingsExt, WebViewExt};
                     let view = wv.inner();
@@ -2413,6 +2763,16 @@ fn main() {
                         }
                         false
                     });
+                });
+            }
+            // окно 1120×720 не влезает в маленький экран (ноутбук 1366×768,
+            // виртуалка 1024×768): часть интерфейса уезжала за край
+            // (после показа: до этого GTK не знает ни монитора, ни размера окна)
+            if let Some(w) = app.get_webview_window("main").filter(|_| !electron_mode()) {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    let w2 = w.clone();
+                    let _ = w.run_on_main_thread(move || fit_to_screen(&w2));
                 });
             }
             // tray: left click toggles window, menu has Show/Quit
@@ -2442,6 +2802,11 @@ fn main() {
                         } = event
                         {
                             let app = tray.app_handle();
+                            #[cfg(target_os = "linux")]
+                            if electron::active() {
+                                electron::control("toggle");
+                                return;
+                            }
                             if let Some(w) = app.get_webview_window("main") {
                                 if w.is_visible().unwrap_or(true) {
                                     let _ = w.hide();
@@ -2454,7 +2819,10 @@ fn main() {
                     .build(app)?;
             }
             // shortcut with AppUserModelID => toasts branded as SafeDrop
-            ensure_notif_shortcut();
+            // ярлык ведёт на установленный SafeDrop — проверочный экземпляр его не трогает
+            if settings::test_instance_dir().is_none() {
+                ensure_notif_shortcut();
+            }
             // Repoint the Explorer handler to this release's side-by-side DLL.
             // Keeping each version under a unique filename avoids overwriting a
             // DLL that Explorer may still have loaded from an earlier release.
@@ -2462,6 +2830,12 @@ fn main() {
                 .settings.try_lock().map(|s| s.ctx_menu).unwrap_or(false);
             if ctx_menu_enabled && cfg!(windows) {
                 let _ = write_ctx_menu(app.handle());
+            }
+            // пакет основного меню Windows 11 берёт DLL по постоянному имени:
+            // после обновления SafeDrop подкладываем туда расширение новой версии
+            #[cfg(windows)]
+            if ctx_menu_enabled {
+                let _ = sync_menu_dll(app.handle());
             }
             // launched from Explorer context menu: bring window forward
             if app
@@ -2471,11 +2845,7 @@ fn main() {
                 .map(|g| g.is_some())
                 .unwrap_or(false)
             {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.unminimize();
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
+                focus_main(app.handle());
             }
             // background file server (LoadDrop is read per-connection)
             let handle = app.handle().clone();
@@ -2491,6 +2861,8 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 signal::run_signal_server(shandle, sport).await;
             });
+            // режим «через сервер»: держит связь с SafeDrop Server, если он выбран
+            relay::start(app.handle().clone(), sport, port);
             // QUIC server (beta): only when enabled, TCP path untouched otherwise
             let qhandle = app.handle().clone();
             let (qon, qport): (bool, u16) = app.state::<AppState>()
@@ -2573,7 +2945,8 @@ fn main() {
             pick_files, pick_image, pick_folder, pick_audio, read_image_dataurl,
             clear_peers, scan_debug, factory_reset, open_firewall, set_ctx_menu, refresh_ctx_menu, get_pending_send,
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
-            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, linux_audio_status, linux_audio_install, own_installer, get_key_info, trust_new_key, forget_key,
+            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, linux_audio_status, linux_audio_install, rtc_debug_on, rtc_debug, own_installer, get_key_info, trust_new_key, forget_key, win11_menu_status, win11_menu_set,
+            server_status, server_configure, server_trust_key, server_ice,
             ytbrowse::ytb_open, ytbrowse::ytb_go, ytbrowse::ytb_nav, ytbrowse::ytb_watch, ytbrowse::ytb_notify, ytbrowse::ytb_state,
             ytbrowse::ytb_set_share, ytbrowse::ytb_remote_nav, ytbrowse::ytb_pause_media, ytbrowse::ytb_media_apply, ytbrowse::ytb_duck, ytbrowse::ytb_chat_send, ytbrowse::ytb_chat_show, ytbrowse::ytb_chat_toggle, ytbrowse::ytb_chat_request, ytbrowse::ytb_chat_history,
             ytbrowse::ytb_close, ytbrowse::ytb_close_all, ytbrowse::ytb_remote_cursor, ytbrowse::ytb_remote_scroll, ytbrowse::ytb_people,

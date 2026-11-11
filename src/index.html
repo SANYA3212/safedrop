@@ -12,7 +12,7 @@
 <div id="app">
   <!-- верхняя панель -->
   <header id="topbar" data-tauri-drag-region>
-    <div class="brand"><img class="brand-logo" src="logo.png" alt="SafeDrop" /><span class="brand-name">SafeDrop</span><span class="brand-ver">P2P</span></div>
+    <div class="brand"><img class="brand-logo" src="logo.png" alt="SafeDrop" /><span class="brand-name">SafeDrop</span><span class="brand-ver" id="brand-mode" title="Режим работы (вкладка «Сервер»)">P2P</span></div>
     <div class="search"><input id="peer-search" placeholder="Поиск контакта…" /></div>
     <div class="win-btns"><button id="btn-details" title="Панель: профили, сеть, звук, оформление"><svg class="ic" viewBox="0 0 24 24"><path d="M20.89,9.78h-.65a1.16,1.16,0,0,1-1-.74V9a1.13,1.13,0,0,1,.22-1.26l.46-.46a1.13,1.13,0,0,0,0-1.58L18.29,4.14a1.13,1.13,0,0,0-1.58,0l-.46.46A1.13,1.13,0,0,1,15,4.82h0a1.16,1.16,0,0,1-.74-1V3.11A1.11,1.11,0,0,0,13.11,2H10.89A1.11,1.11,0,0,0,9.78,3.11v.65a1.16,1.16,0,0,1-.74,1H9A1.13,1.13,0,0,1,7.75,4.6l-.46-.46a1.13,1.13,0,0,0-1.58,0L4.14,5.71a1.13,1.13,0,0,0,0,1.58l.46.46A1.13,1.13,0,0,1,4.82,9V9a1.16,1.16,0,0,1-1,.74H3.11A1.11,1.11,0,0,0,2,10.89v2.22a1.11,1.11,0,0,0,1.11,1.11h.65a1.16,1.16,0,0,1,1,.74v0a1.13,1.13,0,0,1-.22,1.26l-.46.46a1.13,1.13,0,0,0,0,1.58l1.57,1.57a1.13,1.13,0,0,0,1.58,0l.46-.46A1.13,1.13,0,0,1,9,19.18H9a1.16,1.16,0,0,1,.74,1v.65A1.11,1.11,0,0,0,10.89,22h2.22a1.11,1.11,0,0,0,1.11-1.11v-.65a1.16,1.16,0,0,1,.74-1h0a1.13,1.13,0,0,1,1.26.22l.46.46a1.13,1.13,0,0,0,1.58,0l1.57-1.57a1.13,1.13,0,0,0,0-1.58l-.46-.46A1.13,1.13,0,0,1,19.18,15v0a1.16,1.16,0,0,1,1-.74h.65A1.11,1.11,0,0,0,22,13.11V10.89A1.11,1.11,0,0,0,20.89,9.78ZM12,16a4,4,0,1,1,4-4A4,4,0,0,1,12,16Z"/></svg></button><button id="btn-min">—</button><button id="btn-max">▢</button><button id="btn-close"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button></div>
   </header>
@@ -150,6 +150,27 @@
           </div>
           <div class="card"><h3>Диагностика</h3>
             <div class="row"><button id="btn-firewall" data-set-label="Открыть порты в Firewall">Открыть порты в Firewall</button><button id="btn-netdbg" title="Показать IP, Radmin, кто в сети" data-set-label="Диагностика сети"><svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:4px"><circle cx="10" cy="10" r="8"/><path d="M21.71,21.71a1,1,0,0,1-1.42,0L15.61,17A8.67,8.67,0,0,0,17,15.61l4.68,4.68A1,1,0,0,1,21.71,21.71Z"/></svg> Диагностика сети</button></div>
+          </div>
+        </details>
+
+        <details class="set-sec" id="sec-server">
+          <summary><span class="sec-arrow"></span>Сервер <span id="srv-badge" class="srv-badge"></span></summary>
+          <div class="card"><h3>Режим работы</h3>
+            <label class="check" data-set-label="Режим напрямую (P2P)"><input type="radio" name="srv-mode" id="srv-mode-p2p" value="p2p" /> Напрямую (P2P) — LAN, Radmin VPN</label>
+            <label class="check" data-set-label="Режим через сервер"><input type="radio" name="srv-mode" id="srv-mode-server" value="server" /> Через сервер — чаты, файлы и звонки идут через сервер SafeDrop</label>
+            <div class="muted">Режимы не смешиваются: в режиме сервера прямые соединения не используются, а контакты LAN/Radmin показаны «не в сети». Шифрование остаётся сквозным: сервер пересылает данные, но не может их прочитать или подменить собеседника.</div>
+          </div>
+          <div class="card"><h3>Подключение</h3>
+            <label data-set-label="Адрес сервера"><span>Адрес сервера</span><input id="srv-addr" placeholder="IP сервера, например 203.0.113.5 или 203.0.113.5:47840" autocomplete="off" spellcheck="false" /></label>
+            <label data-set-label="Пароль сервера"><span>Пароль</span><input id="srv-pass" type="password" placeholder="если сервер с паролем" autocomplete="off" /></label>
+            <div class="row"><button id="srv-connect" class="primary" data-set-label="Подключиться к серверу">Подключиться</button><button id="srv-disconnect" data-set-label="Отключиться от сервера">Перейти на P2P</button></div>
+            <div id="srv-state" class="srv-state muted">Сервер не используется</div>
+            <div id="srv-key" class="muted srv-key"></div>
+            <div class="row hidden" id="srv-trust-row"><button id="srv-trust" data-set-label="Доверять новому ключу сервера">Доверять новому ключу</button></div>
+          </div>
+          <div class="card"><h3>На сервере <span id="srv-count" class="cnt-badge"></span></h3>
+            <div id="srv-peers" class="muted">—</div>
+            <div class="muted">Все, кто подключён к этому серверу, сами появляются в контактах. Сервер для своих: пароль задаёт тот, кто его запускает.</div>
           </div>
         </details>
 
@@ -329,10 +350,11 @@
         <details class="set-sec" id="sec-system">
           <summary><span class="sec-arrow"></span>Система</summary>
           <div class="card"><h3>Система</h3>
-            <label class="check" data-set-label="Автозапуск Windows"><input type="checkbox" id="set-autostart" /> Автозапуск Windows</label>
+            <label class="check" data-set-label="Автозапуск при входе"><input type="checkbox" id="set-autostart" /> Автозапуск при входе</label>
             <label class="check" data-set-label="Сворачивать в трей"><input type="checkbox" id="set-tray" /> Сворачивать в трей</label>
             <label class="check" data-set-label="Пункт меню проводника"><input type="checkbox" id="set-ctxmenu" /> Пункт «Отправить в SafeDrop» в меню проводника</label>
-            <div class="muted">Пункт «Отправить в SafeDrop» появляется прямо в меню Win11 со списком контактов. Если пункта нет — перезапустите проводник.</div>
+            <label class="check hidden" id="win11-menu-row" data-set-label="Пункт в основном меню Windows 11"><input type="checkbox" id="set-win11menu" /> Сразу в основном меню Windows 11, без «Показать дополнительные параметры»</label>
+            <div class="muted">Пункт со списком контактов есть в меню по правой кнопке. В Windows 11 основное меню принимает только пакеты, поэтому для него SafeDrop один раз попросит разрешение администратора. Если пункта нет — перезапустите проводник.</div>
             <div class="row"><button id="btn-ctx-refresh" data-set-label="Обновить пункты меню проводника"><svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:4px"><path d="M20,11A8,8,0,0,0,5.64,6.64L4,8.29V4H8.29l1.59,1.59A10,10,0,0,1,22,13Z"/><path d="M4,13A8,8,0,0,0,18.36,17.36L20,15.71V20H15.71l-1.59-1.59A10,10,0,0,1,2,11Z"/></svg> Обновить пункты меню</button><button id="btn-clear-peers" title="Удалить все контакты" data-set-label="Очистить контакты"><svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:4px"><path d="M20.89,9.78h-.65a1.16,1.16,0,0,1-1-.74V9a1.13,1.13,0,0,1,.22-1.26l.46-.46a1.13,1.13,0,0,0,0-1.58L18.29,4.14a1.13,1.13,0,0,0-1.58,0l-.46.46A1.13,1.13,0,0,1,15,4.82h0a1.16,1.16,0,0,1-.74-1V3.11A1.11,1.11,0,0,0,13.11,2H10.89A1.11,1.11,0,0,0,9.78,3.11v.65a1.16,1.16,0,0,1-.74,1H9A1.13,1.13,0,0,1,7.75,4.6l-.46-.46a1.13,1.13,0,0,0-1.58,0L4.14,5.71a1.13,1.13,0,0,0,0,1.58l.46.46A1.13,1.13,0,0,1,4.82,9V9a1.16,1.16,0,0,1-1,.74H3.11A1.11,1.11,0,0,0,2,10.89v2.22a1.11,1.11,0,0,0,1.11,1.11h.65a1.16,1.16,0,0,1,1,.74v0a1.13,1.13,0,0,1-.22,1.26l-.46.46a1.13,1.13,0,0,0,0,1.58l1.57,1.57a1.13,1.13,0,0,0,1.58,0l.46-.46A1.13,1.13,0,0,1,9,19.18H9a1.16,1.16,0,0,1,.74,1v.65A1.11,1.11,0,0,0,10.89,22h2.22a1.11,1.11,0,0,0,1.11-1.11v-.65a1.16,1.16,0,0,1,.74-1h0a1.13,1.13,0,0,1,1.26.22l.46.46a1.13,1.13,0,0,0,1.58,0l1.57-1.57a1.13,1.13,0,0,0,0-1.58l-.46-.46A1.13,1.13,0,0,1,19.18,15v0a1.16,1.16,0,0,1,1-.74h.65A1.11,1.11,0,0,0,22,13.11V10.89A1.11,1.11,0,0,0,20.89,9.78ZM12,16a4,4,0,1,1,4-4A4,4,0,0,1,12,16Z"/></svg> Очистить контакты</button><button id="btn-clear-cache" title="Временные файлы, аватары, недокачанное" data-set-label="Очистить кэш"><svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:4px"><path d="M17,4V5H15V4H9V5H7V4A2,2,0,0,1,9,2h6A2,2,0,0,1,17,4Z"/><path d="M20,6H4A1,1,0,0,0,4,8H5V20a2,2,0,0,0,2,2H17a2,2,0,0,0,2-2V8h1a1,1,0,0,0,0-2Z"/></svg> Очистить кэш</button></div>
             <div class="row"><button id="btn-factory-reset" class="danger" title="Стереть всё и вернуть как было" data-set-label="Полный сброс программы"><svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:4px"><path d="M17,4V5H15V4H9V5H7V4A2,2,0,0,1,9,2h6A2,2,0,0,1,17,4Z"/><path d="M20,6H4A1,1,0,0,0,4,8H5V20a2,2,0,0,0,2,2H17a2,2,0,0,0,2-2V8h1a1,1,0,0,0,0-2Z"/></svg> Полный сброс программы</button></div>
           </div>
@@ -349,6 +371,7 @@
             <div class="row"><button id="btn-upd-send" class="primary" data-set-label="Разослать обновление"><svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:4px"><path d="M21.66,12a2,2,0,0,1-1.14,1.81L5.87,20.75A2.08,2.08,0,0,1,5,21a2,2,0,0,1-1.82-2.82L5.46,13H11a1,1,0,0,0,0-2H5.46L3.18,5.87A2,2,0,0,1,5.86,3.25h0l14.65,6.94A2,2,0,0,1,21.66,12Z"/></svg> Разослать всем в сети</button></div>
             <div id="upd-log"></div>
           </details>
+          <div class="muted hidden" id="linux-update-info" role="status"></div>
           <div class="muted" id="build-info">Сборка: …</div>
         </details>
 

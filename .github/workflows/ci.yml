@@ -24,3 +24,14 @@ jobs:
       - run: cargo test --release
         working-directory: src-tauri
 
+  # SafeDrop Server (режим «через сервер») работает на Linux
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check install script
+        run: sh -n server/install.sh
+      - run: cargo test --release
+        working-directory: server
+

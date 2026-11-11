@@ -282,12 +282,25 @@ fn def_udp_port() -> u16 { 47833 }
 fn def_idle() -> String { "idle".into() }
 
 fn whoami_host() -> String {
-    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "My-PC".into())
+    if let Ok(n) = std::env::var("COMPUTERNAME") {
+        if !n.trim().is_empty() { return n.trim().to_string(); }
+    }
+    // Linux: COMPUTERNAME нет, имя машины — в ядре / /etc/hostname
+    #[cfg(not(windows))]
+    for p in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            let n = s.trim();
+            if !n.is_empty() && n != "localhost" { return n.to_string(); }
+        }
+    }
+    "My-PC".into()
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        let mut loaddrop = dirs::download_dir()
+        // проверочный экземпляр (SAFEDROP_DATA_DIR) не кладёт файлы в настоящий LoadDrop
+        let mut loaddrop = crate::settings::test_instance_dir()
+            .or_else(dirs::download_dir)
             .or_else(dirs::home_dir)
             .unwrap_or(PathBuf::from("."));
         loaddrop.push("LoadDrop");

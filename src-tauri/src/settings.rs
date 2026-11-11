@@ -1,7 +1,17 @@
 use crate::state::{AppState, Settings};
 use std::fs;
 
+/// Отдельный экземпляр для проверок (переменная `SAFEDROP_DATA_DIR`): своя
+/// папка данных, можно запустить рядом с обычным SafeDrop. Ярлык «Пуск»,
+/// меню Проводника и автозапуск основной установки он не трогает.
+pub fn test_instance_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("SAFEDROP_DATA_DIR").filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+}
+
 pub fn app_dir() -> std::path::PathBuf {
+    if let Some(dir) = test_instance_dir() {
+        return dir;
+    }
     dirs::config_dir()
         .map(|p| p.join("safedrop"))
         .unwrap_or(std::path::PathBuf::from("./safedrop-data"))
@@ -15,6 +25,11 @@ pub fn load_settings(state: &AppState) {
             // into the working directory
             if s.loaddrop_dir.trim().is_empty() {
                 s.loaddrop_dir = Settings::default().loaddrop_dir;
+            }
+            // до 0.3.36 на Linux имя ПК не читалось и всегда было «My-PC»
+            #[cfg(not(windows))]
+            if s.device_name == "My-PC" {
+                s.device_name = Settings::default().device_name;
             }
             if let Ok(mut g) = state.settings.try_lock() {
                 *g = s;
@@ -132,20 +147,48 @@ pub fn apply_autostart(enabled: bool) -> Result<(), String> {
     let dir = dirs::config_dir().ok_or("no config dir")?.join("autostart");
     let file = dir.join("safedrop.desktop");
     if enabled {
-        // AppImage: current_exe — временная точка монтирования, запускать надо сам образ
-        let exe = std::env::var_os("APPIMAGE")
+        // Electron: current_exe — ядро без окна, запускать надо оболочку
+        // (/usr/bin/safedrop передаёт свой путь в SAFEDROP_LAUNCHER)
+        let launcher = std::env::var_os("SAFEDROP_LAUNCHER")
             .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute());
+        if launcher.is_none() && std::env::var("SAFEDROP_ELECTRON_CORE").as_deref() == Ok("1") {
+            return Err("Автозапуск: неизвестно, как запускать SafeDrop (нет SAFEDROP_LAUNCHER)".into());
+        }
+        // AppImage: current_exe — временная точка монтирования, запускать надо сам образ
+        let exe = launcher
+            .or_else(|| std::env::var_os("APPIMAGE").map(std::path::PathBuf::from).filter(|path| path.is_absolute()))
             .map_or_else(|| std::env::current_exe().map_err(|e| e.to_string()), Ok)?;
-        let exec = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let exec = desktop_exec(&exe)?;
         let content = format!(
-            "[Desktop Entry]\nType=Application\nName=SafeDrop\nExec=\"{exec}\"\nIcon=safedrop\nX-GNOME-Autostart-enabled=true\n"
+            "[Desktop Entry]\nType=Application\nName=SafeDrop\nExec={exec}\nIcon=safedrop\nX-GNOME-Autostart-enabled=true\n"
         );
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        std::fs::write(&file, content).map_err(|e| e.to_string())?;
-    } else if file.exists() {
-        let _ = std::fs::remove_file(&file);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new_in(&dir).map_err(|e| e.to_string())?;
+        tmp.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
+        tmp.persist(&file).map_err(|e| e.to_string())?;
+    } else {
+        match fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn desktop_exec(exe: &std::path::Path) -> Result<String, String> {
+    let exe = exe.to_str().ok_or("Путь для автозапуска должен быть в UTF-8")?;
+    if exe.contains('=') || exe.chars().any(char::is_control) {
+        return Err("Путь содержит символы, которые нельзя записать в Exec для автозапуска".into());
+    }
+    // GIO проверяет первый аргумент до подстановки %%. env запускает путь как аргумент.
+    // Сначала экранирование аргумента Exec, затем обратных косых в значении .desktop.
+    let quoted = exe.replace('\\', "\\\\").replace('"', "\\\"")
+        .replace('$', "\\$").replace('\x60', "\\\x60").replace('%', "%%");
+    Ok(format!("env -- \"{}\"", quoted.replace('\\', "\\\\")))
 }
 
 /// Autostart via Startup folder shortcut (stub v1: .bat launcher).

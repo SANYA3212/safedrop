@@ -139,6 +139,10 @@ pub fn my_ips() -> Vec<String> {
     }
     let mut v: Vec<String> = uniq.into_iter().collect();
     v.sort();
+    // в режиме сервера свой адрес — `sd-<ID>` (первым: им представляемся в группах)
+    if let Some(a) = crate::relay::my_addr() {
+        v.insert(0, a);
+    }
     v
 }
 
@@ -278,6 +282,13 @@ pub fn scan_nets() -> Vec<String> {
 
 /// TCP ping: time to connect to peer port. None = offline.
 pub async fn tcp_ping(ip: &str, port: u16, timeout_ms: u64) -> Option<u64> {
+    // через сервер «в сети» знает сервер; в режиме сервера напрямую не ходим
+    if crate::relay::is_relay(ip) {
+        return crate::relay::ping(ip);
+    }
+    if crate::relay::active() {
+        return None;
+    }
     let addr = format!("{ip}:{port}");
     let t0 = Instant::now();
     let res = tokio::time::timeout(

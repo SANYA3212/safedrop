@@ -440,11 +440,8 @@ pub async fn ytb_watch(app: AppHandle, queue: Option<bool>) -> Result<(), String
     if queue {
         return Ok(());
     }
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.unminimize();
-        let _ = main.show();
-        let _ = main.set_focus();
-    }
+    // в Linux через Electron окно показывает Electron (main.rs: focus_main)
+    crate::focus_main(&app);
     Ok(())
 }
 

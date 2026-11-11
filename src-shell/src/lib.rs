@@ -141,10 +141,20 @@ fn exe_path() -> String {
         )
     };
     let dll = String::from_utf16_lossy(&buf[..n as usize]);
-    match std::path::Path::new(&dll).parent() {
-        Some(dir) => dir.join("safedrop.exe").to_string_lossy().to_string(),
-        None => "safedrop.exe".to_string(),
-    }
+    exe_near(std::path::Path::new(&dll))
+}
+
+/// safedrop.exe рядом с DLL или папкой выше: установщик кладёт расширение в
+/// `<программа>\shell\`, и раньше меню запускало несуществующий `shell\safedrop.exe` —
+/// клик по контакту ничего не делал.
+fn exe_near(dll: &std::path::Path) -> String {
+    let dir = dll.parent();
+    dir.into_iter()
+        .chain(dir.and_then(|d| d.parent()))
+        .map(|d| d.join("safedrop.exe"))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "safedrop.exe".to_string())
 }
 
 fn app_data_dir() -> std::path::PathBuf {
@@ -394,6 +404,21 @@ mod tests {
     fn contact_label_formats() {
         let p = PeerJson { ip: "26.1.1.1".into(), name: "".into(), nickname: "".into() };
         assert_eq!(contact_label(&p).0, " (26.1.1.1)".to_string());
+    }
+
+    #[test]
+    fn exe_found_above_shell_folder() {
+        // установленная раскладка: <dir>\safedrop.exe и <dir>\shell\safedrop-shell-x.dll
+        let dir = std::env::temp_dir().join("sd-shell-exe-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("shell")).unwrap();
+        std::fs::write(dir.join("safedrop.exe"), b"").unwrap();
+        let dll = dir.join("shell").join("safedrop-shell-0.0.0.dll");
+        assert_eq!(exe_near(&dll), dir.join("safedrop.exe").to_string_lossy());
+        // exe рядом с DLL важнее
+        std::fs::write(dir.join("shell").join("safedrop.exe"), b"").unwrap();
+        assert_eq!(exe_near(&dll), dir.join("shell").join("safedrop.exe").to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
