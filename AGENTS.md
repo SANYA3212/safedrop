@@ -1,11 +1,13 @@
 # SafeDrop — правила для агентов (Codex и др.)
 
-SafeDrop — P2P-приложение для Windows и Linux: файлы, чаты, группы, звонки (WebRTC) напрямую между ПК, обычно поверх Radmin VPN/LAN. Tauri 2 (Rust) + WebView2 / WebKitGTK, интерфейс — чистый JS без фреймворков. Лицензия MIT + Commons Clause (продавать нельзя). Автор — Саня; отвечай ему по-русски.
+SafeDrop — P2P-приложение для Windows: файлы, чаты, группы, звонки (WebRTC) напрямую между ПК, обычно поверх Radmin VPN/LAN. Tauri 2 (Rust) + WebView2, интерфейс — чистый JS без фреймворков. Лицензия MIT + Commons Clause (продавать нельзя). Автор — Саня; отвечай ему по-русски.
 
 ## Где что
 - `src-tauri/src/main.rs` — команды Tauri; `signal.rs` — сигнальный канал (TCP 47832, TLS, одна JSON-строка на соединение, `process_frame`); `transfer.rs` / `quic.rs` — файлы (TCP 47831), докачка; `tls.rs` — ключи устройств, взаимный TLS, запомненные ключи (`pins.json`); `updsig.rs` — подпись обновлений; `state.rs` — структуры и пути файлов.
 - `src/app.js` — весь интерфейс (ES-модуль, 6000+ строк), `src/index.html`, `src/styles.css`, `src/tauri-shim.js` (демо-режим в браузере).
-- `packaging/arch/` — пакеты Arch (WebKitGTK с WebRTC), `build-linux.sh`, `build-release.bat` (Windows: exe + NSIS + подпись установщика).
+- `build-release.bat` (Windows: exe + NSIS + подпись установщика).
+
+- Linux-версия не развивается и из репозитория убрана. Код под `#[cfg(target_os = "linux")]` в Rust оставлен как есть: в Windows-сборку он не попадает.
 
 ## Обязательно
 - **Каждый коммит дописывает `CHANGELOG.md`** в `## [Не выпущено]` (`### Добавлено` / `### Исправлено` / `### Безопасность`), по-русски, по-человечески, как в существующих записях. Сообщения коммитов — на английском.
