@@ -55,19 +55,19 @@ EOF
   echo "Создан $ENV с новым паролем."
 fi
 
-# порты: TCP 47840 — приложения, UDP 3478 и 49160-49400 — звонки (TURN)
+# порты: TCP 47840 — приложения, UDP 3478 — звонки (TURN). Внутренние порты TURN
+# (49160-49400) снаружи не нужны: сервер пересылает между ними сам, через 127.0.0.1
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow 47840/tcp
   ufw allow 3478/udp
-  ufw allow 49160:49400/udp
   echo "Порты открыты в ufw."
 elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-  firewall-cmd --permanent --add-port=47840/tcp --add-port=3478/udp --add-port=49160-49400/udp
+  firewall-cmd --permanent --add-port=47840/tcp --add-port=3478/udp
   firewall-cmd --reload
   echo "Порты открыты в firewalld."
 else
   echo "ufw/firewalld не найдены. Если есть другой файрвол (iptables, панель хостинга) —"
-  echo "открой TCP 47840, UDP 3478 и UDP 49160-49400."
+  echo "открой TCP 47840 и UDP 3478."
 fi
 
 systemctl daemon-reload
