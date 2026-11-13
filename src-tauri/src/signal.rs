@@ -473,6 +473,9 @@ pub(crate) async fn process_frame(
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
+    // один компьютер — один контакт: с какого бы из его адресов ни пришло
+    // (ключ проверен TLS ещё до разбора кадра), это его чат и его профиль
+    let ip = crate::ident::canon(&state, &ip).await;
     let now = chrono::Local::now().format("%H:%M").to_string();
 
     match frame {
@@ -1463,6 +1466,13 @@ pub async fn announce_to(app: &AppHandle, ip: &str) {
         _ if udp_on => crate::quic::send_frame_quic(ip, udp_port, v, true).await.ok().flatten(),
         _ => None,
     };
+    // после рукопожатия ключ этого адреса известен: если это новый адрес
+    // знакомого устройства — склеить, и дальше работать с адресом контакта
+    if reply.is_some() {
+        crate::ident::merge_now(app).await;
+    }
+    let owner = crate::ident::owner(&state, ip).await;
+    let ip: &str = &owner;
     match reply {
         Some(reply) => {
             if reply.get("kind").and_then(|k| k.as_str()) == Some("hello-reply") {

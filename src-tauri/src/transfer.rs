@@ -261,6 +261,11 @@ async fn handle_conn(
     drop_dir: String,
 ) -> anyhow::Result<()> {
     let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr).to_string();
+    // файл от любого адреса контакта — к этому контакту (доверие, история, чат)
+    let peer_ip = {
+        use tauri::Manager;
+        crate::ident::canon(&app.state::<crate::state::AppState>(), &peer_ip).await
+    };
     let (read_half, mut write_half) = tokio::io::split(sock);
     let mut reader = BufReader::new(read_half);
     let line = crate::quic::read_line_limited(&mut reader, MAX_OFFER_LINE, std::time::Duration::from_secs(30))

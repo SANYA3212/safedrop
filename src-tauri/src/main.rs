@@ -5,6 +5,7 @@ mod discovery;
 mod electron;
 #[cfg(target_os = "linux")]
 mod linuxaudio;
+mod ident;
 mod peers_cmd;
 mod quic;
 mod relay;
@@ -260,8 +261,10 @@ async fn refresh_live_inner(app: &tauri::AppHandle, state: &tauri::State<'_, App
     // а контакты LAN/Radmin в этом режиме недоступны
     if relay::active() {
         {
+            // в сети только те, у кого есть адрес через сервер (его отметит
+            // apply_presence); у склеенного контакта он может быть не первичным
             let mut g = state.peers.lock().await;
-            for p in g.values_mut().filter(|p| !relay::is_relay(&p.ip)) {
+            for p in g.values_mut().filter(|p| !ident::addrs_of(p).iter().any(|a| relay::is_relay(a))) {
                 p.online = false;
                 p.ping_ms = None;
             }
@@ -314,21 +317,15 @@ async fn refresh_live_inner(app: &tauri::AppHandle, state: &tauri::State<'_, App
         let now = chrono::Local::now().format("%H:%M:%S").to_string();
         for p in g.values_mut() { p.online = false; p.ping_ms = None; }
         for (ip, ping) in &live {
-            // dedup: контакт ищется по первичному IP И по любому из его адресов
-            let key = if g.contains_key(ip) {
-                ip.clone()
-            } else {
-                match g.values().find(|p| p.ips.iter().any(|x| x == ip)) {
-                    Some(p) => p.ip.clone(),
-                    None => String::new(),
-                }
-            };
-            if !key.is_empty() {
+            ident::note_alive(ip, *ping);
+            // контакт ищется по первичному адресу, по любому из его адресов и по
+            // ключу устройства (новый адрес знакомого компьютера — тот же контакт)
+            if let Some(key) = ident::attach(&mut g, ip) {
                 if let Some(p) = g.get_mut(&key) {
+                    // у контакта несколько живых адресов — показываем лучший
+                    p.ping_ms = Some(if p.online { p.ping_ms.map_or(*ping, |old| old.min(*ping)) } else { *ping });
                     p.online = true;
-                    p.ping_ms = Some(*ping);
                     p.last_seen = Some(now.clone());
-                    if !p.ips.contains(ip) { p.ips.push(ip.clone()); }
                 }
             } else {
                 g.insert(ip.clone(), Peer {
@@ -2668,6 +2665,9 @@ fn main() {
             }
         }
     }
+    // один компьютер под несколькими адресами (LAN, Radmin, сервер) — один
+    // контакт и один чат: склеить дубли, накопленные старыми версиями
+    ident::merge_at_start(&st);
     {
         let sync = st.group_sync.try_lock().map(|s| s.clone()).unwrap_or_default();
         let local_ips: std::collections::HashSet<String> = discovery::my_ips().into_iter().collect();

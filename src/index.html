@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>SafeDrop</title>
 <link rel="stylesheet" href="styles.css" />
+<style id="theme-tokens">:root {}</style>
 <style id="custom-css"></style>
 </head>
 <body>
@@ -319,30 +320,93 @@
 
         <details class="set-sec" id="sec-appearance">
           <summary><span class="sec-arrow"></span>Внешний вид и темы</summary>
-          <div class="card"><h3>Оформление</h3>
-            <div class="seg-theme"><button data-bg="gradient" class="seg-btn">Градиент</button><button data-bg="color" class="seg-btn">Цвет</button><button data-bg="image" class="seg-btn">Картинка</button></div>
-            <label data-set-label="Цвет фона"><span>Цвет</span><input id="th-color" type="color" value="#141824" /></label>
-            <div class="row"><button id="btn-bg-pick" data-set-label="Выбрать фоновую картинку">Картинка…</button><button id="btn-bg-clear">Убрать</button></div>
-            <label data-set-label="Стекло (размытие)"><span>Стекло</span><input id="th-blur" type="range" min="0" max="30" /><span class="val" id="th-blur-v"></span></label>
-            <label data-set-label="Плотность"><span>Плотность</span><input id="th-opacity" type="range" min="50" max="100" /><span class="val" id="th-opacity-v"></span></label>
-            <label data-set-label="Акцентный цвет темы"><span>Акцент</span><input id="th-accent" type="color" value="#5b8cff" /></label>
-            <h3>Градиент активных кнопок</h3>
-            <div class="gradient-editor">
-              <label data-set-label="Градиент кнопок, цвет 1"><span>Цвет 1</span><input id="th-button-gradient-from" type="color" value="#5b8cff" /></label>
-              <label data-set-label="Градиент кнопок, цвет 2"><span>Цвет 2</span><input id="th-button-gradient-to" type="color" value="#9b59ff" /></label>
-              <label data-set-label="Направление градиента"><span>Направление</span><input id="th-button-gradient-angle" type="range" min="0" max="360" value="135" /><span class="val" id="th-button-gradient-angle-v">135°</span></label>
-              <div id="button-gradient-preview" aria-label="Предпросмотр градиента кнопок"></div>
-            </div>
-            <label data-set-label="Скругление углов"><span>Скругление</span><input id="th-radius" type="range" min="0" max="24" /><span class="val" id="th-radius-v"></span></label>
-            <label data-set-label="Цвет текста"><span>Цвет текста</span><input id="th-text" type="color" value="#eef1f8" /></label>
-            <label data-set-label="Приглушённый текст"><span>Приглушённый текст</span><input id="th-muted" type="color" value="#9aa3b8" /></label>
-            <label data-set-label="Цвет кнопок"><span>Цвет кнопок</span><input id="th-btn" type="color" value="#333a4d" /></label>
-            <label data-set-label="Текст кнопок"><span>Текст кнопок</span><input id="th-btntext" type="color" value="#eef1f8" /></label>
-            <label data-set-label="Цвет ссылок"><span>Цвет ссылок</span><input id="th-link" type="color" value="#7aa2ff" /></label>
-            <label data-set-label="Шрифт"><span>Шрифт</span><input id="th-font" placeholder="Segoe UI" /></label>
-            <label data-set-label="Пользовательский CSS">Свой CSS</label>
-            <textarea id="th-css" rows="4" placeholder=".bubble { font-size: 15px; }"></textarea>
-            <div class="row"><button id="btn-theme-save" class="primary">Сохранить</button><button id="btn-theme-export">Экспорт</button><button id="btn-theme-import">Импорт</button><input id="theme-import-file" type="file" accept=".json,application/json" class="hidden" /><button id="btn-theme-reset">Сброс</button></div>
+          <div class="card theme-settings">
+            <details class="theme-group" id="theme-window" open>
+              <summary>Фон окна</summary>
+              <div class="theme-fields">
+                <label data-set-label="Фон окна: режим цвет градиент картинка"><span>Режим фона</span></label>
+                <div class="seg-theme"><button data-bg="color" class="seg-btn">Цвет</button><button data-bg="gradient" class="seg-btn">Градиент</button><button data-bg="image" class="seg-btn">Картинка</button></div>
+                <label data-set-label="Цвет фона окна" title="Сплошной фон в режиме «Цвет»; также подложка, пока картинка загружается"><span>Цвет фона</span><input id="th-color" type="color" value="#141824" /></label>
+                <div class="gradient-editor">
+                  <label data-set-label="Градиент фона окна: цвет 1"><span>Цвет 1</span><input id="th-bg-gradient-from" data-theme-bg="gradient" type="color" value="#1a2138" /></label>
+                  <label data-set-label="Градиент фона окна: цвет 2"><span>Цвет 2</span><input id="th-bg-gradient-to" data-theme-bg="gradient" type="color" value="#0d1020" /></label>
+                  <label data-set-label="Градиент фона окна: направление"><span>Направление</span><input id="th-bg-gradient-angle" data-theme-bg="gradient" type="range" min="0" max="360" value="135" /><span class="val" id="th-bg-gradient-angle-v">135°</span></label>
+                  <div id="bg-gradient-preview" class="theme-preview" aria-label="Предпросмотр градиента фона"></div>
+                </div>
+                <label class="theme-stacked" data-set-label="Выражение градиента фона CSS" title="Для сложных градиентов из старых тем. Выбор двух цветов выше заменяет выражение простым градиентом"><span>Градиент: своё выражение</span><input id="th-bg-gradient-css" data-theme-bg="gradient" spellcheck="false" /></label>
+                <div class="row"><button id="btn-bg-pick" data-set-label="Выбрать фоновую картинку">Картинка…</button><button id="btn-bg-clear" data-set-label="Убрать фоновую картинку">Убрать</button></div>
+                <div id="th-bg-image-name" class="muted wrap"></div>
+              </div>
+            </details>
+            <details class="theme-group" id="theme-panels">
+              <summary>Панели</summary>
+              <div class="theme-fields">
+                <div class="muted">Контакты, чат, карточка контакта, верхняя полоса и всплывающие окна.</div>
+                <label data-set-label="Свой цвет панелей"><span>Цвет панелей</span><input id="th-panel" type="color" value="#141824" /></label>
+                <label data-set-label="Плотность панелей" title="0% — прозрачные панели, 100% — сплошные. Меню и уведомления остаются читаемыми"><span>Плотность</span><input id="th-opacity" type="range" min="0" max="100" /><span class="val" id="th-opacity-v"></span></label>
+                <label data-set-label="Стекло размытие панелей" title="Размывает фон за панелями; при плотности 100% фон не виден"><span>Стекло (размытие)</span><input id="th-blur" type="range" min="0" max="30" /><span class="val" id="th-blur-v"></span></label>
+                <label data-set-label="Прозрачность границ промежутков панелей" title="Промежутки между панелями и края окна: 100% — виден фон, меньше — заливка цветом панелей. Заливка видна и под прозрачными панелями"><span>Прозрачность границ</span><input id="th-gap" type="range" min="0" max="100" value="100" /><span class="val" id="th-gap-v"></span></label>
+                <label data-set-label="Цвет рамки панелей и разделителей" title="Рамки панелей, карточек, полей и разделители; активные рамки используют акцент"><span>Цвет рамки</span><input id="th-panel-border" type="color" value="#ffffff" /></label>
+                <label data-set-label="Плотность рамки панелей"><span>Плотность рамки</span><input id="th-panel-border-opacity" type="range" min="0" max="100" /><span class="val" id="th-panel-border-opacity-v"></span></label>
+                <label data-set-label="Скругление углов панелей и карточек"><span>Скругление</span><input id="th-radius" type="range" min="0" max="24" /><span class="val" id="th-radius-v"></span></label>
+              </div>
+            </details>
+            <details class="theme-group" id="theme-text">
+              <summary>Текст</summary>
+              <div class="theme-fields">
+                <label data-set-label="Основной цвет текста"><span>Основной текст</span><input id="th-text" type="color" value="#eef1f8" /></label>
+                <label data-set-label="Приглушённый текст"><span>Приглушённый текст</span><input id="th-muted" type="color" value="#9aa3b8" /></label>
+                <label data-set-label="Цвет ссылок в сообщениях"><span>Ссылки в чате</span><input id="th-link" type="color" value="#7aa2ff" /></label>
+                <label data-set-label="Шрифт интерфейса"><span>Шрифт</span><input id="th-font" placeholder="Segoe UI" /></label>
+              </div>
+            </details>
+            <details class="theme-group" id="theme-buttons">
+              <summary>Кнопки</summary>
+              <div class="theme-fields">
+                <label class="theme-stacked" data-set-label="Режим активных кнопок сплошной цвет градиент" title="Обычные кнопки используют цвет ниже. Режим задаёт заливку активных кнопок и отправки. «Как в старой теме» сохраняет прежний отдельный градиент отправки и тёмные кнопки вложений"><span>Активные кнопки</span><select id="th-button-mode"><option value="legacy">Как в старой теме</option><option value="color">Сплошной цвет</option><option value="gradient">Градиент</option></select></label>
+                <label data-set-label="Цвет обычных кнопок и сплошных активных" title="Обычные кнопки; в режиме «Сплошной цвет» — также активные"><span>Цвет кнопок</span><input id="th-btn" type="color" value="#ffffff" /></label>
+                <label data-set-label="Плотность цвета кнопок"><span>Плотность цвета</span><input id="th-btn-opacity" type="range" min="0" max="100" /><span class="val" id="th-btn-opacity-v"></span></label>
+                <div class="gradient-editor">
+                  <label data-set-label="Градиент активных кнопок: цвет 1"><span>Цвет 1</span><input id="th-button-gradient-from" data-theme-button-gradient type="color" value="#5b8cff" /></label>
+                  <label data-set-label="Градиент активных кнопок: цвет 2"><span>Цвет 2</span><input id="th-button-gradient-to" data-theme-button-gradient type="color" value="#9b59ff" /></label>
+                  <label data-set-label="Градиент активных кнопок: направление"><span>Направление</span><input id="th-button-gradient-angle" data-theme-button-gradient type="range" min="0" max="360" value="135" /><span class="val" id="th-button-gradient-angle-v">135°</span></label>
+                  <div id="button-gradient-preview" class="theme-preview" aria-label="Предпросмотр заливки активных кнопок"></div>
+                </div>
+                <label data-set-label="Текст обычных кнопок"><span>Текст обычных</span><input id="th-btntext" type="color" value="#eef1f8" /></label>
+                <label data-set-label="Текст активных кнопок и отправки" title="Кнопки удаления и завершения звонка сохраняют свой предупреждающий цвет"><span>Текст активных</span><input id="th-active-btntext" type="color" value="#ffffff" /></label>
+              </div>
+            </details>
+            <details class="theme-group" id="theme-accent">
+              <summary>Акцент</summary>
+              <div class="theme-fields">
+                <label data-set-label="Основной акцентный цвет темы" title="Выбранный контакт, активные рамки, индикаторы и своё имя в чате"><span>Основной акцент</span><input id="th-accent" type="color" value="#5b8cff" /></label>
+                <label data-set-label="Второй акцентный цвет темы" title="Второй цвет колец аватаров, полос прогресса и баннера. В старом режиме кнопок — также градиент отправки"><span>Второй акцент</span><input id="th-accent2" type="color" value="#9b59ff" /></label>
+              </div>
+            </details>
+            <details class="theme-group" id="theme-messages">
+              <summary>Сообщения в чате</summary>
+              <div class="theme-fields">
+                <div class="muted">Заливка строки сообщения. Плотность 0% сохраняет прежний прозрачный вид.</div>
+                <label data-set-label="Цвет своих сообщений"><span>Свои сообщения</span><input id="th-message-own" type="color" value="#000000" /></label>
+                <label data-set-label="Плотность своих сообщений"><span>Плотность своих</span><input id="th-message-own-opacity" type="range" min="0" max="100" /><span class="val" id="th-message-own-opacity-v"></span></label>
+                <label data-set-label="Цвет чужих сообщений"><span>Чужие сообщения</span><input id="th-message-peer" type="color" value="#000000" /></label>
+                <label data-set-label="Плотность чужих сообщений"><span>Плотность чужих</span><input id="th-message-peer-opacity" type="range" min="0" max="100" /><span class="val" id="th-message-peer-opacity-v"></span></label>
+              </div>
+            </details>
+            <details class="theme-group" id="theme-inputs">
+              <summary>Поля ввода</summary>
+              <div class="theme-fields">
+                <label data-set-label="Цвет полей ввода поиска списков и текста"><span>Цвет полей</span><input id="th-input" type="color" value="#000000" /></label>
+                <label data-set-label="Плотность полей ввода"><span>Плотность полей</span><input id="th-input-opacity" type="range" min="0" max="100" /><span class="val" id="th-input-opacity-v"></span></label>
+              </div>
+            </details>
+            <details class="theme-group" id="theme-css">
+              <summary>Свой CSS</summary>
+              <div class="theme-fields">
+                <label class="theme-stacked" data-set-label="Пользовательский CSS" title="Свой CSS имеет приоритет над настройками выше"><span>Свой CSS</span><textarea id="th-css" rows="4" placeholder=".msgrow p { font-size: 15px; }"></textarea></label>
+              </div>
+            </details>
+            <div class="row"><button id="btn-theme-save" class="primary">Сохранить</button><button id="btn-theme-export">Экспорт</button><button id="btn-theme-import">Импорт</button><input id="theme-import-file" type="file" accept=".json,application/json" class="hidden" /><button id="btn-theme-reset">Сбросить тему</button></div>
             <div id="presets" class="row"></div>
           </div>
         </details>

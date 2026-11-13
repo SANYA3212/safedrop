@@ -47,6 +47,30 @@ function fileName(p) { return String(p || "").split(/[\\/]/).pop(); }
 function dispName(p) { if (p.name && p.name !== p.ip) return p.nickname ? `${p.name} · ${p.nickname}` : p.name; return p.nickname || p.name || showAddr(p.ip); }
 // адрес для показа: контакт через сервер — коротко, а не 64 знака ключа
 function showAddr(ip) { const s = String(ip ?? ""); return s.startsWith("sd-") ? `сервер · ${s.slice(3, 11)}` : s; }
+// у одного компьютера бывает несколько адресов (LAN, Radmin, через сервер) —
+// это один контакт; показываем тот, через который он доступен в этом режиме
+function peerAddrs(p) { return [...new Set([p?.ip, ...(p?.ips || [])].filter(Boolean))]; }
+function liveAddr(p) {
+  let viaSrv = false;
+  try { viaSrv = srv.mode === "server"; } catch {} // srv объявлен ниже по модулю
+  return peerAddrs(p).find((a) => a.startsWith("sd-") === viaSrv) || p.ip;
+}
+// закреплённые сообщения бывших отдельных контактов-адресов — в чат контакта
+function migratePinned() {
+  const all = pinnedMap();
+  let changed = false;
+  for (const p of peers || []) {
+    for (const a of peerAddrs(p)) {
+      if (a === p.ip || !Array.isArray(all[a])) continue;
+      const rows = [...(all[p.ip] || [])];
+      for (const r of all[a]) if (!rows.some((x) => x.id === r.id)) rows.push(r);
+      all[p.ip] = rows.slice(-5);
+      delete all[a];
+      changed = true;
+    }
+  }
+  if (changed) try { localStorage.setItem(PIN_STORE, JSON.stringify(all)); } catch {}
+}
 function dispAva(p) { return p.custom_avatar || p.avatar || ""; }
 // Avatars and chat images come from peers: accept only a base64 image data URL
 // (or a local file URL we built ourselves), always escaped.
@@ -79,11 +103,75 @@ function showHelp(title, html, actionLabel, actionFn) {
 $("#help-ok").onclick = () => $("#help-modal").classList.add("hidden");
 
 // ---------- theme engine ----------
+// Совпадает с ThemeConfig::default(); старые значения не заменяем при загрузке.
+const THEME_DEFAULT = {
+  bg_mode: "gradient", bg_color: "#141824", bg_gradient: "linear-gradient(135deg,#1a2138,#0d1020)", bg_image: "",
+  blur: 14, opacity: 0.92, gap_opacity: 0, panel_color: "", panel_border_color: "rgba(255,255,255,.09)",
+  accent: "#5b8cff", accent_secondary: "#9b59ff", radius: 14, font: "Segoe UI", custom_css: "",
+  text_color: "#eef1f8", muted_color: "#9aa3b8", btn_color: "rgba(255,255,255,.1)", btn_text: "#eef1f8",
+  active_btn_text: "#ffffff", button_mode: "legacy", link_color: "#7aa2ff",
+  button_gradient_from: "#5b8cff", button_gradient_to: "#9b59ff", button_gradient_angle: 135,
+  message_own_color: "transparent", message_peer_color: "transparent", input_color: "",
+};
+function normalizeTheme(theme = {}) {
+  const t = { ...THEME_DEFAULT, ...theme };
+  // Отделяем панели до первого изменения фона, в том числе у старых тем.
+  t.panel_color = t.panel_color || t.bg_color || THEME_DEFAULT.bg_color;
+  return t;
+}
 function rgbaToHex(s) {
   const m = String(s || "").match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
   if (m) return "#" + [1, 2, 3].map((i) => Number(m[i]).toString(16).padStart(2, "0")).join("");
   if (/^#[0-9a-fA-F]{6}$/.test(String(s || "").trim())) return s.trim();
+  if (/^#[0-9a-fA-F]{3}$/.test(String(s || "").trim())) return "#" + s.trim().slice(1).split("").map((c) => c + c).join("");
   return null;
+}
+function colorAlpha(s) {
+  if (s === "transparent") return 0;
+  const m = String(s || "").match(/^rgba\([^,]+,[^,]+,[^,]+,\s*([\d.]+)\s*\)$/i);
+  return m ? Math.min(1, Math.max(0, Number(m[1]))) : 1;
+}
+// Цвет и его плотность редактируются раздельно, хранятся одной CSS-строкой.
+// Не трогаем исходную строку, пока соответствующие поля не изменились.
+function themeColor(id, old, fallback = old) {
+  const hex = $("#" + id).value;
+  const alpha = Number($("#" + id + "-opacity").value) / 100;
+  const previous = old || fallback;
+  if (hex.toLowerCase() === (rgbaToHex(previous) || "#000000").toLowerCase() && Math.round(colorAlpha(previous) * 100) === Math.round(alpha * 100)) return old;
+  return hexA(hex, alpha);
+}
+function syncThemeColor(id, color) {
+  $("#" + id).value = rgbaToHex(color) || "#000000";
+  $("#" + id + "-opacity").value = Math.round(colorAlpha(color) * 100);
+}
+function backgroundGradientParts(value) {
+  const m = String(value).match(/^linear-gradient\(\s*([\d.]+)deg\s*,\s*(#[\da-f]{6})\s*,\s*(#[\da-f]{6})\s*\)$/i);
+  return m ? { angle: Number(m[1]), from: m[2], to: m[3] } : { angle: 135, from: "#1a2138", to: "#0d1020" };
+}
+function syncBackgroundGradient() {
+  const g = backgroundGradientParts(settings.theme.bg_gradient);
+  $("#th-bg-gradient-from").value = g.from;
+  $("#th-bg-gradient-to").value = g.to;
+  $("#th-bg-gradient-angle").value = g.angle;
+  $("#th-bg-gradient-css").value = settings.theme.bg_gradient;
+}
+function syncThemeControls() {
+  const t = settings.theme;
+  const values = {
+    "th-color": t.bg_color, "th-panel": t.panel_color, "th-button-mode": t.button_mode,
+    "th-button-gradient-from": t.button_gradient_from, "th-button-gradient-to": t.button_gradient_to,
+    "th-button-gradient-angle": t.button_gradient_angle, "th-blur": t.blur, "th-opacity": Math.round(t.opacity * 100),
+    "th-gap": Math.round((1 - t.gap_opacity) * 100), "th-accent": t.accent, "th-accent2": t.accent_secondary,
+    "th-radius": t.radius, "th-font": t.font, "th-css": t.custom_css, "th-text": t.text_color,
+    "th-muted": t.muted_color, "th-btntext": t.btn_text, "th-active-btntext": t.active_btn_text, "th-link": t.link_color,
+  };
+  for (const [id, value] of Object.entries(values)) document.getElementById(id).value = value;
+  syncThemeColor("th-btn", t.btn_color);
+  syncThemeColor("th-panel-border", t.panel_border_color);
+  syncThemeColor("th-message-own", t.message_own_color);
+  syncThemeColor("th-message-peer", t.message_peer_color);
+  syncThemeColor("th-input", t.input_color || "rgba(0,0,0,.35)");
+  syncBackgroundGradient();
 }
 function hexA(hex, a) {
   let h = String(hex || "#141824").replace("#", "");
@@ -93,21 +181,37 @@ function hexA(hex, a) {
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
 function applyTheme() {
-  const t = settings.theme || {};
+  const t = normalizeTheme(settings.theme);
   const base = t.bg_color || "#141824";
-  const alpha = t.opacity ?? 0.85;
+  const panel = t.panel_color;
+  const alpha = t.opacity;
   const bg = $("#bg");
   if (t.bg_mode === "color") bg.style.background = base;
   else if (t.bg_mode === "image" && t.bg_image) bg.style.background = `url("${tauriFile(t.bg_image)}") center/cover`;
   else bg.style.background = t.bg_gradient || base;
   document.body.style.background = base;
   const r = document.documentElement.style;
+  // Эти переменные раньше задавались только CSS. Сохраняем приоритет
+  // пользовательского CSS; setProperty не позволяет строке выйти из правила.
+  const tokens = $("#theme-tokens").sheet.cssRules[0].style;
   r.setProperty("--bg", base);
+  r.setProperty("--gradient", t.bg_gradient || base);
   r.setProperty("--accent", t.accent || "#5b8cff");
+  tokens.setProperty("--accent2", t.accent_secondary || "#9b59ff");
   r.setProperty("--button-gradient-from", t.button_gradient_from || "#5b8cff");
   r.setProperty("--button-gradient-to", t.button_gradient_to || "#9b59ff");
   r.setProperty("--button-gradient-angle", `${t.button_gradient_angle ?? 135}deg`);
-  r.setProperty("--radius", `${t.radius ?? 18}px`);
+  const buttonGradient = "linear-gradient(var(--button-gradient-angle),var(--button-gradient-from),var(--button-gradient-to))";
+  const activeButton = t.button_mode === "color" ? "var(--btn)" : buttonGradient;
+  if (t.button_mode === "legacy") {
+    r.removeProperty("--active-btn"); r.removeProperty("--send-btn");
+    r.removeProperty("--composer-btn"); r.removeProperty("--composer-btn-text");
+  } else {
+    r.setProperty("--active-btn", activeButton); r.setProperty("--send-btn", activeButton);
+    r.setProperty("--composer-btn", "var(--btn)"); r.setProperty("--composer-btn-text", "var(--btn-text)");
+  }
+  r.setProperty("--active-btn-text", t.active_btn_text);
+  r.setProperty("--radius", `${t.radius}px`);
   r.setProperty("--blur", `${t.blur ?? 14}px`);
   r.setProperty("--font", t.font || "Segoe UI");
   r.setProperty("--text", t.text_color || "#eef1f8");
@@ -115,15 +219,42 @@ function applyTheme() {
   r.setProperty("--btn", t.btn_color || "rgba(255,255,255,.1)");
   r.setProperty("--btn-text", t.btn_text || "#eef1f8");
   r.setProperty("--link", t.link_color || "#7aa2ff");
-  r.setProperty("--panel", hexA(base, alpha));
-  r.setProperty("--panel2", hexA(base, Math.min(1, alpha + 0.08)));
+  r.setProperty("--panel", hexA(panel, alpha));
+  // меню, подсказки и окна поверх — читаемыми даже при плотности 0
+  r.setProperty("--panel2", hexA(panel, Math.min(1, Math.max(0.55, alpha + 0.08))));
+  // промежутки между панелями и края окна: заливка цветом панелей (0 — сквозь
+  // них виден фон, как раньше). Заливка лежит и под панелями, поэтому их
+  // собственная плотность пересчитана: вместе выходит ровно «Плотность»
+  const gapA = Math.min(1, Math.max(0, Number(t.gap_opacity) || 0));
+  const inA = gapA >= alpha ? 0 : 1 - (1 - alpha) / (1 - gapA);
+  r.setProperty("--gap-tint", hexA(panel, gapA));
+  r.setProperty("--panel-in", hexA(panel, inA));
+  tokens.setProperty("--line", t.panel_border_color);
+  r.setProperty("--message-own", t.message_own_color);
+  r.setProperty("--message-peer", t.message_peer_color);
+  const gv = $("#th-gap-v"); if (gv) gv.textContent = `${Math.round((1 - gapA) * 100)}%`;
   r.setProperty("--card", "rgba(255,255,255,.055)");
+  // Старый --input используется также под вкладками и значками: эти классы
+  // не перекрашиваем настройкой полей ввода.
   r.setProperty("--input", "rgba(0,0,0,.35)");
+  if (t.input_color) r.setProperty("--field-input", t.input_color);
+  else r.removeProperty("--field-input");
   r.setProperty("--hover", "rgba(255,255,255,.08)");
   $("#custom-css").textContent = t.custom_css || "";
   const bv = $("#th-blur-v"); if (bv) bv.textContent = `${t.blur ?? 14}px`;
   const ov = $("#th-opacity-v"); if (ov) ov.textContent = `${Math.round(alpha * 100)}%`;
-  const rv = $("#th-radius-v"); if (rv) rv.textContent = `${t.radius ?? 18}px`;
+  const rv = $("#th-radius-v"); if (rv) rv.textContent = `${t.radius}px`;
+  for (const id of ["th-btn", "th-panel-border", "th-message-own", "th-message-peer", "th-input"]) {
+    $("#" + id + "-opacity-v").textContent = `${$("#" + id + "-opacity").value}%`;
+  }
+  $("#th-button-gradient-angle-v").textContent = `${t.button_gradient_angle}°`;
+  $("#button-gradient-preview").style.background = activeButton;
+  $("#th-bg-gradient-angle-v").textContent = `${$("#th-bg-gradient-angle").value}°`;
+  $("#bg-gradient-preview").style.background = t.bg_gradient;
+  $("#th-bg-image-name").textContent = t.bg_image ? fileName(t.bg_image) : "Картинка не выбрана";
+  // Не скрываем поля режима: поиск по настройкам должен находить их всегда.
+  document.querySelectorAll("[data-theme-bg]").forEach((el) => { el.disabled = el.dataset.themeBg !== t.bg_mode; });
+  document.querySelectorAll("[data-theme-button-gradient]").forEach((el) => { el.disabled = t.button_mode === "color"; });
   document.querySelectorAll(".seg-theme .seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.bg === (t.bg_mode || "gradient")));
 }
 
@@ -248,24 +379,9 @@ async function loadAll() {
   settings = await invoke("get_settings");
   try { profile = await invoke("get_profile"); } catch { profile = { nickname: "", avatar: "" }; }
   peers = await invoke("get_peers");
-  const t = settings.theme || {};
-  $("#th-color").value = t.bg_color || "#141824";
-  $("#th-button-gradient-from").value = t.button_gradient_from || "#5b8cff";
-  $("#th-button-gradient-to").value = t.button_gradient_to || "#9b59ff";
-  $("#th-button-gradient-angle").value = t.button_gradient_angle ?? 135;
-  $("#th-button-gradient-angle-v").textContent = `${$("#th-button-gradient-angle").value}°`;
-  $("#button-gradient-preview").style.background = `linear-gradient(${t.button_gradient_angle ?? 135}deg,${t.button_gradient_from || "#5b8cff"},${t.button_gradient_to || "#9b59ff"})`;
-  $("#th-blur").value = t.blur ?? 14;
-  $("#th-opacity").value = Math.round((t.opacity ?? 0.85) * 100);
-  $("#th-accent").value = t.accent || "#5b8cff";
-  $("#th-radius").value = t.radius ?? 18;
-  $("#th-font").value = t.font || "Segoe UI";
-  $("#th-css").value = t.custom_css || "";
-  const tc = $("#th-text"); if (tc) tc.value = t.text_color || "#eef1f8";
-  const mc = $("#th-muted"); if (mc) mc.value = t.muted_color || "#9aa3b8";
-  const bc = $("#th-btn"); if (bc) bc.value = rgbaToHex(t.btn_color) || "#333a4d";
-  const bt = $("#th-btntext"); if (bt) bt.value = t.btn_text || "#eef1f8";
-  const lk = $("#th-link"); if (lk) lk.value = t.link_color || "#7aa2ff";
+  try { migratePinned(); } catch {} // склейка контактов при запуске (ident.rs)
+  settings.theme = normalizeTheme(settings.theme);
+  syncThemeControls();
   $("#set-device").value = settings.device_name;
   $("#set-port").value = settings.tcp_port;
   $("#set-udp").checked = !!settings.udp_enabled;
@@ -378,7 +494,11 @@ function renderMyAvatar() {
 // ---------- contacts ----------
 function filteredPeers() {
   const q = ($("#peer-search").value || "").toLowerCase();
-  return peers.filter((p) => !q || dispName(p).toLowerCase().includes(q) || p.ip.includes(q));
+  // События приходят из HashMap без порядка, таймер — с другим порядком.
+  // Сортируем копию, чтобы выделение и сам массив peers не менялись.
+  return peers.filter((p) => !q || dispName(p).toLowerCase().includes(q) || p.ip.includes(q))
+    .sort((a, b) => Number(!!b.online) - Number(!!a.online) || Number(!!b.trusted) - Number(!!a.trusted)
+      || dispName(a).localeCompare(dispName(b), "ru", { sensitivity: "base" }) || a.ip.localeCompare(b.ip));
 }
 function renderAll() { renderContacts(); renderGroups(); renderConv(); renderPeerCard(); }
 function renderContacts() {
@@ -396,7 +516,7 @@ function renderContacts() {
     d.className = "contact" + (p.ip === selectedIp ? " active" : "");
     const typingKey = p.ip; // личный чат
     const typingLabelText = typingPeers.has(typingKey) && typingPeers.get(typingKey)?.size ? typingLabel(typingKey) : "";
-    d.innerHTML = `${avaHTML(p, "sm")}<div class="meta"><b><span class="nm">${esc(dispName(p))}</span>${typingLabelText ? `<span class="typing-badge" style="margin-left:6px;font-size:11px;color:#3ddc84;">${esc(typingLabelText)}</span>` : ""}${p.trusted ? '<svg class="ic" viewBox="0 0 24 24" style="color:#f5c518"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z"/></svg>' : ""}</b><small>${p.online ? `<span style="color:#3ddc84">●</span> ${p.ping_ms ?? "?"} мс · ${esc(showAddr(p.ip))}` : `<span style="color:#666">●</span> ${esc(showAddr(p.ip))}`}${stateBadge(p.state)}${(p.state && p.state !== "idle" && p.detail) ? ` · ${esc(p.detail)}` : ""}</small></div>${unread[p.ip] ? `<span class="unread">${unread[p.ip]}</span>` : ""}`;
+    d.innerHTML = `${avaHTML(p, "sm")}<div class="meta"><b><span class="nm">${esc(dispName(p))}</span>${typingLabelText ? `<span class="typing-badge" style="margin-left:6px;font-size:11px;color:#3ddc84;">${esc(typingLabelText)}</span>` : ""}${p.trusted ? '<svg class="ic" viewBox="0 0 24 24" style="color:#f5c518"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z"/></svg>' : ""}</b><small>${p.online ? `<span style="color:#3ddc84">●</span> ${p.ping_ms ?? "?"} мс · ${esc(showAddr(liveAddr(p)))}` : `<span style="color:#666">●</span> ${esc(showAddr(liveAddr(p)))}`}${stateBadge(p.state)}${(p.state && p.state !== "idle" && p.detail) ? ` · ${esc(p.detail)}` : ""}</small></div>${unread[p.ip] ? `<span class="unread">${unread[p.ip]}</span>` : ""}`;
     d.onclick = () => selectPeer(p.ip);
     box.appendChild(d);
   }
@@ -432,7 +552,7 @@ function renderConv() {
     return;
   }
   $("#conv-name").textContent = dispName(p);
-  $("#conv-sub").textContent = `${showAddr(p.ip)} · ${p.online ? `в сети · ${p.ping_ms ?? "?"} мс` : "не в сети"}`;
+  $("#conv-sub").textContent = `${showAddr(liveAddr(p))} · ${p.online ? `в сети · ${p.ping_ms ?? "?"} мс` : "не в сети"}`;
   $("#conv-ava").outerHTML = avaHTML(p, "md").replace('class="ava md', 'id="conv-ava" class="ava md');
   $("#btn-hangup").classList.toggle("hidden", !currentCall);
 }
@@ -466,7 +586,10 @@ function renderPeerCard() {
   const p = sel();
   if (!p) { $("#rc-nick").textContent = "—"; $("#rc-sub").textContent = "Выбери контакт слева"; $("#rc-ping").textContent = "—"; $("#rc-avatar").outerHTML = '<span id="rc-avatar" class="ava lg"><span>?</span></span>'; return; } // сброс аватарки/счётчика от прежней группы
   $("#rc-nick").textContent = dispName(p);
-  $("#rc-sub").textContent = p.nickname ? `ник: ${p.nickname} · ${showAddr(p.ip)}` : showAddr(p.ip);
+  // все адреса этого компьютера: LAN, Radmin, через сервер
+  const addrs = peerAddrs(p).map(showAddr).join(", ");
+  $("#rc-sub").textContent = p.nickname ? `ник: ${p.nickname} · ${addrs}` : addrs;
+  $("#rc-sub").title = peerAddrs(p).length > 1 ? "Один компьютер с несколькими адресами: SafeDrop узнаёт его по ключу устройства" : "";
   $("#rc-ping").innerHTML = p.online ? `<span style="color:#3ddc84">●</span> в сети · ${p.ping_ms ?? "?"} мс` : `<span style="color:#666">●</span> не в сети`;
   $("#rc-avatar").outerHTML = avaHTML(p, "lg").replace('class="ava lg', 'id="rc-avatar" class="ava lg');
   $("#rc-trust").innerHTML = p.trusted ? '<svg class="ic" viewBox="0 0 24 24" style="color:#f5c518"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
@@ -576,7 +699,7 @@ function openGroupModal(g) {
   const inG = new Set(g?.members || []);
   for (const p of peers) {
     const l = document.createElement("label");
-    l.innerHTML = `<input type="checkbox" data-ip="${esc(p.ip)}" ${inG.has(p.ip) ? "checked" : ""} /> ${esc(dispName(p))} <span class="muted">${esc(showAddr(p.ip))}</span>`;
+    l.innerHTML = `<input type="checkbox" data-ip="${esc(p.ip)}" ${inG.has(p.ip) ? "checked" : ""} /> ${esc(dispName(p))} <span class="muted">${esc(showAddr(liveAddr(p)))}</span>`;
     box.appendChild(l);
   }
   if (!peers.length) box.innerHTML = `<div class="empty-hint">Нет контактов — сначала добавь.</div>`;
@@ -2969,7 +3092,7 @@ function openPicker(file) {
   for (const p of peers) {
     const d = document.createElement("div");
     d.className = "pick-row";
-    d.innerHTML = `${avaHTML(p, "sm")}<div><b>${esc(dispName(p))}</b><div class="muted">${esc(showAddr(p.ip))} · ${p.online ? "в сети" : "не в сети"}</div></div>`;
+    d.innerHTML = `${avaHTML(p, "sm")}<div><b>${esc(dispName(p))}</b><div class="muted">${esc(showAddr(liveAddr(p)))} · ${p.online ? "в сети" : "не в сети"}</div></div>`;
     d.onclick = async () => { $("#pick-modal").classList.add("hidden"); await selectPeer(p.ip); sendPaths(p.ip, [pendingFile]); };
     box.appendChild(d);
   }
@@ -3145,8 +3268,10 @@ function renderCallStage() {
   const addPeer = (ip) => {
     const p = peers.find((x) => x.ip === ip);
     const alive = currentCall === ip || !!gpc[ip]?.pc;
+    // он сейчас показывает экран (мы смотрим) — видно прямо на его плитке
+    const sharing = Object.values(views).some((v) => v.ip === ip);
     const d = document.createElement("div");
-    d.innerHTML = tileHTML({ key: ip, ava: avaHTML(p || { name: ip, ip, online: alive }, "lg"), name: p ? dispName(p) : ip, sub: alive ? `${p?.ping_ms ?? "?"} мс` : "вышел", mic: '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><path d="M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z"/><path d="M14,3.23v2.06a7,7,0,0,1,0,13.42v2.06a9,9,0,0,0,0-17.54Z"/></svg>', off: !alive });
+    d.innerHTML = tileHTML({ key: ip, ava: avaHTML(p || { name: ip, ip, online: alive }, "lg"), name: p ? dispName(p) : ip, sub: alive ? (sharing ? `показывает экран · ${p?.ping_ms ?? "?"} мс` : `${p?.ping_ms ?? "?"} мс`) : "вышел", mic: '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><path d="M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z"/><path d="M14,3.23v2.06a7,7,0,0,1,0,13.42v2.06a9,9,0,0,0,0-17.54Z"/></svg>', off: !alive });
     box.appendChild(d.firstChild);
   };
   if (currentCall) addPeer(currentCall);
@@ -3809,7 +3934,8 @@ async function startShareStream(stream, label, withAudio, kind = "screen", audio
       await invoke("sig_send", { peerIp: ip, payload: { kind: "screen-offer", from: myNick(), sdp: JSON.stringify(offer), share_id: shareId, label, with_audio: withAudio, call_id: callId } });
     } catch (e) { toast(`${ip}: ${e}`, true); }
   }
-  updateScreenBtn(); updateCameraBtn(); renderStages(); renderCallScreen(); updateBusy();
+  // плитка «мой экран» — рядом с людьми в звонке, а не только во вкладке «Экраны»
+  updateScreenBtn(); updateCameraBtn(); renderStages(); renderCallStage(); updateBusy();
   toast(`<svg class='ic' viewBox='0 0 24 24'><path d='M14,10V22H4a2,2,0,0,1-2-2V10Z'/><path d='M22,10V20a2,2,0,0,1-2,2H16V10Z'/><path d='M22,4V8H2V4A2,2,0,0,1,4,2H20A2,2,0,0,1,22,4Z'/></svg> ${kind === "camera" ? "Камера включена" : "Показываешь экран"} (${targets.length})${withAudio ? " со звуком" : ""}`);
 }
 function updateScreenBtn() {
@@ -4699,16 +4825,42 @@ $("#noise-smooth").addEventListener("input", (e) => {
 });
 $("#noise-smooth").addEventListener("change", () => invoke("save_settings", { settings }).catch(() => {}));
 function collectTheme() {
-  return { bg_mode: document.querySelector(".seg-theme .seg-btn.active")?.dataset.bg || "gradient", bg_color: $("#th-color").value, bg_gradient: settings.theme?.bg_gradient || "linear-gradient(135deg,#1a2138,#0d1020)", bg_image: settings.theme?.bg_image || "", blur: parseInt($("#th-blur").value) || 0, opacity: (parseInt($("#th-opacity").value) || 85) / 100, accent: $("#th-accent").value, button_gradient_from: $("#th-button-gradient-from").value, button_gradient_to: $("#th-button-gradient-to").value, button_gradient_angle: Number($("#th-button-gradient-angle").value) || 0, radius: parseInt($("#th-radius").value) || 18, font: $("#th-font").value || "Segoe UI", custom_css: $("#th-css").value || "", text_color: $("#th-text")?.value || "#eef1f8", muted_color: $("#th-muted")?.value || "#9aa3b8", btn_color: $("#th-btn")?.value || "rgba(255,255,255,.1)", btn_text: $("#th-btntext")?.value || "#eef1f8", link_color: $("#th-link")?.value || "#7aa2ff" };
+  const old = normalizeTheme(settings.theme);
+  return {
+    bg_mode: document.querySelector(".seg-theme .seg-btn.active")?.dataset.bg || "gradient",
+    bg_color: $("#th-color").value,
+    bg_gradient: CSS.supports("background-image", $("#th-bg-gradient-css").value) ? $("#th-bg-gradient-css").value : old.bg_gradient,
+    bg_image: old.bg_image,
+    panel_color: $("#th-panel").value, panel_border_color: themeColor("th-panel-border", old.panel_border_color),
+    blur: Number($("#th-blur").value), opacity: Number($("#th-opacity").value) / 100,
+    gap_opacity: 1 - Number($("#th-gap").value) / 100,
+    accent: $("#th-accent").value, accent_secondary: $("#th-accent2").value,
+    button_mode: $("#th-button-mode").value, btn_color: themeColor("th-btn", old.btn_color),
+    btn_text: $("#th-btntext").value, active_btn_text: $("#th-active-btntext").value,
+    button_gradient_from: $("#th-button-gradient-from").value, button_gradient_to: $("#th-button-gradient-to").value,
+    button_gradient_angle: Number($("#th-button-gradient-angle").value), radius: Number($("#th-radius").value),
+    font: $("#th-font").value || "Segoe UI", custom_css: $("#th-css").value,
+    text_color: $("#th-text").value, muted_color: $("#th-muted").value, link_color: $("#th-link").value,
+    message_own_color: themeColor("th-message-own", old.message_own_color),
+    message_peer_color: themeColor("th-message-peer", old.message_peer_color), input_color: themeColor("th-input", old.input_color, "rgba(0,0,0,.35)"),
+  };
 }
-["th-color","th-button-gradient-from","th-button-gradient-to","th-button-gradient-angle","th-blur","th-opacity","th-accent","th-radius","th-font","th-text","th-muted","th-btn","th-btntext","th-link"].forEach((id) => document.getElementById(id)?.addEventListener("input", () => {
-  settings.theme = { ...collectTheme(), bg_image: settings.theme?.bg_image || "" };
-  $("#th-button-gradient-angle-v").textContent = `${$("#th-button-gradient-angle").value}°`;
-  $("#button-gradient-preview").style.background = `linear-gradient(${settings.theme.button_gradient_angle}deg,${settings.theme.button_gradient_from},${settings.theme.button_gradient_to})`;
+document.querySelectorAll("#sec-appearance input[id^='th-'], #sec-appearance select, #th-css").forEach((el) => el.addEventListener("input", () => {
+  if (el.id === "th-bg-gradient-css") {
+    const valid = CSS.supports("background-image", el.value);
+    el.setCustomValidity(valid ? "" : "Нужно корректное выражение градиента");
+    if (!valid) return;
+  }
+  if (["th-bg-gradient-from", "th-bg-gradient-to", "th-bg-gradient-angle"].includes(el.id)) {
+    $("#th-bg-gradient-css").value = `linear-gradient(${$("#th-bg-gradient-angle").value}deg,${$("#th-bg-gradient-from").value},${$("#th-bg-gradient-to").value})`;
+  }
+  // Редактирование градиента завершает совместимый смешанный режим.
+  if (el.hasAttribute("data-theme-button-gradient") && $("#th-button-mode").value === "legacy") $("#th-button-mode").value = "gradient";
+  settings.theme = collectTheme();
+  if (el.id === "th-bg-gradient-css") syncBackgroundGradient();
   applyTheme();
 }));
 document.querySelectorAll(".seg-theme .seg-btn").forEach((b) => b.onclick = () => { settings.theme = { ...collectTheme(), bg_mode: b.dataset.bg, bg_image: settings.theme?.bg_image || "" }; applyTheme(); });
-$("#th-css")?.addEventListener("input", () => { settings.theme.custom_css = $("#th-css").value; $("#custom-css").textContent = settings.theme.custom_css; });
 $("#btn-bg-pick").onclick = async () => {
   try {
     const path = await invoke("pick_image");
@@ -4734,9 +4886,11 @@ $("#btn-theme-export").onclick = () => {
 // Берём только известные поля оформления с проверкой типов; картинку фона,
 // если в файле её нет, оставляем свою.
 const THEME_KEYS = {
-  bg_mode: "s", bg_color: "s", bg_gradient: "s", bg_image: "s", blur: "n", opacity: "n", accent: "s",
+  bg_mode: "s", bg_color: "s", bg_gradient: "s", bg_image: "s", blur: "n", opacity: "n", gap_opacity: "n", accent: "s",
   button_gradient_from: "s", button_gradient_to: "s", button_gradient_angle: "n", radius: "n", font: "s",
   custom_css: "s", text_color: "s", muted_color: "s", btn_color: "s", btn_text: "s", link_color: "s",
+  panel_color: "s", panel_border_color: "s", button_mode: "s", active_btn_text: "s", accent_secondary: "s",
+  message_own_color: "s", message_peer_color: "s", input_color: "s",
 };
 function themeFromFile(obj) {
   if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("это не файл темы");
@@ -4748,6 +4902,11 @@ function themeFromFile(obj) {
   }
   if (!Object.keys(out).length) throw new Error("в файле нет настроек оформления");
   if (out.bg_mode && !["gradient", "color", "image"].includes(out.bg_mode)) delete out.bg_mode;
+  if (out.button_mode && !["legacy", "color", "gradient"].includes(out.button_mode)) delete out.button_mode;
+  // Типы и диапазоны соответствуют Rust: импорт не должен ломать сохранение.
+  for (const [key, min, max, integer] of [["blur", 0, 30, true], ["radius", 0, 24, true], ["opacity", 0, 1, false], ["gap_opacity", 0, 1, false], ["button_gradient_angle", 0, 360, true]]) {
+    if (key in out) out[key] = Math.min(max, Math.max(min, integer ? Math.round(out[key]) : out[key]));
+  }
   if (out.bg_image && /^(\\\\|\/\/)|:\/\//.test(out.bg_image)) delete out.bg_image;
   return out;
 }
@@ -4790,7 +4949,8 @@ $("#theme-import-file").onchange = async (e) => {
       }
     }
     const keepImage = !imported.bg_image && settings.theme && settings.theme.bg_image;
-    settings.theme = Object.assign({}, settings.theme, imported);
+    // Отсутствующие новые поля означают старый вид, а не цвета текущей темы.
+    settings.theme = normalizeTheme(imported);
     if (keepImage) settings.theme.bg_image = keepImage;
     if (settings.theme.bg_mode === "image" && !settings.theme.bg_image) {
       toast("Тема импортирована. В ней фон-картинка — выбери свою кнопкой «Картинка…»");
@@ -4800,7 +4960,7 @@ $("#theme-import-file").onchange = async (e) => {
   } catch (err) { toast("Не удалось импортировать тему: " + (err && err.message ? err.message : err), true); }
 };
 $("#btn-theme-reset").onclick = async () => {
-  settings.theme = { bg_mode: "gradient", bg_color: "#141824", bg_gradient: "linear-gradient(135deg,#1a2138,#0d1020)", bg_image: "", blur: 14, opacity: 0.85, accent: "#5b8cff", button_gradient_from: "#5b8cff", button_gradient_to: "#9b59ff", button_gradient_angle: 135, radius: 18, font: "Segoe UI", custom_css: "", text_color: "#eef1f8", muted_color: "#9aa3b8", btn_color: "rgba(255,255,255,.1)", btn_text: "#eef1f8", link_color: "#7aa2ff" };
+  settings.theme = normalizeTheme();
   try { await invoke("save_settings", { settings }); loadAll(); } catch (e) { toast("" + e, true); }
 };
 document.querySelectorAll("#seg .seg-btn").forEach((b) => b.onclick = () => switchSeg(b.dataset.seg));
@@ -5147,10 +5307,11 @@ const PRESETS = [
   { name: "Графит", theme: { bg_mode: "color", bg_color: "#1b1e27", bg_gradient: "", bg_image: "", blur: 0, opacity: 1, accent: "#5b8cff", radius: 14, font: "Segoe UI", custom_css: "", text_color: "#eef1f8", muted_color: "#9aa3b8", btn_color: "#333a4d", btn_text: "#eef1f8", link_color: "#7aa2ff" } },
 ];
 const pr = $("#presets");
-PRESETS.forEach((p) => { const b = document.createElement("button"); b.textContent = p.name; b.onclick = async () => { settings.theme = structuredClone(p.theme); try { await invoke("save_settings", { settings }); loadAll(); } catch (e) { toast("" + e, true); } }; pr.appendChild(b); });
+PRESETS.forEach((p) => { const b = document.createElement("button"); b.textContent = p.name; b.onclick = async () => { settings.theme = normalizeTheme(p.theme); try { await invoke("save_settings", { settings }); loadAll(); } catch (e) { toast("" + e, true); } }; pr.appendChild(b); });
 
 // ---------- аккордеон настроек: 9 секций, состояние запоминается ----------
-const ACC_SECTION_IDS = ["sec-profile", "sec-net", "sec-call", "sec-notif", "sec-chat", "sec-files", "sec-appearance", "sec-system", "sec-about"];
+const ACC_SECTION_IDS = ["sec-profile", "sec-net", "sec-call", "sec-notif", "sec-chat", "sec-files", "sec-appearance", "sec-system", "sec-about",
+  "theme-window", "theme-panels", "theme-text", "theme-buttons", "theme-accent", "theme-messages", "theme-inputs", "theme-css"];
 function sectionsOpenMap() { return (settings.sections_open && typeof settings.sections_open === "object") ? settings.sections_open : {}; }
 let accProgrammatic = false;
 function renderAccordionState() {
@@ -5160,7 +5321,7 @@ function renderAccordionState() {
     const d = document.getElementById(id);
     if (!d) return;
     if (id in open) d.open = !!open[id];
-    if (!(id in open)) d.open = false; // дефолт: всё закрыто, первый запуск не шумит
+    if (!(id in open)) d.open = id === "theme-window"; // первая группа внутри закрытого раздела
   });
   setTimeout(() => { accProgrammatic = false; }, 0);
 }
@@ -5168,7 +5329,7 @@ let accSaveTimer = null;
 function bindAccordion() {
   const acc = $("#settings-acc");
   if (!acc) return;
-  acc.querySelectorAll("details.set-sec").forEach((d) => {
+  acc.querySelectorAll("details.set-sec, details.theme-group").forEach((d) => {
     d.addEventListener("toggle", () => {
       // поиск/восстановление состояния не должны перезаписывать настройку
       if (accProgrammatic || ($("#set-search")?.value || "").trim()) return;
@@ -5193,7 +5354,7 @@ function restoreSettingsSearch() {
     el.normalize();
   }
   setSearchOriginal.clear();
-  document.querySelectorAll("#settings-acc .set-hit, #settings-acc .set-dim, .set-sec.set-nohits")
+  document.querySelectorAll("#settings-acc .set-hit, #settings-acc .set-dim, #settings-acc .set-nohits")
     .forEach((el) => el.classList.remove("set-hit", "set-dim", "set-nohits"));
   renderAccordionState(); // вернуть запомненное состояние секций
 }
@@ -5213,12 +5374,18 @@ function runSettingsSearch() {
   let any = false;
   acc.querySelectorAll("details.set-sec").forEach((sec) => {
     let secHit = false;
+    const groupHits = new Set();
+    sec.querySelectorAll(".theme-group").forEach((group) => {
+      const summary = group.querySelector("summary");
+      if (summary.textContent.toLowerCase().includes(q)) { groupHits.add(group); markTextMatches(summary, q); }
+    });
     const rows = [...sec.querySelectorAll(rowSel)]
       .filter((el) => !el.parentElement?.closest(rowSel)); // только верхние строки
     for (const el of rows) {
       const labelText = (el.dataset.setLabel || "").toLowerCase();
       const bodyText = el.textContent.toLowerCase();
-      if (labelText.includes(q) || bodyText.includes(q)) {
+      const group = el.closest(".theme-group");
+      if (labelText.includes(q) || bodyText.includes(q) || groupHits.has(group)) {
         secHit = true; any = true;
         el.classList.add("set-hit");
         markTextMatches(el, q);
@@ -5229,6 +5396,11 @@ function runSettingsSearch() {
     // заголовки: только подсветка, не скрываем
     sec.querySelectorAll("h3").forEach((h) => {
       if (h.textContent.toLowerCase().includes(q)) { secHit = true; any = true; markTextMatches(h, q); }
+    });
+    sec.querySelectorAll(".theme-group").forEach((group) => {
+      const hit = groupHits.has(group) || !!group.querySelector(".set-hit");
+      if (hit) { group.open = true; secHit = true; any = true; }
+      else group.classList.add("set-nohits");
     });
     if (secHit) sec.open = true;
     else sec.classList.add("set-nohits");
@@ -5247,7 +5419,7 @@ function markTextMatches(el, q) {
   const targets = [];
   while (walker.nextNode()) {
     const n = walker.currentNode;
-    if (n.nodeValue.toLowerCase().includes(q)) targets.push(n);
+    if (!n.parentElement?.closest("select, textarea, input") && n.nodeValue.toLowerCase().includes(q)) targets.push(n);
   }
   for (const n of targets) {
     const text = n.nodeValue;
@@ -5429,8 +5601,26 @@ try {
   await listen("safedrop-peers", async (e) => {
     peers = Array.isArray(e.payload) ? e.payload : await invoke("get_peers").catch(() => peers);
     checkLinuxPeerVersions();
+    migratePinned();
     if (!sel() && !selGroup && peers.length) { selectedIp = peers[0].ip; try { chats[selectedIp] = await invoke("get_chat", { peerIp: selectedIp }); chats[selectedIp].forEach((m) => seenIds.add(m.id)); } catch {} }
     renderAll(); renderChat(); renderCallStage();
+  });
+  // новый адрес оказался уже знакомым компьютером (тот же ключ): его чат
+  // переехал в чат контакта — перечитать, непрочитанные перенести
+  await listen("safedrop-contacts-merged", async (e) => {
+    const map = e.payload || {};
+    let reload = false;
+    for (const [from, to] of Object.entries(map)) {
+      if (unread[from]) { unread[to] = (unread[to] || 0) + unread[from]; delete unread[from]; }
+      delete chats[from]; delete chats[to];
+      if (selectedIp === from) selectedIp = to;
+      if (selectedIp === to) reload = true;
+    }
+    if (reload && !selGroup) {
+      try { chats[selectedIp] = await invoke("get_chat", { peerIp: selectedIp }); chats[selectedIp].forEach((m) => seenIds.add(m.id)); } catch { chats[selectedIp] = []; }
+    }
+    migratePinned();
+    renderAll(); renderChat();
   });
   await listen("safedrop-chat", (e) => {
     const m = e.payload;

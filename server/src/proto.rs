@@ -58,9 +58,23 @@ pub enum ToServer {
     Name { name: String },
     #[serde(rename = "ping")]
     Ping,
+    /// Свой пинг до сервера (мс, замер ping→pong). Сервер в ответ шлёт
+    /// `Rtts`: пинг до собеседника через сервер = свой + его.
+    #[serde(rename = "rtt")]
+    Rtt { ms: u32 },
     #[serde(other)]
     Unknown,
 }
+
+/// Пинг до сервера у другого устройства.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct PeerRtt {
+    pub id: String,
+    pub ms: u32,
+}
+
+/// Пинг дольше этого — не пинг, а ошибка замера.
+pub const MAX_RTT_MS: u32 = 60_000;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "t")]
@@ -89,6 +103,9 @@ pub enum ToClient {
     Turn { turn: TurnInfo },
     #[serde(rename = "pong")]
     Pong,
+    /// Пинг до сервера у остальных устройств (ответ на `Rtt`).
+    #[serde(rename = "rtts")]
+    Rtts { list: Vec<PeerRtt> },
     #[serde(other)]
     Unknown,
 }
@@ -151,6 +168,10 @@ mod tests {
         assert_eq!(serde_json::from_str::<ToClient>(r#"{"t":"future"}"#).unwrap(), ToClient::Unknown);
         let w: ToClient = serde_json::from_str(r#"{"t":"welcome","id":"x"}"#).unwrap();
         assert_eq!(w, ToClient::Welcome { id: "x".into(), server_ver: String::new(), turn: None });
+        // пинги: новые сообщения, старые версии видят в них Unknown
+        assert_eq!(serde_json::to_string(&ToServer::Rtt { ms: 42 }).unwrap(), r#"{"t":"rtt","ms":42}"#);
+        let r: ToClient = serde_json::from_str(r#"{"t":"rtts","list":[{"id":"a","ms":7}]}"#).unwrap();
+        assert_eq!(r, ToClient::Rtts { list: vec![PeerRtt { id: "a".into(), ms: 7 }] });
     }
 
     #[test]

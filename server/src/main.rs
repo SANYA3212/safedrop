@@ -250,6 +250,8 @@ struct Client {
     kick: Arc<Notify>,
     name: String,
     ver: String,
+    /// его пинг до сервера (мс), 0 — неизвестен
+    rtt: u32,
 }
 
 struct Pending {
@@ -424,7 +426,7 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
             let _ = w.shutdown().await;
             return;
         }
-        let client = Client { conn, tx: tx.clone(), kick: kick.clone(), name: clean_name(&name), ver: clean_name(&ver) };
+        let client = Client { conn, tx: tx.clone(), kick: kick.clone(), name: clean_name(&name), ver: clean_name(&ver), rtt: 0 };
         if let Some(old) = g.insert(id.clone(), client) {
             // то же устройство подключилось заново (сменилась сеть): старое закрыть
             old.kick.notify_one();
@@ -454,6 +456,7 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
     let mut turn_at = Instant::now();
     // смена имени рассылает список всем: не чаще раза в пару секунд
     let mut name_at: Option<Instant> = None;
+    let mut rtt_at: Option<Instant> = None;
     loop {
         let got = tokio::select! {
             r = tokio::time::timeout(Duration::from_secs(PING_SECS * 3), read_line_limited(&mut reader, MAX_CTL_LINE)) => r,
@@ -494,6 +497,24 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
                         let _ = tx.try_send(line(&ToClient::Turn { turn }));
                     }
                 }
+            }
+            ToServer::Rtt { ms } => {
+                // клиент шлёт раз в PING_SECS; чаще — не отвечаем (список бывает большим)
+                if rtt_at.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+                    continue;
+                }
+                rtt_at = Some(Instant::now());
+                let list: Vec<PeerRtt> = {
+                    let mut g = hub.clients.lock().await;
+                    if let Some(c) = g.get_mut(&id).filter(|c| c.conn == conn) {
+                        c.rtt = ms.min(MAX_RTT_MS);
+                    }
+                    g.iter()
+                        .filter(|(other, c)| **other != id && c.rtt > 0)
+                        .map(|(other, c)| PeerRtt { id: other.clone(), ms: c.rtt })
+                        .collect()
+                };
+                let _ = tx.try_send(line(&ToClient::Rtts { list }));
             }
             ToServer::Hello { .. } | ToServer::Unknown => {}
         }

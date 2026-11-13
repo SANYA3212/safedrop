@@ -485,10 +485,35 @@ async fn tcp(ip: &str, port: u16, timeout: Duration) -> Result<Stream, String> {
     Ok(Box::new(s))
 }
 
+/// Исходящее соединение с контактом: по лучшему из его адресов (`ident::route`
+/// — у одного устройства их бывает несколько: LAN, Radmin, через сервер).
+/// Ключ проверяется по тому адресу, к которому подключились.
+pub async fn connect(ip: &str, port: u16, timeout: Duration) -> Result<Stream, String> {
+    let addrs = crate::ident::route(ip);
+    let last = addrs.len().saturating_sub(1);
+    let mut err = String::new();
+    for (i, addr) in addrs.iter().enumerate() {
+        // запасные адреса пробуем быстрее, чтобы не ждать мёртвый адрес целиком
+        let t = if i < last { timeout.min(Duration::from_secs(4)) } else { timeout };
+        let t0 = std::time::Instant::now();
+        match connect_one(addr, port, t).await {
+            Ok(s) => {
+                crate::ident::note_alive(addr, t0.elapsed().as_millis() as u64);
+                return Ok(s);
+            }
+            Err(e) => {
+                crate::ident::note_dead(addr);
+                err = e;
+            }
+        }
+    }
+    Err(err)
+}
+
 /// Исходящее соединение: зашифрованное, если контакт это умеет. С контактом,
 /// чей ключ запомнен, — только зашифрованное и только с этим ключом.
 /// Через сервер — всегда зашифрованное, и ключ обязан совпасть с ID в адресе.
-pub async fn connect(ip: &str, port: u16, timeout: Duration) -> Result<Stream, String> {
+async fn connect_one(ip: &str, port: u16, timeout: Duration) -> Result<Stream, String> {
     let relayed = crate::relay::id_of(ip);
     let pinned = relayed.is_some() || pin_of(ip).is_some();
     let sock = tcp(ip, port, timeout).await?;

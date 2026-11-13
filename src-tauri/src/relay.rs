@@ -86,6 +86,10 @@ struct Shared {
     turn: Option<TurnInfo>,
     tx: Option<mpsc::Sender<String>>,
     rtt_ms: Option<u64>,
+    /// пинг до сервера у других устройств (из `Rtts`)
+    peer_rtt: HashMap<String, u64>,
+    /// сервер умеет раздавать пинги (новая версия); у старого — только свой
+    rtts_known: bool,
     sig_port: u16,
     file_port: u16,
 }
@@ -142,11 +146,23 @@ pub fn my_addr() -> Option<String> {
     (!fp.is_empty()).then(|| addr_of(&fp))
 }
 
-/// «В сети ли» контакт через сервер (вместо TCP-пинга).
+/// Пинг до собеседника через сервер: путь туда и обратно идёт через сервер,
+/// значит, это свой пинг до сервера плюс его. Пока замера нет — `None`
+/// (а не выдуманная цифра). Старый сервер пинги не раздаёт — тогда свой.
+fn peer_ping(g: &Shared, id: &str) -> Option<u64> {
+    let mine = g.rtt_ms?;
+    if !g.rtts_known {
+        return Some(mine.max(1));
+    }
+    g.peer_rtt.get(id).map(|theirs| (mine + theirs).max(1))
+}
+
+/// «В сети ли» контакт через сервер (вместо TCP-пинга); число — пинг до него,
+/// 0 — в сети, но пинг ещё не замерен.
 pub fn ping(addr: &str) -> Option<u64> {
     let id = id_of(addr)?;
     let g = lock();
-    (g.state == "online" && g.peers.contains_key(id)).then(|| g.rtt_ms.unwrap_or(1).max(1))
+    (g.state == "online" && g.peers.contains_key(id)).then(|| peer_ping(&g, id).unwrap_or(0))
 }
 
 /// Разобрать «хост[:порт]» (IPv6 — в квадратных скобках).
@@ -545,8 +561,9 @@ async fn session(
         g.host = host.clone();
         g.port = port;
     }
+    // первый ping — сразу (первый тик interval мгновенный): пинг виден через
+    // долю секунды после подключения, а не через PING_SECS
     let mut ping = tokio::time::interval(Duration::from_secs(proto::PING_SECS));
-    ping.tick().await;
     let mut ping_at: Option<Instant> = None;
     let result: Result<(), Stop> = loop {
         tokio::select! {
@@ -601,8 +618,27 @@ async fn session(
                     }
                     ToClient::Pong => {
                         if let Some(t) = ping_at.take() {
-                            lock().rtt_ms = Some(t.elapsed().as_millis() as u64);
+                            let ms = t.elapsed().as_millis() as u64;
+                            lock().rtt_ms = Some(ms);
+                            emit_status(app);
+                            // сообщить свой пинг: сервер ответит пингами остальных
+                            // 0 у сервера значит «неизвестен»: сервер рядом — это 1 мс
+                            let ms = ms.clamp(1, proto::MAX_RTT_MS as u64) as u32;
+                            let _ = tx.try_send(line(&ToServer::Rtt { ms }));
                         }
+                    }
+                    ToClient::Rtts { list } => {
+                        {
+                            let mut g = lock();
+                            g.rtts_known = true;
+                            g.peer_rtt = list
+                                .into_iter()
+                                .filter(|r| proto::valid_id(&r.id) && r.ms <= proto::MAX_RTT_MS)
+                                .take(2000)
+                                .map(|r| (r.id, r.ms as u64))
+                                .collect();
+                        }
+                        apply_presence(app).await;
                     }
                     ToClient::Fail { .. } | ToClient::Unknown => {}
                 }
@@ -617,6 +653,8 @@ async fn session(
         g.peers.clear();
         g.turn = None;
         g.rtt_ms = None;
+        g.peer_rtt.clear();
+        g.rtts_known = false;
         g.state = "off".into();
     }
     emit_status(app);
@@ -627,9 +665,10 @@ async fn session(
 /// сеть — запросить профиль. Ушедших помечает «не в сети» общий
 /// heartbeat (`signal::dead_online`, через `ping`), как и в LAN.
 pub async fn apply_presence(app: &AppHandle) {
-    let (online, list, rtt) = {
+    let (online, list, pings) = {
         let g = lock();
-        (g.state == "online", g.peers.values().cloned().collect::<Vec<_>>(), g.rtt_ms.unwrap_or(1).max(1))
+        let pings: HashMap<String, Option<u64>> = g.peers.keys().map(|id| (id.clone(), peer_ping(&g, id))).collect();
+        (g.state == "online", g.peers.values().cloned().collect::<Vec<_>>(), pings)
     };
     if !online {
         return;
@@ -645,14 +684,19 @@ pub async fn apply_presence(app: &AppHandle) {
                 continue;
             }
             let ip = addr_of(&info.id);
-            match g.get_mut(&ip) {
-                Some(p) => {
-                    if !p.online {
-                        fresh.push(ip.clone());
+            let rtt = pings.get(&info.id).copied().flatten();
+            // этот компьютер может уже быть контактом по LAN/Radmin (тот же ключ)
+            let owner = crate::ident::attach(&mut g, &ip).filter(|key| g.contains_key(key));
+            match owner {
+                Some(key) => {
+                    if let Some(p) = g.get_mut(&key) {
+                        if !p.online {
+                            fresh.push(p.ip.clone());
+                        }
+                        p.online = true;
+                        p.ping_ms = rtt;
+                        p.last_seen = Some(now.clone());
                     }
-                    p.online = true;
-                    p.ping_ms = Some(rtt);
-                    p.last_seen = Some(now.clone());
                 }
                 None => {
                     let name = if info.name.is_empty() { ip.clone() } else { info.name.clone() };
@@ -669,7 +713,7 @@ pub async fn apply_presence(app: &AppHandle) {
                             supports_file_confirm: false,
                             supports_chat_ack: false,
                             supports_watch: false,
-                            ping_ms: Some(rtt),
+                            ping_ms: rtt,
                             last_seen: Some(now.clone()),
                             phash: String::new(),
                             state: "idle".into(),

@@ -127,6 +127,7 @@ pub fn load_peers(state: &AppState) {
         if let Ok(list) = serde_json::from_str::<Vec<Peer>>(&data) {
             if let Ok(mut g) = state.peers.try_lock() {
                 *g = list.into_iter().map(|p| (p.ip.clone(), p)).collect::<HashMap<_, _>>();
+                crate::ident::sync(&g);
             }
         }
     }
@@ -134,6 +135,7 @@ pub fn load_peers(state: &AppState) {
 
 pub fn persist_peers(state: &AppState) {
     if let Some(g) = try_lock_briefly(&state.peers) {
+        crate::ident::sync(&g);
         let list: Vec<_> = g.values().cloned().collect();
         if let Ok(data) = serde_json::to_string_pretty(&list) {
             let _ = fs::write(state.peers_path(), data);

@@ -40,7 +40,34 @@ pub struct ThemeConfig {
     pub button_gradient_to: String,
     #[serde(default = "def_button_gradient_angle")]
     pub button_gradient_angle: u16,
+    /// Заливка промежутков между панелями цветом фона (0 — прозрачные, как
+    /// раньше; 1 — сплошные). В настройках — «Прозрачность границ» = 1 − это.
+    #[serde(default)]
+    pub gap_opacity: f32,
+    /// Пусто в старых темах: интерфейс берёт прежний bg_color.
+    #[serde(default)]
+    pub panel_color: String,
+    #[serde(default = "def_panel_border")]
+    pub panel_border_color: String,
+    /// legacy сохраняет прежние различия активных кнопок и отправки.
+    #[serde(default = "def_button_mode")]
+    pub button_mode: String, // legacy | color | gradient
+    #[serde(default = "def_active_btn_text")]
+    pub active_btn_text: String,
+    #[serde(default = "def_button_gradient_to")]
+    pub accent_secondary: String,
+    #[serde(default = "def_transparent")]
+    pub message_own_color: String,
+    #[serde(default = "def_transparent")]
+    pub message_peer_color: String,
+    /// Пусто — прежние заливки полей (в том числе отдельное поле просмотра).
+    #[serde(default)]
+    pub input_color: String,
 }
+fn def_panel_border() -> String { "rgba(255,255,255,.09)".into() }
+fn def_button_mode() -> String { "legacy".into() }
+fn def_active_btn_text() -> String { "#ffffff".into() }
+fn def_transparent() -> String { "transparent".into() }
 fn def_bg_mode() -> String { "gradient".into() }
 fn def_bg_color() -> String { "#141824".into() }
 fn def_gradient() -> String { "linear-gradient(135deg,#1a2138,#0d1020)".into() }
@@ -71,6 +98,12 @@ impl Default for ThemeConfig {
             button_gradient_from: def_button_gradient_from(),
             button_gradient_to: def_button_gradient_to(),
             button_gradient_angle: def_button_gradient_angle(),
+            gap_opacity: 0.0,
+            panel_color: String::new(), panel_border_color: def_panel_border(),
+            button_mode: def_button_mode(), active_btn_text: def_active_btn_text(),
+            accent_secondary: def_button_gradient_to(),
+            message_own_color: def_transparent(), message_peer_color: def_transparent(),
+            input_color: String::new(),
         }
     }
 }
