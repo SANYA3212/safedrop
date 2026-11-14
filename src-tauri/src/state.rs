@@ -295,6 +295,8 @@ pub struct Settings {
     pub scan_manual: Vec<String>, // manually added IPs/subnets for scanning
     #[serde(default)]
     pub sections_open: std::collections::HashMap<String, bool>, // settings accordion open state
+    #[serde(default = "def_true")]
+    pub auto_update: bool, // раз в минуту смотреть новый выпуск на GitHub
 }
 fn def_device() -> String { whoami_host() }
 fn def_duck_level() -> u8 { 30 }
@@ -388,6 +390,7 @@ impl Default for Settings {
             scan_adapters: Vec::new(),
             scan_manual: Vec::new(),
             sections_open: std::collections::HashMap::new(),
+            auto_update: true,
         }
     }
 }

@@ -3,6 +3,7 @@
 mod discovery;
 #[cfg(target_os = "linux")]
 mod electron;
+mod ghupdate;
 #[cfg(target_os = "linux")]
 mod linuxaudio;
 mod ident;
@@ -1466,6 +1467,20 @@ async fn pick_image(app: tauri::AppHandle) -> Result<Option<String>, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Фон окна: картинка или видео (видео играет без звука по кругу).
+#[tauri::command]
+async fn pick_bg_media(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        file_dialog(&app)
+            .set_title("Выбери картинку или видео для фона")
+            .add_filter("Картинка или видео", &["png", "jpg", "jpeg", "webp", "gif", "bmp", "mp4", "webm", "m4v", "mov", "mkv"])
+            .pick_file()
+            .map(|p| p.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     tokio::task::spawn_blocking(move || {
@@ -1603,6 +1618,7 @@ async fn factory_reset(
     }
     let _ = std::fs::remove_dir_all(state.app_dir.join("avatars"));
     let _ = std::fs::remove_dir_all(state.app_dir.join("audio-out"));
+    ghupdate::clear_downloads(); // установщики, скачанные с GitHub
     let voice_dir = state.settings.lock().await.loaddrop_dir.clone();
     let mut voice_files = std::collections::HashSet::new();
     for rows in state.chats.lock().await.values() {
@@ -1736,10 +1752,36 @@ fn clsid_key() -> String {
     format!("HKCU\\Software\\Classes\\CLSID\\{SHELL_CLSID}")
 }
 
+/// `\\?\C:\SafeDrop` → `C:\SafeDrop` (`\\?\UNC\srv\share` → `\\srv\share`).
+/// Tauri отдаёт папку ресурсов в «длинном» виде, а `Add-AppxPackage
+/// -ExternalLocation` разбирает его как URI с именем хоста «?» и падает с
+/// «Недопустимый URI: невозможно выполнить разбор имени хоста».
+fn plain_path(p: std::path::PathBuf) -> std::path::PathBuf {
+    let s = p.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(rest);
+    }
+    p
+}
+
+#[cfg(test)]
+mod plain_path_tests {
+    #[test]
+    fn strips_verbatim_prefix() {
+        let f = |s: &str| super::plain_path(s.into()).to_string_lossy().into_owned();
+        assert_eq!(f(r"\\?\C:\SafeDrop\shell"), r"C:\SafeDrop\shell");
+        assert_eq!(f(r"\\?\UNC\srv\share\app"), r"\\srv\share\app");
+        assert_eq!(f(r"C:\SafeDrop"), r"C:\SafeDrop");
+    }
+}
+
 fn shell_dll_path(app: &tauri::AppHandle) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // Installed builds keep the bundled extension under the app resource folder.
-    let resource = app.path().resource_dir().map_err(|e| e.to_string())?.join("shell").join(format!("safedrop-shell-{}.dll", env!("CARGO_PKG_VERSION")));
+    let resource = plain_path(app.path().resource_dir().map_err(|e| e.to_string())?).join("shell").join(format!("safedrop-shell-{}.dll", env!("CARGO_PKG_VERSION")));
     if resource.exists() {
         return Ok(resource.to_string_lossy().to_string());
     }
@@ -2942,10 +2984,10 @@ fn main() {
             get_chat, send_chat, send_group_chat, send_chat_read, save_voice_record, discard_voice_record, stage_chat_audio, discard_staged_audio, chat_audio_size, chat_edit, chat_react, chat_typing, sig_send, delete_msgs, clear_chat, open_mic_settings, set_busy,
             get_groups, create_group, rename_group, set_group_avatar, delete_group, leave_group, group_add_member, group_remove_member,
             send_file, send_update, apply_update, open_url, open_notif_settings, get_transfers, clear_transfers, cancel_transfer, respond_file_offer, test_notify, open_loaddrop, move_loaddrop, get_loaddrop,
-            pick_files, pick_image, pick_folder, pick_audio, read_image_dataurl,
+            pick_files, pick_image, pick_bg_media, pick_folder, pick_audio, read_image_dataurl,
             clear_peers, scan_debug, factory_reset, open_firewall, set_ctx_menu, refresh_ctx_menu, get_pending_send,
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
-            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, linux_audio_status, linux_audio_install, rtc_debug_on, rtc_debug, own_installer, get_key_info, trust_new_key, forget_key, win11_menu_status, win11_menu_set,
+            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, linux_audio_status, linux_audio_install, rtc_debug_on, rtc_debug, own_installer, get_key_info, trust_new_key, forget_key, win11_menu_status, win11_menu_set, ghupdate::check_github_update, ghupdate::download_github_update,
             server_status, server_configure, server_trust_key, server_ice,
             ytbrowse::ytb_open, ytbrowse::ytb_go, ytbrowse::ytb_nav, ytbrowse::ytb_watch, ytbrowse::ytb_notify, ytbrowse::ytb_state,
             ytbrowse::ytb_set_share, ytbrowse::ytb_remote_nav, ytbrowse::ytb_pause_media, ytbrowse::ytb_media_apply, ytbrowse::ytb_duck, ytbrowse::ytb_chat_send, ytbrowse::ytb_chat_show, ytbrowse::ytb_chat_toggle, ytbrowse::ytb_chat_request, ytbrowse::ytb_chat_history,

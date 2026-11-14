@@ -180,15 +180,59 @@ function hexA(hex, a) {
   if (Number.isNaN(n)) return `rgba(20,24,40,${a})`;
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
+// ---------- видео на фоне окна ----------
+// Без звука, по кругу. Пока окно свёрнуто или спрятано в трей, видео стоит на
+// паузе: не декодируется и не грузит процессор/видеокарту.
+const BG_VIDEO_EXT = /\.(mp4|m4v|webm|mov|mkv)$/i;
+function isBgVideo(path) { return BG_VIDEO_EXT.test(path || ""); }
+let bgVideoTimer = null;
+function setBgVideo(path) {
+  let v = $("#bg-video");
+  if (!path) {
+    if (v) { v.pause(); v.removeAttribute("src"); v.load(); v.remove(); } // отпустить декодер и буферы
+    clearInterval(bgVideoTimer); bgVideoTimer = null;
+    return;
+  }
+  if (!v) {
+    v = document.createElement("video");
+    v.id = "bg-video";
+    v.muted = true; v.loop = true; v.playsInline = true; v.disablePictureInPicture = true;
+    v.setAttribute("aria-hidden", "true");
+    v.onerror = () => toast("Видео для фона не открывается: " + fileName(v.dataset.path || ""), true);
+    $("#bg").appendChild(v);
+  }
+  if (v.dataset.path !== path) { v.dataset.path = path; v.src = tauriFile(path); }
+  syncBgVideo();
+  // свернуть/спрятать окно не всегда видно странице — проверяем и сами
+  if (!bgVideoTimer) bgVideoTimer = setInterval(syncBgVideo, 2000);
+}
+async function bgWindowHidden() {
+  if (document.hidden) return true;
+  const w = window.__TAURI__?.window?.getCurrentWindow?.();
+  if (!w) return false;
+  try { return (await w.isMinimized()) || !(await w.isVisible()); } catch { return false; }
+}
+async function syncBgVideo() {
+  const v = $("#bg-video");
+  if (!v) return;
+  if (await bgWindowHidden()) { if (!v.paused) v.pause(); }
+  else if (v.paused) v.play().catch(() => {});
+}
+document.addEventListener("visibilitychange", syncBgVideo);
+for (const ev of ["tauri://resize", "tauri://focus", "tauri://blur"]) listen(ev, syncBgVideo).catch?.(() => {});
+
 function applyTheme() {
   const t = normalizeTheme(settings.theme);
   const base = t.bg_color || "#141824";
   const panel = t.panel_color;
   const alpha = t.opacity;
   const bg = $("#bg");
+  const bgVideo = t.bg_mode === "image" && isBgVideo(t.bg_image) ? t.bg_image : "";
   if (t.bg_mode === "color") bg.style.background = base;
+  else if (bgVideo) bg.style.background = base; // подложка, пока видео грузится
   else if (t.bg_mode === "image" && t.bg_image) bg.style.background = `url("${tauriFile(t.bg_image)}") center/cover`;
   else bg.style.background = t.bg_gradient || base;
+  setBgVideo(bgVideo);
   document.body.style.background = base;
   const r = document.documentElement.style;
   // Эти переменные раньше задавались только CSS. Сохраняем приоритет
@@ -251,7 +295,7 @@ function applyTheme() {
   $("#button-gradient-preview").style.background = activeButton;
   $("#th-bg-gradient-angle-v").textContent = `${$("#th-bg-gradient-angle").value}°`;
   $("#bg-gradient-preview").style.background = t.bg_gradient;
-  $("#th-bg-image-name").textContent = t.bg_image ? fileName(t.bg_image) : "Картинка не выбрана";
+  $("#th-bg-image-name").textContent = t.bg_image ? (isBgVideo(t.bg_image) ? "Видео: " : "") + fileName(t.bg_image) : "Картинка или видео не выбраны";
   // Не скрываем поля режима: поиск по настройкам должен находить их всегда.
   document.querySelectorAll("[data-theme-bg]").forEach((el) => { el.disabled = el.dataset.themeBg !== t.bg_mode; });
   document.querySelectorAll("[data-theme-button-gradient]").forEach((el) => { el.disabled = t.button_mode === "color"; });
@@ -396,6 +440,7 @@ async function loadAll() {
   $("#set-autostart").checked = settings.autostart;
   $("#set-tray").checked = settings.minimize_to_tray;
   $("#set-ctxmenu").checked = !!settings.ctx_menu;
+  if ($("#set-auto-update")) $("#set-auto-update").checked = settings.auto_update !== false;
   if (hostOs === "windows") refreshWin11Menu();
   const st = $("#set-show-typing");
   if (st) st.checked = settings.show_typing !== false;
@@ -1625,12 +1670,16 @@ function openMsgMenu(e, m) {
   const emojis = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
   const reactRow = emojis.map((em) => `<button data-act="react" data-emoji="${em}" title="Реакция «${em}»">${em}</button>`).join("");
   const isPinned = pinnedFor().some((x) => x.id === m.id);
+  // выделенный кусок именно этого сообщения копируется вместо всего текста
+  const sel = window.getSelection?.();
+  const row = e.target?.closest?.(".msgrow");
+  const picked = sel && !sel.isCollapsed && row?.contains(sel.anchorNode) ? String(sel).trim() : "";
   const actions = [
     `<button data-act="forward">Переслать</button>`,
     `<button data-act="pin">${isPinned ? "Открепить" : "Закрепить"}</button>`,
     `<button data-act="reply">Ответить</button>`,
     mine ? `<button data-act="edit">Изменить</button>` : "",
-    mine ? `<button data-act="copy">Копировать текст</button>` : "",
+    picked || m.text ? `<button data-act="copy">${picked ? "Копировать выделенное" : "Копировать текст"}</button>` : "",
     `<button data-act="del" class="danger">Удалить</button>`,
   ].filter(Boolean).join("");
   menu.innerHTML = `<div class="mm-reacts">${reactRow}</div>${actions}`;
@@ -1664,7 +1713,7 @@ function openMsgMenu(e, m) {
       if (Date.now() > 12 * 3600 * 1000) {} // правка доступна всегда в этой версии
       setEdit({ id: src.id, text: src.text || "" });
     } else if (act === "copy") {
-      navigator.clipboard.writeText(src.text || "").then(() => toast("Скопировано")).catch(() => {});
+      navigator.clipboard.writeText(picked || src.text || "").then(() => toast("Скопировано")).catch((err) => toast("Не скопировалось: " + err, true));
     } else if (act === "del") {
       openDel({ mode: "msg", id: src.id, mine });
     }
@@ -4863,7 +4912,7 @@ document.querySelectorAll("#sec-appearance input[id^='th-'], #sec-appearance sel
 document.querySelectorAll(".seg-theme .seg-btn").forEach((b) => b.onclick = () => { settings.theme = { ...collectTheme(), bg_mode: b.dataset.bg, bg_image: settings.theme?.bg_image || "" }; applyTheme(); });
 $("#btn-bg-pick").onclick = async () => {
   try {
-    const path = await invoke("pick_image");
+    const path = await invoke("pick_bg_media");
     if (!path) return;
     settings.theme = { ...collectTheme(), bg_mode: "image", bg_image: path };
     applyTheme(); await invoke("save_settings", { settings }); toast("Фон установлен <svg class='ic' viewBox='0 0 24 24'><path d='M9,16.17,4.83,12l-1.42,1.41L9,19,21,7l-1.41-1.41Z'/></svg>");
@@ -5000,6 +5049,75 @@ async function refreshMyVer() {
     $("#upd-myver").textContent = "v" + b.version;
     return b.version;
   } catch { return "0.0.0"; }
+}
+// ---------- обновления с GitHub ----------
+// Раз в минуту (галочка «Искать обновления») Rust смотрит последний выпуск на
+// GitHub. Есть новее — внизу слева зелёная кнопка; по нажатию «Да» установщик
+// качается, проверяется подписью SafeDrop и ставится через apply_update.
+let ghLatest = null; // версия новее своей, если нашлась
+let ghBusy = false;
+function ghShow(ver) {
+  ghLatest = ver || null;
+  const b = $("#me-update");
+  if (!b) return;
+  b.classList.toggle("hidden", !ghLatest);
+  b.title = ghLatest ? `Вышел SafeDrop ${ghLatest} — нажми, чтобы обновиться` : "";
+}
+async function ghCheck(manual = false) {
+  if (isDemo || hostOs !== "windows" || ghBusy) return;
+  if (!manual && settings?.auto_update === false) return;
+  const status = $("#upd-gh-status");
+  try {
+    const r = await invoke("check_github_update");
+    ghShow(r.available ? r.latest : null);
+    if (status) status.textContent = r.available ? `На GitHub есть версия ${r.latest}` : `Последняя версия на GitHub — ${r.latest}, у тебя ${r.current}`;
+  } catch (e) {
+    if (status) status.textContent = "Не удалось проверить обновления: " + e;
+  }
+}
+async function ghInstall() {
+  const ver = ghLatest;
+  if (!ver || ghBusy) return;
+  const cur = (await refreshMyVer()) || "";
+  const call = typeof inVoice === "function" && inVoice() ? " Звонок прервётся." : "";
+  const yes = await askConfirm(`Обновить SafeDrop до ${ver}?`,
+    `Сейчас стоит ${cur}. SafeDrop скачает установщик с GitHub, проверит его подпись, закроется, обновится и запустится снова.${call}`, "Да, обновить");
+  if (!yes) return;
+  ghBusy = true;
+  const btn = $("#me-update");
+  if (btn) btn.disabled = true;
+  toast(`Скачиваю SafeDrop ${ver}…`);
+  try {
+    const path = await invoke("download_github_update", { version: ver });
+    toast("Подпись верна — запускаю установщик…");
+    await invoke("apply_update", { path, version: ver });
+  } catch (e) {
+    toast("Обновление не установлено: " + e, true);
+  } finally {
+    ghBusy = false;
+    if (btn) btn.disabled = false;
+  }
+}
+{
+  let lastPct = -1;
+  listen("safedrop-gh-update-progress", (e) => {
+    const { done = 0, total = 0 } = e.payload || {};
+    if (!total) return;
+    const pct = Math.min(100, Math.floor((done / total) * 100));
+    if (pct === lastPct || (pct % 25 && pct !== 100)) return;
+    lastPct = pct;
+    const status = $("#upd-gh-status");
+    if (status) status.textContent = `Скачано ${pct}% (${(done / 1048576).toFixed(1)} из ${(total / 1048576).toFixed(1)} МБ)`;
+  }).catch(() => {});
+  const box = $("#set-auto-update");
+  if (box) box.onchange = () => {
+    settings.auto_update = box.checked;
+    if (box.checked) ghCheck(); else { ghShow(null); const s = $("#upd-gh-status"); if (s) s.textContent = ""; }
+    invoke("save_settings", { settings }).catch((err) => toast("Не сохранилось: " + err, true));
+  };
+  $("#me-update")?.addEventListener("click", ghInstall);
+  setTimeout(() => ghCheck(), 8000);
+  setInterval(() => ghCheck(), 60000);
 }
 $("#btn-upd-pick").onclick = async () => {
   if (hostOs === "linux") return;
@@ -5240,13 +5358,25 @@ async function sendAudioToChat(path, opts = {}) {
   if (!targets.length) { toast("Нет получателей в сети", true); return null; }
   let audio = path;
   try { audio = await invoke("stage_chat_audio", { path }); } catch {}
-  toast(`Отправка ${isChatVideo(audio) ? "видео" : "аудио"} ${fileName(audio)}…`);
-  let ok = 0;
-  for (const t of targets) {
-    try { await invoke("send_file", { peerIp: t, filePath: audio }); ok++; }
-    catch (e) { toast("Не отправлено: " + e, true); }
+  const what = isChatVideo(audio) ? "видео" : /^safedrop-voice-/i.test(fileName(audio)) ? "голосовое" : "аудио";
+  // Личный чат: друг не в сети или связь оборвалась — сообщение всё равно
+  // сохраняется со статусом «отправлено», и Rust (flush_pending_for_peer) пришлёт
+  // сначала файл, потом сообщение, когда друг появится. Как с обычным текстом.
+  const offline = !group && !peers.find((p) => p.ip === peerIp)?.online;
+  let ok = 0, queued = false;
+  if (offline) queued = true;
+  else {
+    toast(`Отправка: ${what} ${fileName(audio)}…`);
+    for (const t of targets) {
+      try { await invoke("send_file", { peerIp: t, filePath: audio }); ok++; }
+      catch (e) { if (group) toast("Не отправлено: " + e, true); else queued = true; }
+    }
   }
-  if (!ok) {
+  if (queued) {
+    const who = peers.find((p) => p.ip === peerIp);
+    toast(`${who ? dispName(who) : "Собеседник"} сейчас не на связи — ${what} уйдёт, когда он появится`);
+  }
+  if (!ok && !queued) {
     // копию никому не отдали — не копить её
     if (audio !== path) invoke("discard_staged_audio", { path: audio }).catch(() => {});
     return null;

@@ -34,6 +34,7 @@
       <div id="group-list"></div>
       <div id="me-card"><span id="me-ava" class="ava sm"><span>?</span></span>
         <div class="me-meta"><b id="me-nick">…</b><span id="me-ip">…</span></div>
+        <button id="me-update" class="hidden" title="Есть обновление SafeDrop"><svg class="ic" viewBox="0 0 24 24"><path d="M12,2A10,10,0,1,0,22,12,10,10,0,0,0,12,2Zm4.71,9.71a1,1,0,0,1-1.42,0L13,9.41V16a1,1,0,0,1-2,0V9.41L8.71,11.71a1,1,0,0,1-1.42-1.42l4-4a1,1,0,0,1,1.42,0l4,4A1,1,0,0,1,16.71,11.71Z"/></svg></button>
         <button id="me-mic" title="Мут"><svg class="ic" viewBox="0 0 24 24"><path d="M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z"/><path d="M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z"/></svg></button>
       </div>
     </aside>
@@ -325,7 +326,7 @@
               <summary>Фон окна</summary>
               <div class="theme-fields">
                 <label data-set-label="Фон окна: режим цвет градиент картинка"><span>Режим фона</span></label>
-                <div class="seg-theme"><button data-bg="color" class="seg-btn">Цвет</button><button data-bg="gradient" class="seg-btn">Градиент</button><button data-bg="image" class="seg-btn">Картинка</button></div>
+                <div class="seg-theme"><button data-bg="color" class="seg-btn">Цвет</button><button data-bg="gradient" class="seg-btn">Градиент</button><button data-bg="image" class="seg-btn" title="Картинка или видео (без звука, по кругу; на паузе, пока окно свёрнуто)">Картинка / видео</button></div>
                 <label data-set-label="Цвет фона окна" title="Сплошной фон в режиме «Цвет»; также подложка, пока картинка загружается"><span>Цвет фона</span><input id="th-color" type="color" value="#141824" /></label>
                 <div class="gradient-editor">
                   <label data-set-label="Градиент фона окна: цвет 1"><span>Цвет 1</span><input id="th-bg-gradient-from" data-theme-bg="gradient" type="color" value="#1a2138" /></label>
@@ -334,7 +335,7 @@
                   <div id="bg-gradient-preview" class="theme-preview" aria-label="Предпросмотр градиента фона"></div>
                 </div>
                 <label class="theme-stacked" data-set-label="Выражение градиента фона CSS" title="Для сложных градиентов из старых тем. Выбор двух цветов выше заменяет выражение простым градиентом"><span>Градиент: своё выражение</span><input id="th-bg-gradient-css" data-theme-bg="gradient" spellcheck="false" /></label>
-                <div class="row"><button id="btn-bg-pick" data-set-label="Выбрать фоновую картинку">Картинка…</button><button id="btn-bg-clear" data-set-label="Убрать фоновую картинку">Убрать</button></div>
+                <div class="row"><button id="btn-bg-pick" data-set-label="Выбрать фоновую картинку или видео">Картинка или видео…</button><button id="btn-bg-clear" data-set-label="Убрать фоновую картинку или видео">Убрать</button></div>
                 <div id="th-bg-image-name" class="muted wrap"></div>
               </div>
             </details>
@@ -426,6 +427,9 @@
 
         <details class="set-sec" id="sec-about">
           <summary><span class="sec-arrow"></span>Обновления и о программе</summary>
+          <label class="check" data-set-label="Искать обновления на GitHub"><input type="checkbox" id="set-auto-update" /> Искать обновления</label>
+          <div class="muted wrap">Раз в минуту SafeDrop смотрит на GitHub, вышла ли новая версия. Если вышла — рядом с микрофоном внизу слева появится зелёная кнопка: нажми её, и SafeDrop скачает, проверит подпись и обновится сам.</div>
+          <div class="muted" id="upd-gh-status"></div>
           <details id="updates-pane" class="card updates-card">
             <summary>Раздать обновление контактам</summary>
             <div class="muted">Твоя версия: <b id="upd-myver">…</b></div>

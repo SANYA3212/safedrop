@@ -55,7 +55,7 @@ export async function invoke(cmd, args = {}) {
     case "create_group": case "send_group_chat": throw "демо-режим: запусти приложение";
     case "rename_group": case "delete_group": case "leave_group": case "group_add_member": case "group_remove_member": return;
     case "sig_send": return;
-    case "pick_files": case "pick_image": case "pick_folder": case "pick_audio": return null;
+    case "pick_files": case "pick_image": case "pick_bg_media": case "pick_folder": case "pick_audio": return null;
     case "clear_peers": case "open_firewall": case "set_ctx_menu": case "refresh_ctx_menu": case "fix_mic_blocked": return null;
     case "take_mic_reset_flag": return false;
     case "clear_cache": return "демо: нечего чистить";
