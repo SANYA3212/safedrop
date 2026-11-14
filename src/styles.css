@@ -1,4 +1,5 @@
 /* SafeDrop Flow — собственный современный стиль */
+body.sd-paused *, body.sd-paused *::before, body.sd-paused *::after { animation-play-state: paused !important; }
 :root {
   --bg: #141824;
   --gradient: linear-gradient(135deg,#1a2138,#0d1020);
@@ -85,7 +86,7 @@ body:not(.details-open) #details { display: none; }
 .me-meta b { display: block; font-size: 13px; }
 .me-meta span { font-size: 11px; color: var(--muted); display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #me-card button { background: transparent; border: 0; font-size: 17px; cursor: pointer; }
-#me-card #me-update { color: #3ddc84; background: rgba(61, 220, 132, .16); border-radius: 50%; width: 30px; height: 30px; padding: 0; display: grid; place-items: center; box-shadow: 0 0 0 0 rgba(61, 220, 132, .5); animation: upd-pulse 2.2s ease-out infinite; }
+#me-card #me-update { color: #3ddc84; background: rgba(61, 220, 132, .16); border-radius: 50%; width: 30px; height: 30px; padding: 0; display: grid; place-items: center; box-shadow: 0 0 0 0 rgba(61, 220, 132, .5); animation: upd-pulse 2.2s ease-out 6; }
 #me-card #me-update.hidden { display: none; }
 #me-card #me-update:hover { background: rgba(61, 220, 132, .28); }
 #me-card #me-update .ic { width: 20px; height: 20px; fill: currentColor; transform: rotate(180deg); } /* стрелка вниз — «скачать» */
@@ -124,6 +125,7 @@ body:not(.details-open) #details { display: none; }
 #chat-pane, #files-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 #chat-pane { position: relative; }
 #messages { flex: 1; overflow-y: auto; padding: 10px 16px; display: flex; flex-direction: column; }
+.chat-earlier { flex-shrink: 0; align-self: center; margin: 4px 0 12px; }
 #chat-scroll-bottom { position: absolute; z-index: 5; right: 24px; bottom: 76px; display: flex; gap: 7px; align-items: center; padding: 8px 13px; border: 1px solid var(--accent); border-radius: 999px; background: var(--panel2); color: var(--text); box-shadow: 0 4px 18px rgba(0,0,0,.35); cursor: pointer; }
 #chat-scroll-bottom.hidden { display: none; }
 #chat-scroll-bottom .ic { width: 17px; height: 17px; }

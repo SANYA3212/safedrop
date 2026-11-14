@@ -16,6 +16,49 @@ let peers = [], selectedIp = null, chats = {}, unread = {};
 let groups = [], selGroup = null, myIp = "";
 const seenIds = new Set(); // защита от дублей сообщений
 let pendingFile = null;
+let uiHidden = document.hidden, uiReady = false;
+const pendingUi = new Set();
+let peerUiTimer = null;
+function deferUi(render) {
+  if (uiHidden || document.hidden) { pendingUi.add(render); return true; }
+  pendingUi.delete(render);
+  return false;
+}
+function flushUi() {
+  if (!uiReady || uiHidden || document.hidden) return;
+  clearTimeout(peerUiTimer); peerUiTimer = null;
+  if (pendingUi.has(renderChat)) pendingUi.delete(renderPeerChat);
+  if (pendingUi.has(renderChat) || pendingUi.has(renderPeerChat)) pendingUi.delete(renderPinned);
+  const renders = [...pendingUi]; pendingUi.clear();
+  for (const render of renders) render();
+}
+function schedulePeerUi() {
+  for (const render of [renderContacts, renderGroups, renderConv, renderPeerCard, renderPeerChat, renderPeerCallStage]) pendingUi.add(render);
+  if (!uiHidden && !document.hidden && !peerUiTimer) peerUiTimer = setTimeout(flushUi, 120);
+}
+// hidden — окно не видно (свёрнуто, в трее): отрисовку откладываем.
+// paused — ещё и игра во весь экран, а SafeDrop не в фокусе: окно может быть
+// на втором мониторе, поэтому сообщения показываем, а видеофон и анимации
+// (нагрузка на видеокарту) ставим на паузу.
+let uiPaused = false;
+function setUiHidden(hidden, paused = hidden) {
+  const changed = uiHidden !== hidden;
+  uiHidden = hidden;
+  uiPaused = hidden || paused;
+  document.body.classList.toggle("sd-paused", uiPaused);
+  if (changed && !hidden) flushUi();
+}
+// Сравниваем исходный HTML, а не сериализацию DOM (браузер меняет её).
+function setUiHtml(el, html) {
+  if (el._sdHtml === html) return;
+  el.innerHTML = html; el._sdHtml = html;
+}
+function setUiAvatar(el, html) {
+  if (el._sdAvatar === html) return;
+  const template = document.createElement("template"); template.innerHTML = html;
+  const next = template.content.firstElementChild;
+  next._sdAvatar = html; el.replaceWith(next);
+}
 
 // ---------- helpers ----------
 function toast(msg, err = false) {
@@ -185,12 +228,11 @@ function hexA(hex, a) {
 // паузе: не декодируется и не грузит процессор/видеокарту.
 const BG_VIDEO_EXT = /\.(mp4|m4v|webm|mov|mkv)$/i;
 function isBgVideo(path) { return BG_VIDEO_EXT.test(path || ""); }
-let bgVideoTimer = null;
+let bgVideoSync = 0;
 function setBgVideo(path) {
   let v = $("#bg-video");
   if (!path) {
     if (v) { v.pause(); v.removeAttribute("src"); v.load(); v.remove(); } // отпустить декодер и буферы
-    clearInterval(bgVideoTimer); bgVideoTimer = null;
     return;
   }
   if (!v) {
@@ -203,8 +245,6 @@ function setBgVideo(path) {
   }
   if (v.dataset.path !== path) { v.dataset.path = path; v.src = tauriFile(path); }
   syncBgVideo();
-  // свернуть/спрятать окно не всегда видно странице — проверяем и сами
-  if (!bgVideoTimer) bgVideoTimer = setInterval(syncBgVideo, 2000);
 }
 async function bgWindowHidden() {
   if (document.hidden) return true;
@@ -213,13 +253,28 @@ async function bgWindowHidden() {
   try { return (await w.isMinimized()) || !(await w.isVisible()); } catch { return false; }
 }
 async function syncBgVideo() {
+  const gen = ++bgVideoSync;
+  if (document.hidden) setUiHidden(true);
+  const w = window.__TAURI__?.window?.getCurrentWindow?.();
+  const [hidden, fullscreen, focused] = await Promise.all([
+    bgWindowHidden(),
+    invoke("fullscreen_app_running").catch(() => false),
+    w?.isFocused ? w.isFocused().catch(() => document.hasFocus()) : document.hasFocus(),
+  ]);
+  if (gen !== bgVideoSync) return;
+  const gone = document.hidden || hidden;
+  setUiHidden(gone, gone || (!!fullscreen && !focused));
   const v = $("#bg-video");
   if (!v) return;
-  if (await bgWindowHidden()) { if (!v.paused) v.pause(); }
+  if (uiPaused) { if (!v.paused) v.pause(); }
   else if (v.paused) v.play().catch(() => {});
 }
 document.addEventListener("visibilitychange", syncBgVideo);
+window.addEventListener("focus", syncBgVideo);
+window.addEventListener("blur", syncBgVideo);
 for (const ev of ["tauri://resize", "tauri://focus", "tauri://blur"]) listen(ev, syncBgVideo).catch?.(() => {});
+// Опрос нужен и при статическом фоне: сворачивание/трей не всегда меняют document.hidden.
+setInterval(syncBgVideo, 2000);
 
 function applyTheme() {
   const t = normalizeTheme(settings.theme);
@@ -546,28 +601,56 @@ function filteredPeers() {
       || dispName(a).localeCompare(dispName(b), "ru", { sensitivity: "base" }) || a.ip.localeCompare(b.ip));
 }
 function renderAll() { renderContacts(); renderGroups(); renderConv(); renderPeerCard(); }
+let contactsSignature = "", convSignature = "", peerCardSignature = "", groupsSignature = "";
+function peerDisplay(p) {
+  return p ? [p.ip, dispName(p), p.nickname, dispAva(p), p.online, p.ping_ms, p.trusted, liveAddr(p), peerAddrs(p), p.state, p.detail] : null;
+}
+function selectedDisplay() {
+  const g = curGroup();
+  return g ? ["group", g.id, g.name, g.avatar, g.members.map((ip) => peerDisplay(peers.find((p) => p.ip === ip)) || ip)] : ["peer", selectedIp, peerDisplay(sel())];
+}
 function renderContacts() {
-  const box = $("#contact-list"); box.innerHTML = "";
+  if (deferUi(renderContacts)) return;
+  const box = $("#contact-list");
   const list = filteredPeers();
   const on = peers.filter((p) => p.online).length;
+  const labels = new Map(list.map((p) => [p.ip, typingLabel(p.ip)]));
+  const signature = JSON.stringify([peers.length, on, selectedIp, list.map((p) => [peerDisplay(p), unread[p.ip], labels.get(p.ip)])]);
+  if (signature === contactsSignature) return;
+  contactsSignature = signature;
   $("#cnt-online").textContent = peers.length ? `${on} в сети` : "";
   if (!list.length) {
     box.innerHTML = peers.length ? `<div class="empty-hint">Ничего не найдено.</div>`
       : `<div class="empty-hint"><b>Пока пусто.</b><br>1. Нажми <svg class="ic" viewBox="0 0 24 24"><circle cx="10" cy="10" r="8"/><path d="M21.71,21.71a1,1,0,0,1-1.42,0L15.61,17A8.67,8.67,0,0,0,17,15.61l4.68,4.68A1,1,0,0,1,21.71,21.71Z"/></svg> — автоскан сети Radmin добавит всех.<br>2. Или <svg class="ic" viewBox="0 0 24 24"><path d="M19,11H13V5a1,1,0,0,0-2,0v6H5a1,1,0,0,0,0,2h6v6a1,1,0,0,0,2,0V13h6a1,1,0,0,0,0-2Z"/></svg> и введи IP вручную (26.x.x.x).<br>Контакты сохраняются автоматически.</div>`;
     return;
   }
+  box.querySelector(".empty-hint")?.remove();
+  const have = new Map([...box.children].map((row) => [row.dataset.ip, row]));
+  const ids = new Set(list.map((p) => p.ip));
+  for (const [ip, row] of have) if (!ids.has(ip)) row.remove();
+  let cursor = box.firstElementChild;
   for (const p of list) {
-    const d = document.createElement("div");
+    const d = have.get(p.ip) || document.createElement("div");
+    if (!have.has(p.ip)) {
+      d.dataset.ip = p.ip;
+      d.innerHTML = '<span class="ava"></span><div class="meta"></div><span class="unread hidden"></span>';
+      d.onclick = () => selectPeer(p.ip);
+    }
     d.className = "contact" + (p.ip === selectedIp ? " active" : "");
-    const typingKey = p.ip; // личный чат
-    const typingLabelText = typingPeers.has(typingKey) && typingPeers.get(typingKey)?.size ? typingLabel(typingKey) : "";
-    d.innerHTML = `${avaHTML(p, "sm")}<div class="meta"><b><span class="nm">${esc(dispName(p))}</span>${typingLabelText ? `<span class="typing-badge" style="margin-left:6px;font-size:11px;color:#3ddc84;">${esc(typingLabelText)}</span>` : ""}${p.trusted ? '<svg class="ic" viewBox="0 0 24 24" style="color:#f5c518"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z"/></svg>' : ""}</b><small>${p.online ? `<span style="color:#3ddc84">●</span> ${p.ping_ms ?? "?"} мс · ${esc(showAddr(liveAddr(p)))}` : `<span style="color:#666">●</span> ${esc(showAddr(liveAddr(p)))}`}${stateBadge(p.state)}${(p.state && p.state !== "idle" && p.detail) ? ` · ${esc(p.detail)}` : ""}</small></div>${unread[p.ip] ? `<span class="unread">${unread[p.ip]}</span>` : ""}`;
-    d.onclick = () => selectPeer(p.ip);
-    box.appendChild(d);
+    const typingLabelText = labels.get(p.ip);
+    setUiAvatar(d.querySelector(".ava"), avaHTML(p, "sm"));
+    setUiHtml(d.querySelector(".meta"), `<b><span class="nm">${esc(dispName(p))}</span>${typingLabelText ? `<span class="typing-badge" style="margin-left:6px;font-size:11px;color:#3ddc84;">${esc(typingLabelText)}</span>` : ""}${p.trusted ? '<svg class="ic" viewBox="0 0 24 24" style="color:#f5c518"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z"/></svg>' : ""}</b><small>${p.online ? `<span style="color:#3ddc84">●</span> ${p.ping_ms ?? "?"} мс · ${esc(showAddr(liveAddr(p)))}` : `<span style="color:#666">●</span> ${esc(showAddr(liveAddr(p)))}`}${stateBadge(p.state)}${(p.state && p.state !== "idle" && p.detail) ? ` · ${esc(p.detail)}` : ""}</small>`);
+    const badge = d.querySelector(".unread");
+    const count = String(unread[p.ip] || "");
+    if (badge.textContent !== count) badge.textContent = count;
+    badge.classList.toggle("hidden", !unread[p.ip]);
+    if (d !== cursor) box.insertBefore(d, cursor);
+    cursor = d.nextElementSibling;
   }
 }
 function sel() { return peers.find((p) => p.ip === selectedIp) || null; }
 async function selectPeer(ip) {
+  if (curKey() !== ip) resetChatWindow();
   selectedIp = ip; selGroup = null; unread[ip] = 0;
   setReply(null);
   hideChatSearch();
@@ -578,12 +661,16 @@ async function selectPeer(ip) {
   markDirectChatRead();
 }
 function renderConv() {
+  if (deferUi(renderConv)) return;
+  const signature = JSON.stringify([selectedDisplay(), !!currentCall, !!groupCall]);
+  if (signature === convSignature) return;
+  convSignature = signature;
   const g = curGroup();
   if (g) {
     const on = g.members.filter((m) => peers.find((p) => p.ip === m)?.online);
     $("#conv-name").textContent = g.name;
     $("#conv-sub").innerHTML = `<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:2px"><circle cx="9" cy="8" r="3"/><path d="M14,11H4A2,2,0,0,0,2,13v5H6V15H4V13A1,1,0,0,1,5,12H13a1,1,0,0,1,1,1v2H12v3h4V13A2,2,0,0,0,14,11Z"/><circle cx="17" cy="9" r="2.5"/><path d="M20,11.5A1.5,1.5,0,0,0,18.5,10H15a3,3,0,0,1,2,2.82V18H15v3h4V14.82A3,3,0,0,1,20,13Z"/></svg> ${g.members.length} · <span style="color:#3ddc84">●</span> ${on.length} в сети`;
-    $("#conv-ava").outerHTML = groupAva(g, "md").replace('class="ava md', 'id="conv-ava" class="ava md');
+    setUiAvatar($("#conv-ava"), groupAva(g, "md").replace('class="ava md', 'id="conv-ava" class="ava md'));
     $("#btn-call").innerHTML = '<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:4px"><path d="M21,15v3.93a2,2,0,0,1-2.29,2A18,18,0,0,1,3.14,5.29,2,2,0,0,1,5.13,3H9a1,1,0,0,1,1,.89,10.74,10.74,0,0,0,1,3.78,1,1,0,0,1-.42,1.26l-.86.49a1,1,0,0,0-.33,1.46,14.08,14.08,0,0,0,3.69,3.69,1,1,0,0,0,1.46-.33l.49-.86A1,1,0,0,1,16.33,13a10.74,10.74,0,0,0,3.78,1A1,1,0,0,1,21,15Z"/></svg> Группе';
     $("#btn-hangup").classList.toggle("hidden", !groupCall);
     return;
@@ -593,34 +680,37 @@ function renderConv() {
   if (!p) {
     $("#conv-name").textContent = "Выбери контакт";
     $("#conv-sub").textContent = "слева, чтобы начать общение";
-    $("#conv-ava").outerHTML = `<span id="conv-ava" class="ava md"><span>?</span></span>`;
+    setUiAvatar($("#conv-ava"), `<span id="conv-ava" class="ava md"><span>?</span></span>`);
     return;
   }
   $("#conv-name").textContent = dispName(p);
   $("#conv-sub").textContent = `${showAddr(liveAddr(p))} · ${p.online ? `в сети · ${p.ping_ms ?? "?"} мс` : "не в сети"}`;
-  $("#conv-ava").outerHTML = avaHTML(p, "md").replace('class="ava md', 'id="conv-ava" class="ava md');
+  setUiAvatar($("#conv-ava"), avaHTML(p, "md").replace('class="ava md', 'id="conv-ava" class="ava md'));
   $("#btn-hangup").classList.toggle("hidden", !currentCall);
 }
 function renderPeerCard() {
+  if (deferUi(renderPeerCard)) return;
+  renderKeyInfo(curGroup() ? null : sel());
+  const signature = JSON.stringify(selectedDisplay());
+  if (signature === peerCardSignature) return;
+  peerCardSignature = signature;
   const g = curGroup();
   if (g) {
     const on = g.members.filter((m) => peers.find((p) => p.ip === m)?.online);
     $("#rc-nick").textContent = g.name;
     $("#rc-sub").textContent = g.members.map((m) => { const p = peers.find((x) => x.ip === m); return p ? dispName(p) : m; }).join(", ") || "пустая группа";
     $("#rc-ping").innerHTML = `<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:2px"><circle cx="9" cy="8" r="3"/><path d="M14,11H4A2,2,0,0,0,2,13v5H6V15H4V13A1,1,0,0,1,5,12H13a1,1,0,0,1,1,1v2H12v3h4V13A2,2,0,0,0,14,11Z"/><circle cx="17" cy="9" r="2.5"/><path d="M20,11.5A1.5,1.5,0,0,0,18.5,10H15a3,3,0,0,1,2,2.82V18H15v3h4V14.82A3,3,0,0,1,20,13Z"/></svg> ${g.members.length} · <span style="color:#3ddc84">●</span> ${on.length}`;
-    $("#rc-avatar").outerHTML = groupAva(g, "lg").replace('class="ava lg', 'id="rc-avatar" class="ava lg');
+    setUiAvatar($("#rc-avatar"), groupAva(g, "lg").replace('class="ava lg', 'id="rc-avatar" class="ava lg'));
     $("#rc-rename").onclick = renameSel;
     $("#rc-rename").title = "Изменить группу";
     $("#rc-del").onclick = delSel;
     $("#rc-del").title = "Удалить группу";
     $("#rc-avatar-btn").style.display = "none";
     $("#rc-trust").style.display = "none";
-    renderKeyInfo(null);
     return;
   }
   $("#rc-avatar-btn").style.display = "";
   $("#rc-trust").style.display = "";
-  renderKeyInfo(sel());
   $("#rc-rename").onclick = renameSel;
   $("#rc-rename").title = "Локальное имя";
   $("#rc-del").onclick = delSel;
@@ -629,14 +719,14 @@ function renderPeerCard() {
   $("#rc-trust").title = "Доверенный";
   $("#rc-trust").onclick = toggleTrustSel;
   const p = sel();
-  if (!p) { $("#rc-nick").textContent = "—"; $("#rc-sub").textContent = "Выбери контакт слева"; $("#rc-ping").textContent = "—"; $("#rc-avatar").outerHTML = '<span id="rc-avatar" class="ava lg"><span>?</span></span>'; return; } // сброс аватарки/счётчика от прежней группы
+  if (!p) { $("#rc-nick").textContent = "—"; $("#rc-sub").textContent = "Выбери контакт слева"; $("#rc-ping").textContent = "—"; setUiAvatar($("#rc-avatar"), '<span id="rc-avatar" class="ava lg"><span>?</span></span>'); return; } // сброс аватарки/счётчика от прежней группы
   $("#rc-nick").textContent = dispName(p);
   // все адреса этого компьютера: LAN, Radmin, через сервер
   const addrs = peerAddrs(p).map(showAddr).join(", ");
   $("#rc-sub").textContent = p.nickname ? `ник: ${p.nickname} · ${addrs}` : addrs;
   $("#rc-sub").title = peerAddrs(p).length > 1 ? "Один компьютер с несколькими адресами: SafeDrop узнаёт его по ключу устройства" : "";
   $("#rc-ping").innerHTML = p.online ? `<span style="color:#3ddc84">●</span> в сети · ${p.ping_ms ?? "?"} мс` : `<span style="color:#666">●</span> не в сети`;
-  $("#rc-avatar").outerHTML = avaHTML(p, "lg").replace('class="ava lg', 'id="rc-avatar" class="ava lg');
+  setUiAvatar($("#rc-avatar"), avaHTML(p, "lg").replace('class="ava lg', 'id="rc-avatar" class="ava lg'));
   $("#rc-trust").innerHTML = p.trusted ? '<svg class="ic" viewBox="0 0 24 24" style="color:#f5c518"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M12,2l3.09,6.26L22,9.27l-5,4.87,1.18,6.88L12,17.77l-6.18,3.25L7,14.14,2,9.27l6.91-1.01Z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
 }
 
@@ -647,16 +737,17 @@ let keyInfoGen = 0;
 async function renderKeyInfo(p) {
   const box = $("#rc-key"); if (!box) return;
   const gen = ++keyInfoGen;
-  if (!p || isDemo) { box.innerHTML = ""; return; }
+  if (!p || isDemo) { setUiHtml(box, ""); return; }
   let k = null;
   try { k = await invoke("get_key_info", { ip: p.ip }); } catch {}
   if (gen !== keyInfoGen) return;
+  if (uiHidden || document.hidden) { pendingUi.add(renderPeerCard); return; }
   if (!k?.fp) {
-    box.innerHTML = `${LOCK_ICON}Ключ ещё не получен: он запомнится при первом защищённом соединении.`;
+    setUiHtml(box, `${LOCK_ICON}Ключ ещё не получен: он запомнится при первом защищённом соединении.`);
     return;
   }
-  box.innerHTML = `${LOCK_ICON}Код безопасности: <b class="key-code">${esc(k.code)}</b><br>Сверьте его с другом голосом — у него должен быть такой же.`
-    + (k.pending ? `<br><span class="key-warn">Пришёл другой ключ, его код: <b class="key-code">${esc(k.pending_code)}</b>. Соединения отклоняются, пока вы не решите.</span> <button id="rc-key-trust">Доверять новому</button>` : "");
+  setUiHtml(box, `${LOCK_ICON}Код безопасности: <b class="key-code">${esc(k.code)}</b><br>Сверьте его с другом голосом — у него должен быть такой же.`
+    + (k.pending ? `<br><span class="key-warn">Пришёл другой ключ, его код: <b class="key-code">${esc(k.pending_code)}</b>. Соединения отклоняются, пока вы не решите.</span> <button id="rc-key-trust">Доверять новому</button>` : ""));
   const b = $("#rc-key-trust");
   if (b) b.onclick = () => trustNewKey(p.ip, k.pending, k.pending_code);
 }
@@ -706,9 +797,14 @@ function renderGroupAvatarPreview() {
   preview.innerHTML = `<span>${avaInner(groupAvatarEdit, letter)}</span>`;
 }
 function renderGroups() {
-  const box = $("#group-list"); if (!box) return; box.innerHTML = "";
+  if (deferUi(renderGroups)) return;
+  const box = $("#group-list"); if (!box) return;
   const q = ($("#peer-search").value || "").toLowerCase();
   const list = groups.filter((g) => !q || g.name.toLowerCase().includes(q));
+  const signature = JSON.stringify([selGroup, list.map((g) => [g, unread[`g:${g.id}`], typingLabel(`g:${g.id}`), g.members.map((ip) => { const p = peers.find((x) => x.ip === ip); return [p?.online, p?.state]; })])]);
+  if (signature === groupsSignature) return;
+  groupsSignature = signature;
+  box.innerHTML = "";
   if (!list.length) { box.innerHTML = `<div class="empty-hint">Групп нет. Создай кнопкой +.</div>`; return; }
   for (const g of list) {
     const on = g.members.filter((m) => peers.find((p) => p.ip === m)?.online).length;
@@ -723,6 +819,7 @@ function renderGroups() {
   }
 }
 async function selectGroup(id) {
+  if (curKey() !== `g:${id}`) resetChatWindow();
   selGroup = id; selectedIp = null; unread[`g:${id}`] = 0;
   setReply(null);
   hideChatSearch();
@@ -849,6 +946,14 @@ function pushMsg(m) {
 }
 let renderedKey = null;
 let lastChatAtBottom = true;
+const CHAT_PAGE_SIZE = 300;
+let chatWindowFirstId = null, chatWindowStart = 0, chatWindowExpanded = false;
+let chatRenderVersion = 0, chatLayout = null;
+let pendingChatJump = null;
+function resetChatWindow() {
+  chatWindowFirstId = null; chatWindowStart = 0; chatWindowExpanded = false;
+  chatRenderVersion++; chatLayout = null; pendingChatJump = null;
+}
 function pauseMediaIn(root) {
   try {
     root.querySelectorAll(".audio-player").forEach((el) => el.disposeAudioPlayer());
@@ -1108,10 +1213,10 @@ function msgImages(m) {
   return m?.image ? [m.image] : [];
 }
 // содержимое ответа-цитаты: автор и начало текста/тип вложения
-function quoteOf(m) {
+function quoteOf(m, byId) {
   if (!m?.reply_to) return null;
   const list = chats[m.peer] || [];
-  const src = list.find((x) => x.id === m.reply_to);
+  const src = byId ? byId.get(m.reply_to) : list.find((x) => x.id === m.reply_to);
   if (!src) return { removed: true, author: "", text: "Сообщение удалено" };
   const author = src.from_me ? (profile.nickname || settings?.device_name || "Я") : src.from_nick;
   let text;
@@ -1149,7 +1254,9 @@ function togglePinned(key, msg) {
   try { localStorage.setItem(PIN_STORE, JSON.stringify(all)); } catch {}
   renderPinned(); renderChat();
 }
+let pinnedSignature = "";
 function renderPinned() {
+  if (deferUi(renderPinned)) return;
   const host = $("#pinned-strip"); if (!host) return;
   const key = curKey();
   const list = chats[key];
@@ -1164,6 +1271,9 @@ function renderPinned() {
     }
     rows = live.filter(([, msg]) => msg).map(([pin, msg]) => ({ ...pin, text: msgPreview(msg) }));
   }
+  const signature = JSON.stringify([key, rows]);
+  if (signature === pinnedSignature) return;
+  pinnedSignature = signature;
   host.innerHTML = "";
   host.classList.toggle("hidden", !rows.length);
   for (const pin of rows) {
@@ -1178,16 +1288,19 @@ function renderPinned() {
   }
 }
 
-function buildRow(m, p, g, myLetter, myNick) {
+function buildRow(m, p, g, myLetter, myNick, quote = quoteOf(m), avatar = rowAvatar(m, p, g, myLetter)) {
   const me = !!m.from_me;
-  const { av, letter } = rowAvatar(m, p, g, myLetter);
+  const { av, letter } = avatar;
   const images = msgImages(m);
   const imgsHTML = images.length ? `<div class="chat-imgs">${images.map((src, i) => `<img class="chat-img" data-i="${i}" src="${esc(safeImg(src))}" />`).join("")}</div>` : "";
   const editMark = m.edited_at ? `<span class="medit">изм.</span>` : "";
   const d = document.createElement("div");
   d.className = "msgrow" + (me ? " me" : "");
   d.dataset.mid = m.id;
-  d.innerHTML = `<span class="ava sm"><span>${avaInner(av, letter)}</span></span><div class="mbody"><div class="mhead"><b>${esc(me ? myNick : m.from_nick)}</b><time>${esc(msgTime(m))}</time>${editMark}${msgStatusHTML(m)}</div>${m.forwarded_from ? `<div class="forwarded-mark">Переслано от ${esc(m.forwarded_from)}</div>` : ""}${quoteHTML(quoteOf(m))}${imgsHTML}<p data-raw="${esc(m.text || "")}">${renderMsgText(m.text)}</p>${reactionsHTML(m, myNick)}</div><button class="mdel" title="Удалить"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button>`;
+  d.innerHTML = `<span class="ava sm"><span>${avaInner(av, letter)}</span></span><div class="mbody"><div class="mhead"><b>${esc(me ? myNick : m.from_nick)}</b><time>${esc(msgTime(m))}</time>${editMark}${msgStatusHTML(m)}</div>${m.forwarded_from ? `<div class="forwarded-mark">Переслано от ${esc(m.forwarded_from)}</div>` : ""}${quoteHTML(quote)}${imgsHTML}<p data-raw="${esc(m.text || "")}">${renderMsgText(m.text)}</p>${reactionsHTML(m, myNick)}</div><button class="mdel" title="Удалить"><svg class="ic" viewBox="0 0 24 24"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg></button>`;
+  d.querySelector(".ava.sm > span")._sdHtml = avaInner(av, letter);
+  d._sdQuoteHtml = quoteHTML(quote);
+  d._sdReactionsHtml = reactionsHTML(m, myNick);
   d.querySelectorAll(".chat-img").forEach((img) => { img.onclick = () => openImg(images[Number(img.dataset.i)]); });
   if (m.audio) d.querySelector(".mbody").insertBefore(isChatVideo(m.audio) ? createVideoPlayer(m.audio) : createAudioPlayer(m.audio), d.querySelector(".mbody > p"));
   d.querySelector(".mdel").onclick = () => openDel({ mode: "msg", id: m.id, mine: me });
@@ -1204,14 +1317,15 @@ function buildRow(m, p, g, myLetter, myNick) {
   });
   return d;
 }
-function refreshRow(row, m, p, g, myLetter, myNick) {
+function refreshRow(row, m, p, g, myLetter, myNick, quote = quoteOf(m), avatar = rowAvatar(m, p, g, myLetter)) {
   // обновить шапку без трогания медиа (ник/ава могли смениться)
   const me = !!m.from_me;
   try {
-    const { av, letter } = rowAvatar(m, p, g, myLetter);
+    row.oncontextmenu = (e) => { e.preventDefault(); openMsgMenu(e, m); };
+    const { av, letter } = avatar;
     row.querySelector(".mhead b").textContent = me ? myNick : m.from_nick;
     row.querySelector(".mhead time").textContent = msgTime(m);
-    row.querySelector(".ava.sm > span").innerHTML = avaInner(av, letter);
+    setUiHtml(row.querySelector(".ava.sm > span"), avaInner(av, letter));
     // текст мог измениться (правка сообщения) — перерисовываем только если реально другой
     const pEl = row.querySelector("p");
     if (pEl && pEl.dataset.raw !== (m.text || "")) {
@@ -1234,26 +1348,39 @@ function refreshRow(row, m, p, g, myLetter, myNick) {
       st.classList.toggle("read", !!m.read);
     } else if (st) st.remove();
     // реакции: перерисовать только контейнер, медиа не трогаем
-    let rr = row.querySelector(".mreacts");
     const html = reactionsHTML(m, myNick);
-    if (rr) rr.remove();
-    if (html) {
-      const body = row.querySelector(".mbody");
-      body.insertAdjacentHTML("beforeend", html);
-      row.querySelectorAll(".react").forEach((b) => {
-        b.onclick = () => {
-          const emoji = b.dataset.emoji;
-          const mine = b.classList.contains("mine");
-          invoke("chat_react", { peerIp: curKey(), id: m.id, emoji, remove: mine })
-            .catch((e) => toast("" + e, true));
-        };
-      });
+    if (row._sdReactionsHtml !== html) {
+      row._sdReactionsHtml = html;
+      row.querySelector(".mreacts")?.remove();
+      if (html) {
+        const body = row.querySelector(".mbody");
+        body.insertAdjacentHTML("beforeend", html);
+        row.querySelectorAll(".react").forEach((b) => {
+          b.onclick = () => {
+            const emoji = b.dataset.emoji;
+            const mine = b.classList.contains("mine");
+            invoke("chat_react", { peerIp: curKey(), id: m.id, emoji, remove: mine })
+              .catch((e) => toast("" + e, true));
+          };
+        });
+      }
+    }
+    const quoteHtml = quoteHTML(quote);
+    if (row._sdQuoteHtml !== quoteHtml) {
+      row._sdQuoteHtml = quoteHtml;
+      row.querySelector(".mquote")?.remove();
+      if (quoteHtml) {
+        (row.querySelector(".forwarded-mark") || head).insertAdjacentHTML("afterend", quoteHtml);
+        const q = row.querySelector(".mquote");
+        q.onclick = () => scrollToMsg(q.dataset.quote);
+      }
     }
   } catch (e) {
     console.error("refreshRow", e);
   }
 }
-function renderChat() {
+function renderChat({ preserveScroll = false } = {}) {
+  if (deferUi(renderChat)) return;
   const key = curKey();
   renderPinned();
   const box = $("#messages"); const list = chats[key] || [];
@@ -1268,10 +1395,14 @@ function renderChat() {
     pauseMediaIn(box);
     box.innerHTML = "";
     renderedKey = key;
+    chatWindowFirstId = null; chatWindowStart = 0; chatWindowExpanded = false;
   }
+  const version = ++chatRenderVersion;
+  chatLayout = null;
   const title = g ? g.name : (p ? dispName(p) : "");
   let hint = box.querySelector(".empty-hint");
   if (!list.length) {
+    chatWindowFirstId = null; chatWindowStart = 0;
     if (!hint) pauseMediaIn(box);
     if (!hint) box.innerHTML = `<div class="empty-hint">Это начало переписки с <b>${esc(title)}</b>. Сообщения летят напрямую, без серверов. <svg class="ic" viewBox="0 0 24 24"><path d="M12,2C6.48,2,2,6.48,2,12s4.48,10,10,10,10-4.48,10-10S17.52,2,12,2Zm0,18c-4.41,0-8-3.59-8-8s3.59-8,8-8,8,3.59,8,8-3.59,8-8,8Z"/><path d="M12,6c-3.31,0-6,2.69-6,6s2.69,6,6,6,6-2.69,6-6-2.69-6-6-6Zm0,10c-2.21,0-4-1.79-4-4s1.79-4,4-4,4,1.79,4,4-1.79,4-4,4Z"/></svg></div>`;
     updateChatBottomButton();
@@ -1280,45 +1411,117 @@ function renderChat() {
   if (hint) hint.remove();
   const myLetter = ((profile.nickname || settings?.device_name || "?"))[0].toUpperCase();
   const myNick = profile.nickname || settings?.device_name || "Я";
-  const ids = new Set(list.map((m) => m.id));
+  // Поиск цитат — один индекс на всю историю, без find для каждого ответа.
+  const byId = new Map(list.map((m) => [m.id, m]));
+  if (!chatWindowFirstId || (!chatWindowExpanded && wasAtBottom && !preserveScroll)) {
+    chatWindowStart = Math.max(0, list.length - CHAT_PAGE_SIZE);
+  } else {
+    const first = list.findIndex((m) => m.id === chatWindowFirstId);
+    chatWindowStart = first >= 0 ? first : Math.min(chatWindowStart, Math.max(0, list.length - CHAT_PAGE_SIZE));
+  }
+  chatWindowFirstId = list[chatWindowStart]?.id;
+  const visible = list.slice(chatWindowStart);
+  // Якорь берём до вставки: высота старых строк (включая медиа) может меняться.
+  const boxTop = box.getBoundingClientRect().top;
+  const anchor = (!wasAtBottom || preserveScroll) ? [...box.querySelectorAll(".msgrow[data-mid]")]
+    .find((row) => row.getBoundingClientRect().bottom > boxTop) : null;
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  let preserveAnchor = !!anchor;
+  let expectedTop = box.scrollTop;
+  const ids = new Set(visible.map((m) => m.id));
   // удалить строки удалённых (медиа внутри сначала глушим)
   box.querySelectorAll(".msgrow[data-mid]").forEach((row) => {
     if (!ids.has(row.dataset.mid)) { pauseMediaIn(row); row.remove(); }
   });
-  // добавить новые, обновить шапки старых — играющее не трогаем вообще
+  // Первичная сборка — фрагментом; затем один проход курсором по порядку.
   const have = new Map();
   box.querySelectorAll(".msgrow[data-mid]").forEach((row) => have.set(row.dataset.mid, row));
-  for (let i = 0; i < list.length; i++) {
-    const m = list[i];
-    const row = have.get(m.id);
-    if (row) { refreshRow(row, m, p, g, myLetter, myNick); continue; }
-    const newRow = buildRow(m, p, g, myLetter, myNick);
-    let nextRow = null;
-    for (let j = i + 1; j < list.length; j++) {
-      nextRow = have.get(list[j].id);
-      if (nextRow) break;
+  const ordered = [], newImages = [];
+  let earlier = box.querySelector(".chat-earlier");
+  if (chatWindowStart > 0) {
+    if (!earlier) {
+      earlier = document.createElement("button"); earlier.className = "chat-earlier";
+      earlier.onclick = () => {
+        const all = chats[curKey()] || [];
+        chatWindowExpanded = true;
+        chatWindowFirstId = all[Math.max(0, chatWindowStart - CHAT_PAGE_SIZE)]?.id;
+        renderChat({ preserveScroll: true });
+      };
     }
-    box.insertBefore(newRow, nextRow);
-    have.set(m.id, newRow);
+    const label = `Показать раньше (${Math.min(CHAT_PAGE_SIZE, chatWindowStart)})`;
+    if (earlier.textContent !== label) earlier.textContent = label;
+    ordered.push(earlier);
+  } else earlier?.remove();
+  const peerByIp = new Map(peers.map((peer) => [peer.ip, peer]));
+  const authors = new Map();
+  if (g) for (const ip of g.members) {
+    const peer = peerByIp.get(ip); if (!peer) continue;
+    for (const name of [peer.nickname, peer.name]) if (!authors.has(name)) authors.set(name, peer);
+  }
+  for (const m of visible) {
+    const author = g && !m.from_me ? authors.get(m.from_nick) : null;
+    const avatar = author ? { av: dispAva(author), letter: (dispName(author) || "?")[0].toUpperCase() }
+      : g && !m.from_me ? { av: "", letter: (m.from_nick || "?")[0].toUpperCase() } : rowAvatar(m, p, null, myLetter);
+    const quote = quoteOf(m, byId), images = msgImages(m);
+    // Не сериализуем base64-картинки/аватары при каждом обновлении.
+    const signature = JSON.stringify([m.from_me, m.from_nick, m.text, m.ts, m.sent_at, m.edited_at, m.status, m.read, m.reactions, quote, myNick, avatar.letter]);
+    let row = have.get(m.id), old = row?._sdRow;
+    const mediaChanged = old && (old.audio !== m.audio || old.forwarded !== m.forwarded_from || old.mine !== m.from_me
+      || old.images.length !== images.length || images.some((src, i) => src !== old.images[i]));
+    if (mediaChanged) { pauseMediaIn(row); row.remove(); row = null; }
+    if (!row) {
+      row = buildRow(m, p, g, myLetter, myNick, quote, avatar);
+      newImages.push(...row.querySelectorAll("img.chat-img"));
+    } else if (!old || old.signature !== signature || old.avatar !== avatar.av) {
+      refreshRow(row, m, p, g, myLetter, myNick, quote, avatar);
+    }
+    row._sdRow = { signature, avatar: avatar.av, audio: m.audio, images: images.slice(), forwarded: m.forwarded_from, mine: m.from_me };
+    ordered.push(row);
+  }
+  if (!box.firstChild) {
+    const fragment = document.createDocumentFragment();
+    for (const row of ordered) fragment.appendChild(row);
+    box.appendChild(fragment);
+  } else {
+    let cursor = box.firstChild;
+    for (const row of ordered) {
+      if (row !== cursor) box.insertBefore(row, cursor);
+      cursor = row.nextSibling;
+    }
   }
   // Capture the user's position before adding rows: checking after appending
   // could mistake a previously-bottom reader for someone browsing history.
   const keepAtBottom = () => {
-    if (wasAtBottom) box.scrollTop = box.scrollHeight;
+    if (uiHidden || document.hidden || version !== chatRenderVersion || key !== curKey()) return;
+    if (wasAtBottom && !preserveScroll && lastChatAtBottom) box.scrollTop = box.scrollHeight;
+    else if (preserveAnchor && anchor.isConnected) {
+      if (Math.abs(box.scrollTop - expectedTop) < 2) box.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+      else preserveAnchor = false; // пользователь уже прокрутил сам — старый якорь больше не удерживаем
+    }
+    expectedTop = box.scrollTop;
     updateChatBottomButton();
   };
+  if (wasAtBottom && !preserveScroll) lastChatAtBottom = true;
+  chatLayout = keepAtBottom;
   keepAtBottom();
   requestAnimationFrame(keepAtBottom);
-  if (wasAtBottom) box.querySelectorAll("img.chat-img").forEach((img) => {
-    if (!img.complete) img.addEventListener("load", keepAtBottom, { once: true });
+  newImages.forEach((img) => {
+    if (!img.complete) img.addEventListener("load", () => chatLayout?.(), { once: true });
   });
+  if (pendingChatJump?.key === key) {
+    const id = pendingChatJump.id; pendingChatJump = null; scrollToMsg(id);
+  }
 }
 function updateChatBottomButton() {
+  if (deferUi(updateChatBottomButton)) return;
   const box = $("#messages"), button = $("#chat-scroll-bottom");
   if (!box || !button) return;
   if (box.clientHeight <= 0) return;
   const distance = box.scrollHeight - box.scrollTop - box.clientHeight;
+  const wasAtBottom = lastChatAtBottom;
   lastChatAtBottom = distance <= 48;
+  // сам вернулся вниз после чтения старых — снова держим 300 последних
+  if (!wasAtBottom && lastChatAtBottom && chatWindowExpanded) chatWindowExpanded = false;
   button.classList.toggle("hidden", box.scrollHeight <= box.clientHeight + 16 || distance <= 48);
 }
 $("#messages").addEventListener("scroll", updateChatBottomButton, { passive: true });
@@ -1337,8 +1540,20 @@ function flashRow(row) {
 }
 function scrollToMsg(id) {
   if (!id) return;
+  if (uiHidden || document.hidden) { pendingChatJump = { key: curKey(), id }; pendingUi.add(renderChat); return; }
   const box = $("#messages");
-  const row = box.querySelector(`.msgrow[data-mid="${CSS.escape(id)}"]`);
+  let row = box.querySelector(`.msgrow[data-mid="${CSS.escape(id)}"]`);
+  if (!row) {
+    const list = chats[curKey()] || [];
+    const index = list.findIndex((m) => m.id === id);
+    if (index < 0) return;
+    chatWindowExpanded = true;
+    chatWindowFirstId = list[Math.max(0, index - 20)]?.id;
+    renderChat({ preserveScroll: true });
+    row = box.querySelector(`.msgrow[data-mid="${CSS.escape(id)}"]`);
+  }
+  // Отложенный keepAtBottom не должен отменять переход к найденному сообщению.
+  chatRenderVersion++; chatLayout = null; lastChatAtBottom = false;
   if (row) { row.scrollIntoView({ behavior: "smooth", block: "center" }); flashRow(row); setTimeout(updateChatBottomButton, 350); }
 }
 function hideChatSearch() {
@@ -1956,10 +2171,17 @@ async function answerIncomingFileOffer(accepted) {
 $("#incoming-file-accept").onclick = () => answerIncomingFileOffer(true);
 $("#incoming-file-reject").onclick = () => answerIncomingFileOffer(false);
 $("#incoming-file-modal").addEventListener("click", (e) => { if (e.target.id === "incoming-file-modal") answerIncomingFileOffer(false); });
+let transfersSignature = "", transfersFetch = null;
 async function refreshTransfers() {
+  if (deferUi(refreshTransfers)) return;
   let list = [];
-  try { list = await invoke("get_transfers"); } catch {}
+  try { list = await (transfersFetch ||= invoke("get_transfers")); } catch { return; }
+  finally { transfersFetch = null; }
+  if (deferUi(refreshTransfers)) return;
   updateUpdateProgress(list);
+  const signature = JSON.stringify(list.map((t) => [t.id, t.direction, t.filename, t.peer, t.done, t.size, t.speed_bps, t.status, t.error, t.progress]));
+  if (signature === transfersSignature) return;
+  transfersSignature = signature;
   const box = $("#transfers");
   box.innerHTML = list.length ? "" : `<div class="empty-hint">Передач пока нет. Файлы выбранному контакту — кнопкой выше или перетаскиванием на окно.</div>`;
   [...list].reverse().slice(0, 60).forEach((t) => {
@@ -1996,12 +2218,14 @@ function updateUpdateProgress(list) {
     const bar = row.querySelector(".bar > div");
     if (details) {
       const pct = Math.round((Number(transfer.progress) || 0) * 100);
-      details.textContent = transfer.status === "active"
+      const text = transfer.status === "active"
         ? `${fmtSize(transfer.done)} / ${fmtSize(transfer.size)} · ${pct}% · ${fmtSpeed(transfer.speed_bps)}`
         : transfer.status === "done" ? "Передача завершена"
         : transfer.status === "error" ? `Ошибка: ${transfer.error || "передача прервана"}`
         : transfer.status === "cancelled" ? "Передача отменена" : trStatus(transfer.status);
-      if (bar) bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+      if (details.textContent !== text) details.textContent = text;
+      const width = `${Math.max(0, Math.min(100, pct))}%`;
+      if (bar && bar.style.width !== width) bar.style.width = width;
     }
   }
 }
@@ -3359,6 +3583,25 @@ function renderCallStage() {
   }
   renderCallScreen();
 }
+let peerCallSignature = "", peerChatSignature = "";
+function renderPeerCallStage() {
+  if (deferUi(renderPeerCallStage)) return;
+  const ips = [currentCall, ...(groupCall?.members || []), ...Object.values(views).map((v) => v.ip)].filter(Boolean);
+  const signature = JSON.stringify(ips.map((ip) => peerDisplay(peers.find((p) => p.ip === ip))));
+  if (signature === peerCallSignature) return;
+  peerCallSignature = signature;
+  if (inVoice()) renderCallStage();
+}
+function renderPeerChat() {
+  if (deferUi(renderPeerChat)) return;
+  const g = curGroup();
+  const ips = g ? g.members : [selectedIp];
+  const signature = JSON.stringify([curKey(), g?.name, profile.nickname, profile.avatar, settings?.device_name,
+    ips.map((ip) => { const p = peers.find((x) => x.ip === ip); return p ? [p.ip, p.name, p.nickname, dispAva(p)] : ip; })]);
+  if (signature === peerChatSignature) return;
+  peerChatSignature = signature;
+  renderChat();
+}
 function switchSeg(name) {
   document.querySelectorAll("#seg .seg-btn").forEach((x) => x.classList.toggle("active", x.dataset.seg === name));
   const filesBtn = $("#btn-files-pane");
@@ -4450,11 +4693,12 @@ function typingLabel(key) {
 }
 
 function renderTypingBadge(key) {
+  if (uiHidden || document.hidden) { pendingUi.add(renderCurrentTyping); return; }
   const el = $("#conv-typing");
   if (!el) return;
   if (key !== curKey()) return;
   const label = typingLabel(key);
-  el.textContent = label;
+  if (el.textContent !== label) el.textContent = label;
   el.classList.toggle("hidden", !label);
   const m = typingPeers.get(key);
   if (m && m.size) {
@@ -4467,6 +4711,7 @@ function renderTypingBadge(key) {
     if (t) { clearTimeout(t); typingTimers.delete(key); }
   }
 }
+function renderCurrentTyping() { renderTypingBadge(curKey()); }
 
 $("#chat-input").addEventListener("input", () => {
   // эмитим «печатает» не чаще раза в 2.5с, только когда есть контакт/группа
@@ -5732,8 +5977,11 @@ try {
     peers = Array.isArray(e.payload) ? e.payload : await invoke("get_peers").catch(() => peers);
     checkLinuxPeerVersions();
     migratePinned();
-    if (!sel() && !selGroup && peers.length) { selectedIp = peers[0].ip; try { chats[selectedIp] = await invoke("get_chat", { peerIp: selectedIp }); chats[selectedIp].forEach((m) => seenIds.add(m.id)); } catch {} }
-    renderAll(); renderChat(); renderCallStage();
+    if (!sel() && !selGroup && peers.length) {
+      const ip = peers[0].ip; selectedIp = ip;
+      try { chats[ip] = await invoke("get_chat", { peerIp: ip }); chats[ip].forEach((m) => seenIds.add(m.id)); } catch {}
+    }
+    schedulePeerUi();
   });
   // новый адрес оказался уже знакомым компьютером (тот же ключ): его чат
   // переехал в чат контакта — перечитать, непрочитанные перенести
@@ -7520,6 +7768,9 @@ try {
     } catch {}
   }
 } catch (e) { toast("Ошибка запуска: " + e, true); }
+uiReady = true;
+syncBgVideo();
+flushUi();
 // чистка зависших показов: соединение умерло — плитку долой, без чёрных экранов
 const discCount = {};
 function sweepStale() {
@@ -7616,5 +7867,5 @@ function sweepStale() {
   }
 }
 setInterval(() => { refreshTransfers(); sweepStale(); }, 1500);
-setInterval(async () => { try { peers = await invoke("get_peers"); renderContacts(); renderConv(); renderPeerCard(); } catch {} }, 10000);
+setInterval(async () => { try { peers = await invoke("get_peers"); schedulePeerUi(); } catch {} }, 10000);
 setInterval(() => { updCheckCallPeers().catch(() => {}); }, 10000);

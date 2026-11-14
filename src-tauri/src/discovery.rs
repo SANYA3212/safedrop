@@ -252,6 +252,21 @@ pub fn scan_targets(adapters: &[AdapterInfo], known: &[String], manual: &[String
     v
 }
 
+/// Лёгкая проверка: только адреса известных контактов и вручную добавленные
+/// отдельные IP (без обхода подсетей).
+pub fn light_targets(known: &[String], manual: &[String]) -> Vec<String> {
+    let mut set: HashSet<String> = HashSet::new();
+    for k in known.iter().chain(manual.iter()) {
+        let k = k.trim();
+        if k.parse::<Ipv4Addr>().map(usable_v4).unwrap_or(false) {
+            set.insert(k.to_string());
+        }
+    }
+    let mut v: Vec<String> = set.into_iter().take(1024).collect();
+    v.sort();
+    v
+}
+
 /// Human-readable scan coverage for network diagnostics.
 pub fn scan_nets() -> Vec<String> {
     let ads = my_adapters();
@@ -301,7 +316,7 @@ pub async fn tcp_ping(ip: &str, port: u16, timeout_ms: u64) -> Option<u64> {
     }
 }
 
-/// Sweep `targets` concurrently (128 workers, 450 ms probe timeout),
+/// Sweep `targets` concurrently (64 workers, 450 ms probe timeout),
 /// reporting progress via `safedrop-scan-progress` {done, total}.
 /// Returns Vec<(ip, ping_ms)> of live hosts.
 pub async fn scan_subnet_with_progress(
@@ -310,7 +325,9 @@ pub async fn scan_subnet_with_progress(
     app: Option<tauri::AppHandle>,
 ) -> Vec<(String, u64)> {
     let total = targets.len();
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
+    // 64, а не 128: меньше одновременных полуоткрытых соединений (сетевой
+    // стек, драйвер VPN и антивирус всего ПК); полный обход идёт редко
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
     let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let app = std::sync::Arc::new(app);
     let mut tasks = Vec::with_capacity(total);
@@ -341,4 +358,22 @@ pub async fn scan_subnet_with_progress(
     }
     live.sort();
     live
+}
+
+#[cfg(test)]
+mod light_tests {
+    use super::light_targets;
+
+    #[test]
+    fn only_known_ipv4_addresses() {
+        let known = vec![
+            "26.1.2.3".to_string(),
+            "26.1.2.3".to_string(),
+            "sd-0123abcd".to_string(),
+            "127.0.0.1".to_string(),
+            "192.168.1.20".to_string(),
+        ];
+        let manual = vec!["10.0.0.0/24".to_string(), " 10.0.0.7 ".to_string()];
+        assert_eq!(light_targets(&known, &manual), vec!["10.0.0.7", "192.168.1.20", "26.1.2.3"]);
+    }
 }

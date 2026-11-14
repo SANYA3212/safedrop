@@ -1610,8 +1610,10 @@ pub async fn broadcast_hash(app: &AppHandle) {
             s.profile.nickname.clone()
         };
         let h = profile_hash(&nn, &s.profile.avatar);
+        // только тем, кто в сети: соединение с выключенным ПК каждые 15 с
+        // ничего не даёт (когда он появится, ему уйдёт announce_to)
         let g = state.peers.lock().await;
-        (s.sig_port, h, s.device_name.clone(), g.keys().cloned().collect::<Vec<_>>())
+        (s.sig_port, h, s.device_name.clone(), g.values().filter(|p| p.online).map(|p| p.ip.clone()).collect::<Vec<_>>())
     };
     for ip in ips {
         let v = serde_json::json!({"kind":"profile-hash","hash":hash,"device":dev});

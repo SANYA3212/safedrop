@@ -44,6 +44,7 @@ export async function invoke(cmd, args = {}) {
     case "ping_peer": return null;
     case "scan_network": return [];
     case "get_transfers": return [];
+    case "fullscreen_app_running": return false;
     case "send_file": throw "демо-режим: запусти приложение";
     case "open_loaddrop": return;
     case "move_loaddrop": return;

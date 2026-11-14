@@ -133,13 +133,83 @@ pub fn load_peers(state: &AppState) {
     }
 }
 
+static PEERS_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PEERS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// (номер последнего записанного снимка, хеш его содержимого)
+static PEERS_WRITTEN: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
+/// Снимок контактов под их замком: маршруты обновляются, снимок получает
+/// номер — более старый снимок никогда не перезапишет более новый.
+fn peers_snapshot(g: &std::collections::HashMap<String, crate::state::Peer>) -> (u64, Vec<crate::state::Peer>) {
+    crate::ident::sync(g);
+    let seq = PEERS_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    (seq, g.values().cloned().collect())
+}
+
+/// Запись снимка (без замка контактов). Неизменившийся файл не переписывается.
+fn write_peers(path: &std::path::Path, seq: u64, list: &[crate::state::Peer]) {
+    use std::hash::{Hash, Hasher};
+    let Ok(data) = serde_json::to_string_pretty(list) else { return };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    let hash = h.finish();
+    let mut w = PEERS_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seq <= w.0 {
+        return; // уже записан более свежий снимок
+    }
+    w.0 = seq;
+    if hash == w.1 {
+        return;
+    }
+    if fs::write(path, data).is_ok() {
+        w.1 = hash;
+    }
+}
+
+/// Раньше каждый вызов ждал замок контактов (засыпая поток tokio до 0,5 с) и
+/// синхронно писал peers.json под этим замком — сканирование раз в 30 с,
+/// проверка связи раз в 2 с и сетевые кадры делали это постоянно. Теперь
+/// маршруты обновляются сразу, если замок свободен, а пачка изменений
+/// превращается в одну фоновую запись примерно через 0,25 с.
 pub fn persist_peers(state: &AppState) {
-    if let Some(g) = try_lock_briefly(&state.peers) {
+    use std::sync::atomic::Ordering;
+    let Some(app) = CHAT_APP.get() else { persist_peers_now(state); return };
+    if let Ok(g) = state.peers.try_lock() {
         crate::ident::sync(&g);
-        let list: Vec<_> = g.values().cloned().collect();
-        if let Ok(data) = serde_json::to_string_pretty(&list) {
-            let _ = fs::write(state.peers_path(), data);
-        }
+    } else {
+        // замок занят (часто — самим вызывающим): маршруты обновим, как только
+        // он освободится, не дожидаясь отложенной записи
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            use tauri::Manager;
+            let state = app.state::<AppState>();
+            crate::ident::sync(&*state.peers.lock().await);
+        });
+    }
+    if PEERS_DIRTY.swap(true, Ordering::SeqCst) {
+        return; // запись уже запланирована и увидит это изменение
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        use tauri::Manager;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        PEERS_DIRTY.store(false, Ordering::SeqCst);
+        let state = app.state::<AppState>();
+        let (seq, list) = {
+            let g = state.peers.lock().await;
+            peers_snapshot(&g)
+        };
+        let path = state.peers_path();
+        let _ = tauri::async_runtime::spawn_blocking(move || write_peers(&path, seq, &list)).await;
+    });
+}
+
+/// Синхронная запись контактов (выход из программы, сброс).
+pub fn persist_peers_now(state: &AppState) {
+    if let Some(g) = try_lock_briefly(&state.peers) {
+        let (seq, list) = peers_snapshot(&g);
+        drop(g);
+        write_peers(&state.peers_path(), seq, &list);
     }
 }
 
@@ -214,4 +284,23 @@ pub fn apply_autostart(enabled: bool) -> Result<(), String> {
         let _ = std::fs::remove_file(&bat);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod peers_write_tests {
+    use super::write_peers;
+
+    #[test]
+    fn older_snapshot_never_overwrites_newer() {
+        let dir = std::env::temp_dir().join(format!("safedrop-peers-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("peers.json");
+        let _ = std::fs::remove_file(&path);
+        write_peers(&path, 10, &[]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+        std::fs::write(&path, "newer").unwrap();
+        write_peers(&path, 9, &[]); // старый снимок пришёл поздно — пропустить
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

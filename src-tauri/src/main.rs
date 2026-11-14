@@ -227,7 +227,95 @@ fn adapter_key(a: &discovery::AdapterInfo) -> String {
     format!("{}|{}", a.name, a.ip)
 }
 
+/// Полный обход подсетей в спокойном режиме — не чаще, чем раз в столько.
+/// Между ними раз в 30 с проверяются только адреса известных контактов:
+/// новые компьютеры с SafeDrop сами находят нас и представляются.
+const FULL_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Запущено полноэкранное приложение (игра, презентация, видео во весь
+/// экран): в это время SafeDrop не делает тяжёлых фоновых обходов сети.
+fn fullscreen_busy() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Shell::{
+            SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+        };
+        // SAFETY: функция без аргументов, только читает состояние оболочки
+        let shell = match unsafe { SHQueryUserNotificationState() } {
+            Ok(s) => s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE,
+            Err(_) => false,
+        };
+        shell || foreground_covers_monitor()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Игры «в окне без рамки» (так Dota 2 запускается по умолчанию) оболочка
+/// не всегда считает полноэкранными: активное окно другой программы без
+/// заголовка, закрывающее весь монитор, — тоже полноэкранное приложение.
+#[cfg(windows)]
+fn foreground_covers_monitor() -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetWindowLongW, GetWindowRect,
+        GetWindowThreadProcessId, GWL_STYLE, WS_CAPTION,
+    };
+    // SAFETY: только чтение сведений об окнах; все указатели — на локальные переменные
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() || hwnd == GetDesktopWindow() || hwnd == GetShellWindow() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == std::process::id() {
+            return false; // своё окно (например, видео во весь экран) — не игра
+        }
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(hwnd, &mut cls).max(0) as usize;
+        let cls = String::from_utf16_lossy(&cls[..n.min(cls.len())]);
+        if cls == "WorkerW" || cls == "Progman" {
+            return false; // рабочий стол
+        }
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        if style & WS_CAPTION.0 == WS_CAPTION.0 {
+            return false; // обычное (в т.ч. развёрнутое) окно с заголовком
+        }
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+        if mon.0.is_null() {
+            return false;
+        }
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return false;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_err() {
+            return false;
+        }
+        let m = mi.rcMonitor;
+        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+    }
+}
+
+/// Для интерфейса: когда идёт игра во весь экран, а SafeDrop не в фокусе,
+/// он ставит на паузу видеофон и анимации.
+#[tauri::command]
+async fn fullscreen_app_running() -> bool {
+    fullscreen_busy()
+}
+
 async fn refresh_live(app: &tauri::AppHandle, state: &tauri::State<'_, AppState>) -> Vec<Peer> {
+    refresh_live_mode(app, state, true).await
+}
+
+/// `full` — обход подсетей целиком (запуск, смена сети, кнопка «Скан»,
+/// раз в 10 минут); иначе — проверка только адресов известных контактов.
+async fn refresh_live_mode(app: &tauri::AppHandle, state: &tauri::State<'_, AppState>, full: bool) -> Vec<Peer> {
     // adapters for the scan: user filter (settings.scan_adapters, empty = all),
     // signature stored so loop-level code can notice network changes too
     let ads_all = discovery::my_adapters();
@@ -239,7 +327,7 @@ async fn refresh_live(app: &tauri::AppHandle, state: &tauri::State<'_, AppState>
     } else {
         false
     };
-    if changed {
+    if changed && full {
         // network changed (VPN connected / Wi-Fi switched): re-run scan immediately
         let _ = app.emit("safedrop-scan-progress", serde_json::json!({ "done": 0, "total": 1 }));
     }
@@ -252,12 +340,12 @@ async fn refresh_live(app: &tauri::AppHandle, state: &tauri::State<'_, AppState>
     ).is_err() {
         return state.peers.lock().await.values().cloned().collect();
     }
-    let result = refresh_live_inner(app, state).await;
+    let result = refresh_live_inner(app, state, full).await;
     state.scanning.store(false, std::sync::atomic::Ordering::SeqCst);
     result
 }
 
-async fn refresh_live_inner(app: &tauri::AppHandle, state: &tauri::State<'_, AppState>) -> Vec<Peer> {
+async fn refresh_live_inner(app: &tauri::AppHandle, state: &tauri::State<'_, AppState>, full: bool) -> Vec<Peer> {
     // режим «через сервер»: кто в сети — знает сервер, сеть не сканируем,
     // а контакты LAN/Radmin в этом режиме недоступны
     if relay::active() {
@@ -301,8 +389,13 @@ async fn refresh_live_inner(app: &tauri::AppHandle, state: &tauri::State<'_, App
         }
         (s.tcp_port, s.scan_manual.clone(), known)
     };
-    let targets = discovery::scan_targets(&ads, &known, &manual);
-    let live = discovery::scan_subnet_with_progress(port, targets, Some(app.clone())).await;
+    let live = if full {
+        let targets = discovery::scan_targets(&ads, &known, &manual);
+        discovery::scan_subnet_with_progress(port, targets, Some(app.clone())).await
+    } else {
+        // тихая проверка: без полосы «Скан» в интерфейсе
+        discovery::scan_subnet_with_progress(port, discovery::light_targets(&known, &manual), None).await
+    };
     // свои адреса: сервер слушает 0.0.0.0, поэтому скан находит нас самих
     // на каждом адаптере (пинг 0-2мс) — себя в контакты не добавляем
     let mine: std::collections::HashSet<String> =
@@ -1302,6 +1395,7 @@ try {{
         .spawn()
         .map_err(|e| e.to_string())?;
     settings::save_chats_now(&state); // история пишется с задержкой
+    settings::persist_peers_now(&state); // контакты тоже
     std::thread::sleep(std::time::Duration::from_millis(250));
     std::process::exit(0);
 }
@@ -1662,6 +1756,8 @@ async fn factory_reset(
     let _ = std::fs::create_dir_all(&fresh.loaddrop_dir);
     *state.settings.lock().await = fresh;
     state.peers.lock().await.clear();
+    // отложенная запись старого списка не должна вернуть контакты после сброса
+    settings::persist_peers_now(&state);
     state.transfers.lock().await.clear();
     state.call_history.lock().await.clear();
     state.chats.lock().await.clear();
@@ -2049,6 +2145,7 @@ async fn win_hide(app: tauri::AppHandle) -> Result<(), String> {
 async fn win_quit(app: tauri::AppHandle) -> Result<(), String> {
     // история пишется на диск с задержкой — перед выходом дописать
     settings::save_chats_now(&app.state::<AppState>());
+    settings::persist_peers_now(&app.state::<AppState>());
     app.exit(0);
     Ok(())
 }
@@ -2127,6 +2224,7 @@ async fn fix_mic_blocked(state: tauri::State<'_, AppState>) -> Result<(), String
         .spawn()
         .map_err(|e| e.to_string())?;
     settings::save_chats_now(&state); // история пишется с задержкой
+    settings::persist_peers_now(&state); // контакты тоже
     // give the bat a moment to start, then exit so it can wipe the profile
     std::thread::sleep(std::time::Duration::from_millis(500));
     std::process::exit(0);
@@ -2923,7 +3021,14 @@ fn main() {
                     let state: tauri::State<'_, AppState> = handle2.state();
                     refresh_live(&handle2, &state).await;
                 }
+                // Раньше полный обход (тысячи TCP-подключений к пустым адресам
+                // Radmin/LAN) шёл каждые 30 с — это нагружало сетевой стек,
+                // драйвер VPN и антивирус всего ПК. Теперь полный обход — при
+                // смене сети и раз в 10 минут (не во время полноэкранной игры),
+                // а каждые 30 с — только адреса известных контактов.
                 let mut tick: u32 = 0;
+                let mut last_full = std::time::Instant::now();
+                let mut want_full = false;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                     tick = tick.wrapping_add(1);
@@ -2933,10 +3038,19 @@ fn main() {
                     }
                     let sig = discovery::adapter_signature(&discovery::my_adapters());
                     let changed = state.last_adapter_sig.lock().map(|s| *s != sig).unwrap_or(true);
-                    if !changed && tick % 2 != 0 {
-                        continue; // steady state: full sweep every 30s
+                    if changed {
+                        want_full = true; // смена сети: обойти заново, как только можно
                     }
-                    refresh_live(&handle2, &state).await;
+                    if !changed && tick % 2 != 0 {
+                        continue; // steady state: check every 30s
+                    }
+                    let game = fullscreen_busy();
+                    let full = !game && (want_full || last_full.elapsed() >= FULL_SWEEP_EVERY);
+                    refresh_live_mode(&handle2, &state, full).await;
+                    if full {
+                        want_full = false;
+                        last_full = std::time::Instant::now();
+                    }
                 }
             });
             // lightweight profile sync heartbeat every 15s; every 30s also
@@ -2987,7 +3101,7 @@ fn main() {
             pick_files, pick_image, pick_bg_media, pick_folder, pick_audio, read_image_dataurl,
             clear_peers, scan_debug, factory_reset, open_firewall, set_ctx_menu, refresh_ctx_menu, get_pending_send,
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
-            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, linux_audio_status, linux_audio_install, rtc_debug_on, rtc_debug, own_installer, get_key_info, trust_new_key, forget_key, win11_menu_status, win11_menu_set, ghupdate::check_github_update, ghupdate::download_github_update,
+            win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, linux_audio_status, linux_audio_install, rtc_debug_on, rtc_debug, own_installer, get_key_info, trust_new_key, forget_key, win11_menu_status, win11_menu_set, fullscreen_app_running, ghupdate::check_github_update, ghupdate::download_github_update,
             server_status, server_configure, server_trust_key, server_ice,
             ytbrowse::ytb_open, ytbrowse::ytb_go, ytbrowse::ytb_nav, ytbrowse::ytb_watch, ytbrowse::ytb_notify, ytbrowse::ytb_state,
             ytbrowse::ytb_set_share, ytbrowse::ytb_remote_nav, ytbrowse::ytb_pause_media, ytbrowse::ytb_media_apply, ytbrowse::ytb_duck, ytbrowse::ytb_chat_send, ytbrowse::ytb_chat_show, ytbrowse::ytb_chat_toggle, ytbrowse::ytb_chat_request, ytbrowse::ytb_chat_history,
