@@ -846,6 +846,11 @@ export const mobileApi = {
   unreadOf: (key) => unread[key] || 0,
   isOnline: (ip) => !!peers.find((p) => p.ip === ip)?.online,
   toast: (text, bad = false) => toast(esc(text), bad),
+  // голосовые как в Telegram (держать — запись, отпустить — отправить)
+  voiceStart: () => $("#btn-record-audio")?.onclick?.(),
+  voiceStop: (discard) => stopVoiceRecording(discard),
+  voiceRecording: () => voiceRecorder?.state === "recording",
+  voiceStarting: () => voiceStarting,
 };
 let editingGroup = null;
 function openGroupModal(g) {
@@ -1102,7 +1107,7 @@ function createAudioPlayer(path, { src = tauriFile(path), voice = /^safedrop-voi
   const label = preview ? "Предпрослушивание голосового" : voice ? "Голосовое сообщение" : fileName(path);
   root.querySelector(".audio-name").textContent = label;
   audio.setAttribute("aria-label", label);
-  let decodedDuration = 0, waveAttempted = false, disposed = false;
+  let decodedDuration = 0, waveAttempted = false, disposed = false, probingEnd = false;
   function duration() {
     if (Number.isFinite(audio.duration) && audio.duration > 0) return audio.duration;
     if (decodedDuration) return decodedDuration;
@@ -1111,7 +1116,7 @@ function createAudioPlayer(path, { src = tauriFile(path), voice = /^safedrop-voi
     return Number.isFinite(end) && end > 0 ? end : 0;
   }
   function update() {
-    const total = duration(), current = audio.currentTime || 0;
+    const total = duration(), current = probingEnd ? 0 : (audio.currentTime || 0);
     const progress = total ? Math.min(1, current / total) : 0;
     seek.disabled = !total || !!audio.error;
     seek.value = String(Math.round(progress * 1000));
@@ -1153,6 +1158,19 @@ function createAudioPlayer(path, { src = tauriFile(path), voice = /^safedrop-voi
   audio.addEventListener("pause", () => { if (activeAudioPlayer === audio) activeAudioPlayer = null; update(); });
   ["timeupdate", "durationchange", "loadedmetadata", "progress", "ended"].forEach((event) => audio.addEventListener(event, update));
   audio.addEventListener("loadedmetadata", () => root.loadAudioWave());
+  // Голосовые из MediaRecorder (WebM) без длительности в заголовке: Chromium
+  // узнаёт её, только дойдя до конца файла, а до этого показывает сколько
+  // загружено. Перематываем в конец и сразу обратно — длительность настоящая.
+  audio.addEventListener("loadedmetadata", () => {
+    if (audio.duration === Infinity && audio.paused && !probingEnd) { probingEnd = true; audio.currentTime = 1e7; }
+  });
+  audio.addEventListener("durationchange", () => {
+    if (probingEnd && Number.isFinite(audio.duration)) { probingEnd = false; audio.currentTime = 0; update(); }
+  });
+  // длительность так и не нашлась — всё равно вернуться в начало
+  audio.addEventListener("seeked", () => {
+    if (probingEnd) { probingEnd = false; audio.currentTime = 0; update(); }
+  });
   audio.addEventListener("error", unavailable);
   root.querySelector(".audio-retry").onclick = () => {
     root.classList.remove("is-error"); error.classList.add("hidden");

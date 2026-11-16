@@ -235,3 +235,49 @@ html.mobile #m-l-state { min-height: 20px; text-align: center; font-size: 14px; 
 html.mobile #m-l-state.err { color: #ff8b8f; }
 html.mobile #m-l-state.on { color: #3ddc84; }
 html.mobile .m-code { font-family: ui-monospace, monospace; font-size: 15px; word-break: break-all; background: var(--input); border: 1px solid var(--line); border-radius: 12px; padding: 12px; text-align: center; }
+
+/* ---------- выбор цвета (своя палитра: WebView не открывает системную) ---------- */
+html.mobile .m-color { padding: 8px 16px 16px; display: flex; flex-direction: column; gap: 12px; }
+html.mobile .m-color h4 { margin: 8px 0 0; }
+html.mobile .m-color-top { display: flex; gap: 12px; align-items: center; }
+html.mobile .m-color-preview { width: 52px; height: 52px; border-radius: 14px; border: 1px solid var(--line); flex: 0 0 52px; }
+html.mobile .m-color-hex { flex: 1; font-family: ui-monospace, monospace; font-size: 16px; text-transform: lowercase; }
+html.mobile .m-color-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; }
+html.mobile .m-color .m-swatch { aspect-ratio: 1; width: 100%; min-height: 0; padding: 0; border-radius: 50%; border: 1px solid rgba(255, 255, 255, .25); }
+html.mobile .m-color-row { display: grid; grid-template-columns: 110px 1fr; align-items: center; gap: 10px; font-size: 14px; color: var(--muted); }
+html.mobile .m-color .row { justify-content: flex-end; }
+html.mobile .m-color .row button { min-width: 110px; }
+/* в теме — только то, что действует в выбранном режиме фона и кнопок */
+html.mobile label:has(> input[data-theme-bg]:disabled),
+html.mobile label:has(> input[data-theme-button-gradient]:disabled),
+html.mobile .gradient-editor:not(:has(input[data-theme-bg]:enabled)) { display: none; }
+
+/* ---------- голосовые как в Telegram ---------- */
+html.mobile #btn-record-audio { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+html.mobile #composer { position: relative; }
+html.mobile #composer.m-recording #btn-record-audio { position: relative; z-index: 4; background: #e5484d; color: #fff; transform: scale(1.25); }
+html.mobile #composer.m-recording:has(#m-rec.locked) #btn-record-audio { visibility: hidden; }
+html.mobile #m-rec {
+  position: absolute; inset: 0 0 0 0; z-index: 3; display: flex; align-items: center; gap: 10px;
+  padding: 0 70px 0 16px; background: linear-gradient(var(--m-bg), var(--m-bg)), var(--bg, #141824); pointer-events: none;
+}
+html.mobile #m-rec.hidden { display: none; }
+html.mobile #m-rec.locked { pointer-events: auto; padding-right: 10px; }
+html.mobile .m-rec-dot { width: 10px; height: 10px; border-radius: 50%; background: #e5484d; animation: pl 1s infinite; }
+html.mobile #m-rec b { font-variant-numeric: tabular-nums; min-width: 44px; }
+html.mobile .m-rec-hint { flex: 1; color: var(--muted); font-size: 14px; text-align: center; }
+html.mobile #m-rec:not(.locked) :is(.m-rec-cancel, .m-rec-send) { display: none; }
+html.mobile #m-rec.locked .m-rec-hint { visibility: hidden; }
+html.mobile #m-rec button { min-width: 0; height: 40px; border-radius: 20px; padding: 0 16px; font-size: 15px; border: 1px solid var(--line); background: var(--btn); color: var(--btn-text); }
+html.mobile #m-rec-lock {
+  position: absolute; right: 8px; bottom: 64px; z-index: 3; width: 44px; padding: 10px 0 6px; border-radius: 22px;
+  background: var(--m-bg); border: 1px solid var(--line); display: flex; flex-direction: column; align-items: center; gap: 4px;
+  color: var(--muted); font-size: 11px; pointer-events: none;
+}
+html.mobile #m-rec-lock.hidden { display: none; }
+/* микрофон справа, как в Telegram: пустое поле — микрофон, есть текст — «Отправить» */
+html.mobile #btn-record-audio { order: 5; }
+html.mobile #btn-send { order: 6; }
+html.mobile #composer:has(#chat-input:placeholder-shown) #btn-send { display: none; }
+html.mobile body:is(:has(#pending-attachments:not(.hidden)), :has(#pending-audio:not(.hidden))) #composer #btn-send { display: grid; place-items: center; }
+html.mobile #composer:not(:has(#chat-input:placeholder-shown)) #btn-record-audio { display: none; }

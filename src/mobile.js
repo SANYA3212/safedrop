@@ -534,6 +534,161 @@ function watchTheme() {
   new MutationObserver(syncBubbleColors).observe(root, { attributes: true, attributeFilter: ["style"] });
 }
 
+// ---------- выбор цвета ----------
+// Android WebView не открывает окно выбора цвета для <input type="color">:
+// на телефоне — своя палитра. Значение уходит в поле как обычно (события
+// input и change), дальше тему сохраняет app.js.
+const PALETTE = [
+  "#000000", "#141824", "#1a2138", "#0d1020", "#2b2d31", "#4b5563", "#9aa3b8", "#ffffff",
+  "#5b8cff", "#3b82f6", "#06b6d4", "#14b8a6", "#22c55e", "#84cc16", "#eab308", "#f97316",
+  "#ef4444", "#ec4899", "#d946ef", "#a855f7", "#7c3aed", "#9b59ff", "#6366f1", "#0ea5e9",
+];
+function hexToHsl(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = (n >> 16 & 255) / 255, g = (n >> 8 & 255) / 255, b = (n & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+  let h = 0, sat = 0;
+  if (max !== min) {
+    const d = max - min;
+    sat = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h *= 60;
+  }
+  return [Math.round(h), Math.round(sat * 100), Math.round(l * 100)];
+}
+function hslToHex(h, sat, l) {
+  sat /= 100; l /= 100;
+  const k = (n) => (n + h / 30) % 12, a = sat * Math.min(l, 1 - l);
+  const f = (n) => Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))));
+  return "#" + [f(0), f(8), f(4)].map((v) => v.toString(16).padStart(2, "0")).join("");
+}
+function colorPicker(input) {
+  let value = /^#[0-9a-f]{6}$/i.test(input.value) ? input.value.toLowerCase() : "#5b8cff";
+  const ov = el("div", { class: "m-sheet-ov" });
+  const box = el("div", { class: "m-sheet m-color" });
+  const title = input.closest("label")?.querySelector("span")?.textContent?.trim() || "Цвет";
+  const preview = el("div", { class: "m-color-preview" });
+  const hex = el("input", { class: "m-color-hex", maxlength: "7", spellcheck: "false", autocomplete: "off" });
+  const sliders = ["Оттенок", "Насыщенность", "Яркость"].map((name, i) => {
+    const r = el("input", { type: "range", min: "0", max: i ? "100" : "360" });
+    return { r, row: el("label", { class: "m-color-row" }, el("span", { text: name }), r) };
+  });
+  const grid = el("div", { class: "m-color-grid" });
+  const show = (v, from) => {
+    value = v;
+    preview.style.background = v;
+    if (from !== "hex") hex.value = v;
+    if (from !== "hsl") hexToHsl(v).forEach((n, i) => { sliders[i].r.value = String(n); });
+    sliders[0].row.style.setProperty("--m-hue", sliders[0].r.value);
+  };
+  for (const c of PALETTE) {
+    const b = el("button", { class: "m-swatch", title: c, "aria-label": c });
+    b.style.background = c;
+    b.onclick = () => show(c);
+    grid.append(b);
+  }
+  sliders.forEach(({ r }) => { r.oninput = () => show(hslToHex(...sliders.map((x) => Number(x.r.value))), "hsl"); });
+  hex.oninput = () => { const v = hex.value.trim(); if (/^#[0-9a-f]{6}$/i.test(v)) show(v.toLowerCase(), "hex"); };
+  const close = () => ov.remove();
+  const done = el("button", { class: "primary", text: "Готово", onclick: () => {
+    close();
+    if (input.value.toLowerCase() === value) return;
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  } });
+  box.append(
+    el("h4", { text: title }),
+    el("div", { class: "m-color-top" }, preview, hex),
+    grid,
+    ...sliders.map((x) => x.row),
+    el("div", { class: "row" }, el("button", { text: "Отмена", onclick: close }), done),
+  );
+  ov.onclick = (e) => { if (e.target === ov) close(); };
+  ov.append(box);
+  document.body.append(ov);
+  show(value);
+}
+function registerColorPicker() {
+  document.addEventListener("click", (e) => {
+    const input = e.target.closest?.('input[type="color"]');
+    if (!input || input.disabled) return;
+    e.preventDefault();
+    e.stopPropagation();
+    colorPicker(input);
+  }, true);
+}
+
+// ---------- голосовые как в Telegram ----------
+// Держишь микрофон — идёт запись, отпустил — ушло. Пока держишь: влево —
+// отмена, вверх — запись закрепляется (дальше «Отправить» или «Отмена»).
+function registerVoiceGesture() {
+  const btn = $("#btn-record-audio");
+  if (!btn) return;
+  const bar = el("div", { id: "m-rec", class: "hidden" });
+  const timer = el("b", { text: "0:00" });
+  const hint = el("span", { class: "m-rec-hint", text: "‹ влево — отмена" });
+  const cancelBtn = el("button", { class: "m-rec-cancel", text: "Отмена" });
+  const sendBtn = el("button", { class: "m-rec-send primary", text: "Отправить" });
+  const lock = el("div", { id: "m-rec-lock", class: "hidden" }, ic("lock"), el("span", { text: "▲" }));
+  bar.append(el("i", { class: "m-rec-dot" }), timer, hint, cancelBtn, sendBtn);
+  $("#composer").append(bar, lock);
+  // клик после касания app.js не должен принять за «начать / остановить»
+  $("#composer").addEventListener("click", (e) => {
+    if (e.target.closest("#btn-record-audio")) { e.stopPropagation(); e.preventDefault(); }
+  }, true);
+  btn.addEventListener("contextmenu", (e) => e.preventDefault());
+  let st = null; // { x, y, t0, locked, cancelled, timerId, pointerId }
+  const fmt = (ms) => { const sec = Math.floor(ms / 1000); return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`; };
+  const ui = (on) => {
+    bar.classList.toggle("hidden", !on);
+    lock.classList.toggle("hidden", !on || !!st?.locked);
+    $("#composer").classList.toggle("m-recording", on);
+    bar.classList.toggle("locked", !!st?.locked);
+  };
+  const finish = async (send) => {
+    const s = st; st = null;
+    if (!s) return;
+    clearInterval(s.timerId);
+    ui(false);
+    if (!send || Date.now() - s.t0 < 600) {
+      app?.voiceStop(true);
+      if (send) note("Удерживай кнопку, чтобы записать голосовое");
+      return;
+    }
+    if (!app?.voiceRecording()) { app?.voiceStop(true); return; }
+    const pending = $("#pending-audio");
+    app.voiceStop(false);
+    // запись сохраняется (app.js) и встаёт в «к отправке» — сразу отправить
+    for (let i = 0; i < 60; i++) {
+      if (pending && !pending.classList.contains("hidden")) { $("#btn-send").click(); return; }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    note("Голосовое не успело сохраниться — оно ждёт над полем ввода");
+  };
+  btn.addEventListener("pointerdown", (e) => {
+    if (st || !app) return;
+    e.preventDefault();
+    try { btn.setPointerCapture(e.pointerId); } catch {}
+    st = { x: e.clientX, y: e.clientY, t0: Date.now(), locked: false, pointerId: e.pointerId };
+    app.voiceStart();
+    timer.textContent = "0:00";
+    st.timerId = setInterval(() => { if (st) timer.textContent = fmt(Date.now() - st.t0); }, 250);
+    ui(true);
+  });
+  btn.addEventListener("pointermove", (e) => {
+    if (!st || st.locked || e.pointerId !== st.pointerId) return;
+    const dx = e.clientX - st.x, dy = e.clientY - st.y;
+    if (dx < -90) { finish(false); return; }
+    if (dy < -70) { st.locked = true; ui(true); }
+  });
+  const up = (e) => { if (st && !st.locked && e.pointerId === st.pointerId) finish(true); };
+  btn.addEventListener("pointerup", up);
+  btn.addEventListener("pointercancel", (e) => { if (st && !st.locked) finish(false); });
+  cancelBtn.onclick = () => finish(false);
+  sendBtn.onclick = () => finish(true);
+}
+
 // ---------- запуск ----------
 async function start() {
   const vp = document.querySelector('meta[name="viewport"]');
@@ -545,6 +700,7 @@ async function start() {
   buildSettings();
   watchList();
   watchTheme();
+  registerColorPicker();
   const st = await serverStatus();
   if (!loggedIn(st)) buildLogin();
   root.classList.add("m-ready");
@@ -553,6 +709,7 @@ async function start() {
     app = (await import("./app.js")).mobileApi || null;
   } catch (e) { console.error("SafeDrop mobile: app.js", e); }
   followSelection();
+  registerVoiceGesture();
   decorate();
   refreshPreviews();
   if (loggedIn(st)) askNotifications();
