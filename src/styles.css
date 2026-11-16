@@ -813,4 +813,7 @@ details.set-sec > .card:first-of-type { border-top: 0; }
 .pair-box { margin: 8px 0; padding: 10px 12px; border-radius: 10px; background: rgba(255,255,255,.05); }
 .pair-code { font: 600 28px/1.3 ui-monospace, Consolas, monospace; letter-spacing: 3px; color: var(--text); margin: 6px 0; user-select: all; }
 .pair-code:empty { display: none; }
+.pair-qr { display: flex; justify-content: center; margin: 8px 0; }
+.pair-qr:empty { display: none; }
+.pair-qr canvas { display: block; max-width: 100%; height: auto; background: #fff; border-radius: 6px; image-rendering: pixelated; }
 .brand-ver.srv { background: linear-gradient(135deg,#23a559,#1a7f8f); }

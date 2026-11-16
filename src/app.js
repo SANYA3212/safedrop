@@ -3418,6 +3418,40 @@ function setPairQr(text) {
   box.replaceChildren();
   box.dispatchEvent(new CustomEvent("pair-qr", { detail: text }));
 }
+// Рисует QR: уровень M, байты UTF-8, чёрное на белом (и в тёмной теме), белая
+// рамка 4 модуля, около 220 px. В тексте пароль сервера — никуда его не сохранять
+// и не писать в лог. Пустой текст — QR убран (.pair-qr:empty скрывает блок).
+let qrLib = null;
+async function renderPairQr(box, text) {
+  if (!text) { box.replaceChildren(); return; }
+  try {
+    qrLib ||= import("./vendor/qrcode.mjs").then(({ qrcode }) => {
+      qrcode.stringToBytes = (s) => Array.from(new TextEncoder().encode(s));
+      return qrcode;
+    });
+    const qrcode = await qrLib;
+    if (box.dataset.text !== text) return; // пока грузилось, QR сменился или убран
+    const qr = qrcode(0, "M");
+    qr.addData(text, "Byte");
+    qr.make();
+    const n = qr.getModuleCount(), quiet = 4, total = n + quiet * 2;
+    const dpr = window.devicePixelRatio || 1;
+    const px = Math.max(1, Math.round(220 * dpr / total));
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = total * px;
+    cv.style.width = `${total * px / dpr}px`; // высота — по пропорции (CSS), в узкой панели QR ужимается
+    cv.setAttribute("role", "img");
+    cv.setAttribute("aria-label", "QR-код для входа телефона");
+    const g = cv.getContext("2d");
+    g.fillStyle = "#fff"; g.fillRect(0, 0, cv.width, cv.height);
+    g.fillStyle = "#000";
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+      if (qr.isDark(r, c)) g.fillRect((c + quiet) * px, (r + quiet) * px, px, px);
+    }
+    box.replaceChildren(cv);
+  } catch { qrLib = null; box.replaceChildren(); }
+}
+$("#pair-qr")?.addEventListener("pair-qr", (e) => renderPairQr(e.currentTarget, e.detail || ""));
 function pairStop(msg) {
   if (pairTimer) { clearInterval(pairTimer); pairTimer = null; }
   pairEnds = 0;
