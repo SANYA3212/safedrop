@@ -507,6 +507,33 @@ function followSelection() {
   new MutationObserver(check).observe($("#conv-name"), { childList: true, characterData: true, subtree: true });
 }
 
+// ---------- цвета пузырей из темы ----------
+// На компьютере «Цвет своих / чужих сообщений» по умолчанию прозрачный (строки
+// как в Discord). У пузырей свой цвет по умолчанию, а заданный в теме — главнее.
+function alphaOf(color) {
+  const probe = el("i");
+  probe.style.backgroundColor = color;
+  if (!probe.style.backgroundColor) return 0; // не цвет
+  document.body.append(probe);
+  const c = getComputedStyle(probe).backgroundColor;
+  probe.remove();
+  const m = c.match(/rgba\([^)]*,\s*([\d.]+)\s*\)/);
+  return m ? parseFloat(m[1]) : 1;
+}
+function syncBubbleColors() {
+  const cs = getComputedStyle(root);
+  for (const [from, to] of [["--message-own", "--m-own"], ["--message-peer", "--m-peer"]]) {
+    const v = cs.getPropertyValue(from).trim();
+    if (v && alphaOf(v) > 0) { if (root.style.getPropertyValue(to) !== v) root.style.setProperty(to, v); }
+    else if (root.style.getPropertyValue(to)) root.style.removeProperty(to);
+  }
+}
+function watchTheme() {
+  syncBubbleColors();
+  // applyTheme (app.js) пишет переменные темы в style у <html>
+  new MutationObserver(syncBubbleColors).observe(root, { attributes: true, attributeFilter: ["style"] });
+}
+
 // ---------- запуск ----------
 async function start() {
   const vp = document.querySelector('meta[name="viewport"]');
@@ -517,6 +544,7 @@ async function start() {
   buildChat();
   buildSettings();
   watchList();
+  watchTheme();
   const st = await serverStatus();
   if (!loggedIn(st)) buildLogin();
   root.classList.add("m-ready");

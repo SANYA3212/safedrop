@@ -7,8 +7,9 @@
 html.mobile {
   --m-bar: 56px;
   --m-bg: var(--panel2, #0d1020);
-  --m-own: color-mix(in srgb, var(--accent) 34%, #1a2036);
-  --m-peer: rgba(255, 255, 255, .07);
+  /* пузыри по умолчанию; свои цвета из темы («Сообщения в чате») ставит mobile.js */
+  --m-own-def: color-mix(in srgb, var(--accent) 34%, #1a2036);
+  --m-peer-def: rgba(255, 255, 255, .08);
   -webkit-tap-highlight-color: transparent;
 }
 html.mobile:not(.m-ready) #app { visibility: hidden; }
@@ -17,13 +18,15 @@ html.mobile #bg { inset: 0; }
 html.mobile #app { padding: 0; gap: 0; height: 100%; }
 html.mobile #topbar, html.mobile #demo-banner { display: none; }
 html.mobile #layout { display: block; position: relative; flex: 1; min-height: 0; }
-/* экраны — слоями друг над другом; фон непрозрачный (панели темы полупрозрачные) */
+/* экраны — слоями друг над другом. Панели полупрозрачные, как на компьютере
+   («Плотность» в теме), чтобы был виден фон окна; экран под открытым прячется */
 html.mobile :is(#contacts, #dialog, #details) {
   position: absolute; inset: 0; border: 0; border-radius: 0;
-  backdrop-filter: none; background: linear-gradient(var(--m-bg), var(--m-bg)), var(--bg, #141824);
+  background: var(--panel-in, var(--panel));
 }
 html.mobile #contacts { z-index: 1; }
-html.mobile body:is(.m-chat, .m-settings) #contacts { visibility: hidden; }
+html.mobile body:is(.m-chat, .m-settings) #contacts,
+html.mobile body:is(.m-profile, .m-settings) #dialog { visibility: hidden; }
 html.mobile #dialog { display: none; z-index: 2; }
 html.mobile body.m-chat #dialog { display: flex; animation: m-in .16s ease-out; }
 html.mobile #details { display: none !important; z-index: 3; padding: 0 0 24px; gap: 0; }
@@ -106,7 +109,9 @@ html.mobile #conv-ava { width: 40px; height: 40px; }
 html.mobile #conv-ava > * { font-size: 17px; }
 html.mobile .conv-meta { cursor: pointer; }
 html.mobile .conv-meta b { display: block; font-size: 16.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-html.mobile .conv-meta span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+html.mobile .conv-meta > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+html.mobile #conv-sub span { display: inline; }
+html.mobile #conv-sub .ic { width: 14px; height: 14px; }
 html.mobile .conv-actions { gap: 0; align-items: center; }
 html.mobile .conv-actions > .pill-btn:not(#btn-call):not(#btn-hangup) { display: none; }
 html.mobile #btn-call {
@@ -120,18 +125,23 @@ html.mobile body.m-screens #seg { display: flex; margin: 8px 12px 0; }
 html.mobile #messages { padding: 8px 10px; gap: 2px; }
 html.mobile .msgrow {
   max-width: 86%; align-self: flex-start; gap: 0; padding: 6px 10px 7px; margin: 2px 0;
-  background: var(--m-peer); border-radius: 16px 16px 16px 5px;
+  background: var(--m-peer, var(--m-peer-def)); border-radius: 16px 16px 16px 5px;
 }
-html.mobile .msgrow.me { align-self: flex-end; background: var(--m-own); border-radius: 16px 16px 5px 16px; }
-html.mobile .msgrow:hover { background: var(--m-peer); }
-html.mobile .msgrow.me:hover { background: var(--m-own); }
+html.mobile .msgrow.me { align-self: flex-end; background: var(--m-own, var(--m-own-def)); border-radius: 16px 16px 5px 16px; }
+html.mobile .msgrow:hover { background: var(--m-peer, var(--m-peer-def)); }
+html.mobile .msgrow.me:hover { background: var(--m-own, var(--m-own-def)); }
+html.mobile .msgrow p:empty { display: none; }
+/* картинка без подписи — как в Telegram: без пузыря и рамки, время над ней */
+html.mobile .msgrow:has(.chat-imgs):has(p[data-raw=""]) { background: transparent; padding: 0; }
+html.mobile .msgrow:has(.chat-imgs):has(p[data-raw=""]) .mhead { padding: 0 4px 3px; }
+html.mobile .msgrow .chat-imgs { margin-top: 4px; gap: 4px; }
+html.mobile .msgrow .chat-img { border: 0; border-radius: 14px; max-width: 100%; max-height: 360px; margin-top: 0; }
 html.mobile .msgrow > .ava, html.mobile .msgrow .mdel { display: none; }
 html.mobile .msgrow .mhead { font-size: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 0 6px; }
 html.mobile .msgrow .mhead b { margin: 0; font-size: 13.5px; }
 html.mobile .msgrow.me .mhead b, html.mobile body.m-direct .msgrow .mhead b { display: none; }
 html.mobile .msgrow.me .mhead { justify-content: flex-end; }
 html.mobile .msgrow p { font-size: 15.5px; line-height: 1.38; }
-html.mobile .msgrow .chat-img { max-width: 100%; height: auto; }
 html.mobile #composer { padding: 6px 6px; gap: 4px; align-items: center; border-top: 1px solid var(--line); background: var(--m-bg); }
 html.mobile #composer input { border-radius: 22px; padding: 11px 16px; font-size: 16px; min-width: 0; }
 html.mobile #composer button { min-width: 44px; height: 44px; border: 0; border-radius: 50%; background: transparent; padding: 0; }
