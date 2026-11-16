@@ -1109,8 +1109,10 @@ function createAudioPlayer(path, { src = tauriFile(path), voice = /^safedrop-voi
   audio.setAttribute("aria-label", label);
   let decodedDuration = 0, waveAttempted = false, disposed = false, probingEnd = false;
   function duration() {
-    if (Number.isFinite(audio.duration) && audio.duration > 0) return audio.duration;
+    // расшифрованный звук — точная длительность; заголовок WebM из MediaRecorder
+    // её не содержит, и Android тогда угадывает с запасом (полоса ползла, потом прыгала)
     if (decodedDuration) return decodedDuration;
+    if (Number.isFinite(audio.duration) && audio.duration > 0) return audio.duration;
     // Some MediaRecorder WebMs have no duration in their header; use the seekable end.
     const end = audio.seekable.length ? audio.seekable.end(audio.seekable.length - 1) : 0;
     return Number.isFinite(end) && end > 0 ? end : 0;
@@ -2016,6 +2018,52 @@ function renderPendingAudio() {
   host.appendChild(row);
 }
 
+// WebM из MediaRecorder без длительности в заголовке (Segment → Info → Duration):
+// плееры её угадывают. Вписываем настоящую — так её видят и ПК, и телефон.
+function webmWithDuration(buf, ms) {
+  const b = new Uint8Array(buf);
+  const vint = (p, keepMarker) => {
+    const first = b[p]; if (first === undefined) return null;
+    let len = 1, mask = 0x80;
+    while (len <= 8 && !(first & mask)) { len++; mask >>= 1; }
+    if (len > 8) return null;
+    let value = keepMarker ? first : first & (mask - 1), unknown = (first & (mask - 1)) === mask - 1;
+    for (let i = 1; i < len; i++) { value = value * 256 + b[p + i]; if (b[p + i] !== 0xff) unknown = false; }
+    return { len, value, unknown };
+  };
+  const elem = (p) => {
+    const id = vint(p, true); if (!id) return null;
+    const size = vint(p + id.len, false); if (!size) return null;
+    return { id: id.value, start: p, data: p + id.len + size.len, size: size.value, unknown: size.unknown };
+  };
+  try {
+    const head = elem(0); if (!head || head.id !== 0x1A45DFA3) return buf;
+    const seg = elem(head.data + head.size); if (!seg || seg.id !== 0x18538067) return buf;
+    for (let p = seg.data; p < b.length;) {
+      const e = elem(p); if (!e || e.unknown || e.id === 0x1F43B675) return buf; // кластер — дальше Info не будет
+      if (e.id === 0x1549A966) {
+        let scale = 1e6, hasDuration = false;
+        for (let q = e.data; q < e.data + e.size;) {
+          const c = elem(q); if (!c) return buf;
+          if (c.id === 0x2AD7B1) { scale = 0; for (let i = 0; i < c.size; i++) scale = scale * 256 + b[c.data + i]; }
+          if (c.id === 0x4489) hasDuration = true;
+          q = c.data + c.size;
+        }
+        if (hasDuration || !scale) return buf;
+        const dur = new Uint8Array(11); dur.set([0x44, 0x89, 0x88]);
+        new DataView(dur.buffer).setFloat64(3, ms * 1e6 / scale);
+        const size = e.size + dur.length;
+        const sizeVint = new Uint8Array(8); sizeVint[0] = 0x01;
+        for (let i = 7, v = size; i > 0; i--, v = Math.floor(v / 256)) sizeVint[i] = v % 256;
+        const idLen = vint(e.start, true).len;
+        return new Blob([b.subarray(0, e.start), b.subarray(e.start, e.start + idLen), sizeVint,
+          b.subarray(e.data, e.data + e.size), dur, b.subarray(e.data + e.size)]);
+      }
+      p = e.data + e.size;
+    }
+  } catch {}
+  return buf;
+}
 const VOICE_ICON_MIC = "<svg class='ic' viewBox='0 0 24 24'><path d='M12,2a3,3,0,0,0-3,3v6a3,3,0,0,0,6,0V5A3,3,0,0,0,12,2Z'/><path d='M19,10v1a7,7,0,0,1-14,0V10H3v1a9,9,0,0,0,8,8.94V22h2V19.94A9,9,0,0,0,21,11V10Z'/></svg>";
 const VOICE_ICON_STOP = "<svg class='ic' viewBox='0 0 24 24'><rect x='6' y='6' width='12' height='12' rx='2'/></svg>";
 // Остановить запись: при закрытии окна — сохранить как неотправленную,
@@ -2046,13 +2094,20 @@ function initVoiceRecorder() {
     let stream = null;
     try {
       // выбранный в настройках микрофон; устаревший id (WebKit) — любой
+      // Android: шумо- и эхоподавление движка рвут речь в голосовых — записываем
+      // чисто, громкость выравнивает только автоусиление
+      const phone = document.documentElement.classList.contains("mobile");
+      const clean = phone ? { echoCancellation: false, noiseSuppression: false, autoGainControl: true, channelCount: 1 } : {};
       stream = await gumFallback([
-        ...(settings?.mic_id ? [{ audio: { deviceId: { exact: settings.mic_id } } }] : []),
+        ...(settings?.mic_id ? [{ audio: { ...clean, deviceId: { exact: settings.mic_id } } }] : []),
+        ...(phone ? [{ audio: clean }] : []),
         { audio: true },
       ]);
       if (voiceCancelStart) { stream.getTracks().forEach((track) => track.stop()); return; }
       // поток, куски и таймер — у каждой записи свои: старая запись не мешает новой
-      const rec = new MediaRecorder(stream, { mimeType: mime });
+      const rec = new MediaRecorder(stream, { mimeType: mime, ...(phone ? { audioBitsPerSecond: 64000 } : {}) });
+      let startedAt = 0;
+      rec.onstart = () => { startedAt = performance.now(); };
       const seq = ++voiceSaveSeq;
       const chunks = [];
       const own = stream;
@@ -2063,8 +2118,12 @@ function initVoiceRecorder() {
         own.getTracks().forEach((track) => track.stop());
         if (voiceRecorder === rec) voiceRecorder = null;
         button.innerHTML = VOICE_ICON_MIC; button.classList.remove("rec");
-        const blob = new Blob(chunks, { type: mime });
+        let blob = new Blob(chunks, { type: mime });
         if (rec.discard || !blob.size) return;
+        if (mime.includes("webm") && startedAt) {
+          const fixed = webmWithDuration(await blob.arrayBuffer(), performance.now() - startedAt);
+          if (fixed instanceof Blob) blob = new Blob([fixed], { type: mime });
+        }
         const url = URL.createObjectURL(blob);
         try {
           const data = await new Promise((resolve, reject) => {

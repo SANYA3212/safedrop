@@ -689,6 +689,39 @@ function registerVoiceGesture() {
   sendBtn.onclick = () => finish(true);
 }
 
+// ---------- камера: фронтальная ↔ основная ----------
+// Переключение уже есть в app.js (выбор камеры в настройках → switchCamera,
+// без разрыва звонка): кнопка выбирает другую камеру в том же списке.
+const facing = (d) => /back|rear|environment|задн/i.test(d.label) ? "back" : /front|user|фронт/i.test(d.label) ? "front" : "";
+async function flipCamera() {
+  const cs = $("#cam-select");
+  let cams = [];
+  try { cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput" && d.deviceId); } catch {}
+  if (cams.length < 2) { note("Другой камеры нет (или нет доступа к камере — включи её в звонке)"); return; }
+  const cur = cams.find((d) => d.deviceId === cs?.value) || cams[0];
+  const want = facing(cur) === "back" ? "front" : "back";
+  const next = cams.find((d) => d !== cur && facing(d) === want) || cams[(cams.indexOf(cur) + 1) % cams.length];
+  if (!cs) return;
+  if (![...cs.options].some((o) => o.value === next.deviceId)) cs.append(el("option", { value: next.deviceId, text: next.label || "Камера" }));
+  cs.value = next.deviceId;
+  cs.dispatchEvent(new Event("change")); // app.js: сохранить и переключить в звонке
+  note(facing(next) === "back" ? "Основная камера" : facing(next) === "front" ? "Фронтальная камера" : "Камера переключена", 1800);
+}
+function registerCameraFlip() {
+  const cs = $("#cs-cam");
+  if (cs) {
+    const b = el("button", { id: "m-cs-flip", class: "cs-btn", title: "Перевернуть камеру", "aria-label": "Перевернуть камеру" }, ic("flip"));
+    b.onclick = flipCamera;
+    cs.after(b);
+  }
+  const vb = $("#vb-cam");
+  if (vb) {
+    const b = el("button", { id: "m-vb-flip", title: "Перевернуть камеру", "aria-label": "Перевернуть камеру" }, ic("flip"));
+    b.onclick = flipCamera;
+    vb.after(b);
+  }
+}
+
 // ---------- запуск ----------
 async function start() {
   const vp = document.querySelector('meta[name="viewport"]');
@@ -710,6 +743,7 @@ async function start() {
   } catch (e) { console.error("SafeDrop mobile: app.js", e); }
   followSelection();
   registerVoiceGesture();
+  registerCameraFlip();
   decorate();
   refreshPreviews();
   if (loggedIn(st)) askNotifications();

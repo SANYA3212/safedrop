@@ -281,3 +281,10 @@ html.mobile #btn-send { order: 6; }
 html.mobile #composer:has(#chat-input:placeholder-shown) #btn-send { display: none; }
 html.mobile body:is(:has(#pending-attachments:not(.hidden)), :has(#pending-audio:not(.hidden))) #composer #btn-send { display: grid; place-items: center; }
 html.mobile #composer:not(:has(#chat-input:placeholder-shown)) #btn-record-audio { display: none; }
+
+/* голосовые и аудио в пузыре — без своей рамки и подложки, как в Telegram */
+html.mobile .msgrow .audio-player { border: 0; background: transparent; padding: 2px 0; margin: 2px 0; width: 300px; }
+html.mobile .msgrow .audio-player .audio-play { border: 0; background: var(--accent); color: #fff; }
+html.mobile .msgrow .audio-player .audio-speed { border: 0; }
+/* перевернуть камеру */
+html.mobile #m-cs-flip .m-ic { width: 22px; height: 22px; }
