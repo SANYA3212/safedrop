@@ -851,6 +851,12 @@ export const mobileApi = {
   voiceStop: (discard) => stopVoiceRecording(discard),
   voiceRecording: () => voiceRecorder?.state === "recording",
   voiceStarting: () => voiceStarting,
+  // перевернуть камеру: в звонке — сразу, иначе — следующее включение
+  flipCamera: async () => {
+    camFacing = camFacing === "environment" ? "user" : "environment";
+    if (Object.values(myShares).some((s) => s.kind === "camera")) await switchCamera("");
+    return camFacing;
+  },
 };
 let editingGroup = null;
 function openGroupModal(g) {
@@ -2531,6 +2537,7 @@ function fillCameraSelect(devs) {
     else settings.camera_id = cs.value;
   }
   cs.onchange = async () => {
+    camFacing = ""; // выбрана конкретная камера — сторона (телефон) больше не главная
     settings.camera_id = cs.value;
     await invoke("save_settings", { settings }).catch(() => {});
     await switchCamera(cs.value);
@@ -2554,9 +2561,18 @@ function stopCameraPreview() {
   const v = $("#cam-preview");
   if (v) v.srcObject = null;
 }
+// Телефон: какая камера — фронтальная (user) или основная (environment).
+// Её выбирают по стороне, а не по id: так надёжнее на Android (mobile.js).
+let camFacing = "";
 async function cameraStream(width = 1280, height = 720, fps = 30, deviceId = "") {
   const base = { width: { max: width }, height: { max: height }, frameRate: { max: fps } };
   const soft = { width: { ideal: width }, height: { ideal: height }, frameRate: { ideal: fps } };
+  if (camFacing && !deviceId) {
+    return gumFallback([
+      { video: { ...soft, facingMode: { exact: camFacing } }, audio: false },
+      { video: { facingMode: camFacing }, audio: false },
+    ]);
+  }
   const id = deviceId || settings?.camera_id;
   return gumFallback([
     ...(id ? [{ video: { ...base, deviceId: { exact: id } }, audio: false }, { video: { ...soft, deviceId: { ideal: id } }, audio: false }] : []),
@@ -2594,12 +2610,23 @@ async function switchCamera(deviceId) {
   const entry = Object.entries(myShares).find(([, s]) => s.kind === "camera");
   if (!entry) return;
   const [shareId, share] = entry;
+  const old = share.stream.getVideoTracks()[0];
+  // Телефон не открывает две камеры сразу: новая не открывалась, и запасной
+  // вариант молча брал камеру по умолчанию (фронтальную). Сначала отпускаем
+  // текущую (stop() не шлёт «ended», показ не закрывается)
+  const phone = document.documentElement.classList.contains("mobile");
+  if (phone && old) old.stop();
   let next;
   try { next = await cameraStream(1280, 720, 30, deviceId); }
-  catch (e) { toast("Не удалось переключить камеру: " + (e?.message || e), true); return; }
+  catch (e) {
+    toast("Не удалось переключить камеру: " + (e?.message || e), true);
+    if (!phone || !old) return;
+    // вернуть ту, что была, чтобы звонок не остался без видео
+    camFacing = camFacing === "environment" ? "user" : camFacing === "user" ? "environment" : "";
+    try { next = await cameraStream(1280, 720, 30, deviceId); } catch { return; }
+  }
   const track = next.getVideoTracks()[0];
   if (!track) { next.getTracks().forEach((t) => t.stop()); return; }
-  const old = share.stream.getVideoTracks()[0];
   for (const pc of Object.values(share.pcs)) {
     for (const sender of pc.getSenders()) {
       if (sender.track?.kind === "video") {

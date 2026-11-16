@@ -276,10 +276,15 @@ async function stageFiles(files, keep = false) {
   }
   return paths;
 }
+// скрепка: «Фото или видео» (галерея) или «Файл» — что выбрали, то и спросить у системы
+let pickAccept = "";
 function registerPickers() {
   if (isDemo) return;
   const one = async (accept, keep) => (await stageFiles(await chooseFiles({ accept }), keep))[0] || null;
-  overrideInvoke("pick_files", async () => stageFiles(await chooseFiles({ multiple: true })));
+  overrideInvoke("pick_files", async () => {
+    const accept = pickAccept; pickAccept = "";
+    return stageFiles(await chooseFiles({ accept, multiple: true }));
+  });
   overrideInvoke("pick_image", () => one("image/*", false));
   overrideInvoke("pick_audio", () => one("audio/*", true));
   overrideInvoke("pick_bg_media", () => one("image/*,video/*", true));
@@ -622,6 +627,27 @@ function registerColorPicker() {
 // ---------- голосовые как в Telegram ----------
 // Держишь микрофон — идёт запись, отпустил — ушло. Пока держишь: влево —
 // отмена, вверх — запись закрепляется (дальше «Отправить» или «Отмена»).
+function registerAttachMenu() {
+  const attach = $("#btn-attach");
+  if (!attach) return;
+  $("#composer").addEventListener("click", (e) => {
+    if (!e.target.closest("#btn-attach")) return;
+    e.stopPropagation(); e.preventDefault();
+    sheet("Отправить", [
+      { icon: "image", text: "Фото или видео", run: () => { pickAccept = "image/*,video/*"; attach.onclick?.(); } },
+      { icon: "file", text: "Файл", run: () => { pickAccept = ""; attach.onclick?.(); } },
+    ]);
+  }, true);
+}
+
+// ---------- полоска звонка ----------
+// Нажатие на полоску (не на кнопки) — вернуться на экран звонка, как в Telegram
+function registerCallBar() {
+  const vb = $("#voice-bar");
+  if (!vb) return;
+  vb.addEventListener("click", (e) => { if (!e.target.closest("button")) $("#vb-open")?.click(); });
+}
+
 function registerVoiceGesture() {
   const btn = $("#btn-record-audio");
   if (!btn) return;
@@ -690,22 +716,14 @@ function registerVoiceGesture() {
 }
 
 // ---------- камера: фронтальная ↔ основная ----------
-// Переключение уже есть в app.js (выбор камеры в настройках → switchCamera,
-// без разрыва звонка): кнопка выбирает другую камеру в том же списке.
-const facing = (d) => /back|rear|environment|задн/i.test(d.label) ? "back" : /front|user|фронт/i.test(d.label) ? "front" : "";
+// Сторону переключает app.js (flipCamera): телефон сначала отпускает текущую
+// камеру — две сразу он не открывает — и просит нужную по facingMode.
 async function flipCamera() {
-  const cs = $("#cam-select");
-  let cams = [];
-  try { cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput" && d.deviceId); } catch {}
-  if (cams.length < 2) { note("Другой камеры нет (или нет доступа к камере — включи её в звонке)"); return; }
-  const cur = cams.find((d) => d.deviceId === cs?.value) || cams[0];
-  const want = facing(cur) === "back" ? "front" : "back";
-  const next = cams.find((d) => d !== cur && facing(d) === want) || cams[(cams.indexOf(cur) + 1) % cams.length];
-  if (!cs) return;
-  if (![...cs.options].some((o) => o.value === next.deviceId)) cs.append(el("option", { value: next.deviceId, text: next.label || "Камера" }));
-  cs.value = next.deviceId;
-  cs.dispatchEvent(new Event("change")); // app.js: сохранить и переключить в звонке
-  note(facing(next) === "back" ? "Основная камера" : facing(next) === "front" ? "Фронтальная камера" : "Камера переключена", 1800);
+  if (!app?.flipCamera) return;
+  try {
+    const side = await app.flipCamera();
+    note(side === "environment" ? "Основная камера" : "Фронтальная камера", 1800);
+  } catch (e) { note("Не удалось переключить камеру: " + (e?.message || e)); }
 }
 function registerCameraFlip() {
   const cs = $("#cs-cam");
@@ -744,6 +762,8 @@ async function start() {
   followSelection();
   registerVoiceGesture();
   registerCameraFlip();
+  registerAttachMenu();
+  registerCallBar();
   decorate();
   refreshPreviews();
   if (loggedIn(st)) askNotifications();
