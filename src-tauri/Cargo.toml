@@ -4,6 +4,12 @@ version = "0.3.40"
 description = "SafeDrop — P2P обмен файлами через Radmin VPN"
 edition = "2021"
 
+# Приложение — библиотека (lib.rs): Windows запускает её из main.rs,
+# Android подгружает как libsafedrop_lib.so
+[lib]
+name = "safedrop_lib"
+crate-type = ["cdylib", "rlib"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -16,20 +22,24 @@ uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
-open = "5"
 local-ip-address = "0.6"
 futures = "0.3"
 anyhow = "1"
-rfd = "0.15"
 base64 = "0.22"
 tauri-plugin-notification = "2"
-tauri-plugin-single-instance = "2"
 quinn = "0.11"
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-notify-rust = "4"
 minisign-verify = "0.2"
+
+# только компьютер: окна выбора файлов, второй запуск, уведомления системы,
+# обновления с GitHub. На Android этого нет (там свой интерфейс и APK)
+[target.'cfg(not(target_os = "android"))'.dependencies]
+open = "5"
+rfd = "0.15"
+tauri-plugin-single-instance = "2"
+notify-rust = "4"
 # проверка сертификата GitHub хранилищем Windows (обновления); уже есть в сборке через quinn
 rustls-platform-verifier = "0.7"
 
@@ -49,3 +59,8 @@ windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_UI_Shell_Prop
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
+
+[target.'cfg(target_os = "android")'.dependencies]
+# папки приложения и «Загрузки» берутся у Android (через JNI)
+jni = "0.21"
+ndk-context = "0.1"

@@ -1192,6 +1192,12 @@ pub fn notify_silent(title: &str, body: &str, icon: Option<String>) {
     notify_impl(title, body, icon);
 }
 
+#[cfg(target_os = "android")]
+fn notify_impl(title: &str, body: &str, _icon: Option<String>) {
+    crate::mobile::notify(title, body);
+}
+
+#[cfg(not(target_os = "android"))]
 fn notify_impl(title: &str, body: &str, icon: Option<String>) {
     let mut n = notify_rust::Notification::new();
     n.summary(title);

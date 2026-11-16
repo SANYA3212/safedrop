@@ -22,16 +22,22 @@ fn tls() -> Result<Arc<rustls::ClientConfig>, String> {
     if let Some(c) = CFG.get() {
         return Ok(c.clone());
     }
-    use rustls_platform_verifier::BuilderVerifierExt;
-    // сертификаты сайта проверяет хранилище Windows, как в браузере
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cfg = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_platform_verifier()
-        .map_err(|e| e.to_string())?
-        .with_no_client_auth();
-    Ok(CFG.get_or_init(|| Arc::new(cfg)).clone())
+    // Android: новая версия — новым APK, с GitHub ничего не ставится
+    #[cfg(target_os = "android")]
+    return Err("Обновления с GitHub — только в версии для компьютера".into());
+    #[cfg(not(target_os = "android"))]
+    {
+        use rustls_platform_verifier::BuilderVerifierExt;
+        // сертификаты сайта проверяет хранилище Windows, как в браузере
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+            .with_platform_verifier()
+            .map_err(|e| e.to_string())?
+            .with_no_client_auth();
+        Ok(CFG.get_or_init(|| Arc::new(cfg)).clone())
+    }
 }
 
 struct Resp {

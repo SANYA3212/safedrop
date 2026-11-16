@@ -23,7 +23,13 @@ export function tauriFile(path) {
   return "file:///" + String(path).replace(/\\/g, "/");
 }
 
+// Android: часть команд (выбор файлов) выполняет сам интерфейс — см. mobile.js
+const overrides = new Map();
+export function overrideInvoke(cmd, fn) { overrides.set(cmd, fn); }
+
 export async function invoke(cmd, args = {}) {
+  const own = overrides.get(cmd);
+  if (own) return own(args || {});
   if (E()) return E().invoke(cmd, args || {});
   if (T()?.core?.invoke) return T().core.invoke(cmd, args);
   if (TI()?.invoke) return TI().invoke(cmd, args || {});

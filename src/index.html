@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>SafeDrop</title>
 <link rel="stylesheet" href="styles.css" />
+<!-- Android: раскладка для телефона (mobile.css/mobile.js); на компьютере не включается -->
+<script>if (/Android/i.test(navigator.userAgent)) { document.documentElement.classList.add("mobile"); setTimeout(() => document.documentElement.classList.add("m-ready"), 15000); }</script>
+<link rel="stylesheet" href="mobile.css" />
 <style id="theme-tokens">:root {}</style>
 <style id="custom-css"></style>
 </head>
@@ -623,5 +626,6 @@
 <div id="toast"></div>
 <audio id="remote-audio" autoplay></audio>
 <script type="module" src="app.js"></script>
+<script type="module" src="mobile.js"></script>
 </body>
 </html>

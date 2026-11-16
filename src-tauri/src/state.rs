@@ -317,6 +317,10 @@ fn def_udp_port() -> u16 { 47833 }
 fn def_idle() -> String { "idle".into() }
 
 fn whoami_host() -> String {
+    // телефон: имени компьютера нет, остальные видят просто «Android»
+    if cfg!(target_os = "android") {
+        return "Android".into();
+    }
     if let Ok(n) = std::env::var("COMPUTERNAME") {
         if !n.trim().is_empty() { return n.trim().to_string(); }
     }
@@ -334,11 +338,17 @@ fn whoami_host() -> String {
 impl Default for Settings {
     fn default() -> Self {
         // проверочный экземпляр (SAFEDROP_DATA_DIR) не кладёт файлы в настоящий LoadDrop
-        let mut loaddrop = crate::settings::test_instance_dir()
-            .or_else(dirs::download_dir)
-            .or_else(dirs::home_dir)
-            .unwrap_or(PathBuf::from("."));
-        loaddrop.push("LoadDrop");
+        #[cfg(target_os = "android")]
+        let loaddrop = crate::mobile::loaddrop_dir();
+        #[cfg(not(target_os = "android"))]
+        let loaddrop = {
+            let mut d = crate::settings::test_instance_dir()
+                .or_else(dirs::download_dir)
+                .or_else(dirs::home_dir)
+                .unwrap_or(PathBuf::from("."));
+            d.push("LoadDrop");
+            d
+        };
         Self {
             device_name: whoami_host(),
             loaddrop_dir: loaddrop.to_string_lossy().to_string(),

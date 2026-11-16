@@ -811,6 +811,7 @@ function renderGroups() {
     const busy = g.members.some((m) => { const st = peers.find((p) => p.ip === m)?.state || ""; return st && st !== "idle"; });
     const d = document.createElement("div");
     d.className = "contact" + (selGroup === g.id ? " active" : "");
+    d.dataset.gid = g.id;
     const groupTypingKey = `g:${g.id}`;
     const groupTypingText = typingPeers.has(groupTypingKey) && typingPeers.get(groupTypingKey)?.size ? typingLabel(groupTypingKey) : "";
     d.innerHTML = `${groupAva(g, "sm")}<div class="meta"><b><span class="nm">${esc(g.name)}</span>${groupTypingText ? `<span class="typing-badge" style="margin-left:6px;font-size:11px;color:#3ddc84;">${esc(groupTypingText)}</span>` : ""}</b><small><svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:2px"><circle cx="9" cy="8" r="3"/><path d="M14,11H4A2,2,0,0,0,2,13v5H6V15H4V13A1,1,0,0,1,5,12H13a1,1,0,0,1,1,1v2H12v3h4V13A2,2,0,0,0,14,11Z"/><circle cx="17" cy="9" r="2.5"/><path d="M20,11.5A1.5,1.5,0,0,0,18.5,10H15a3,3,0,0,1,2,2.82V18H15v3h4V14.82A3,3,0,0,1,20,13Z"/></svg> ${g.members.length} · <span style="color:#3ddc84">●</span> ${on}${busy ? ' · <svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M21,15v3.93a2,2,0,0,1-2.29,2A18,18,0,0,1,3.14,5.29,2,2,0,0,1,5.13,3H9a1,1,0,0,1,1,.89,10.74,10.74,0,0,0,1,3.78,1,1,0,0,1-.42,1.26l-.86.49a1,1,0,0,0-.33,1.46,14.08,14.08,0,0,0,3.69,3.69,1,1,0,0,0,1.46-.33l.49-.86A1,1,0,0,1,16.33,13a10.74,10.74,0,0,0,3.78,1A1,1,0,0,1,21,15Z"/></svg>' : ""}${unread[`g:${g.id}`] ? ` · <svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M20,2H4A2,2,0,0,0,2,4V22l4-4H20a2,2,0,0,0,2-2V4A2,2,0,0,0,20,2Z"/></svg>${unread[`g:${g.id}`]}` : ""}</small></div>`;
@@ -828,6 +829,24 @@ async function selectGroup(id) {
   try { chats[`g:${id}`] = await invoke("get_chat", { peerIp: `g:${id}` }); chats[`g:${id}`].forEach((m) => seenIds.add(m.id)); } catch { chats[`g:${id}`] = []; }
   renderChat();
 }
+// Android (mobile.js): «назад» из чата в список закрывает чат — новые сообщения
+// в нём снова считаются непрочитанными; список чатов спрашивает, что открыто.
+export function closeChat() {
+  if (!selectedIp && !selGroup) return;
+  resetChatWindow();
+  selectedIp = null; selGroup = null;
+  setReply(null);
+  hideChatSearch();
+  renderAll(); renderChat();
+}
+export const mobileApi = {
+  closeChat,
+  openKey: () => curKey() || "",
+  isGroupOpen: () => !!selGroup,
+  unreadOf: (key) => unread[key] || 0,
+  isOnline: (ip) => !!peers.find((p) => p.ip === ip)?.online,
+  toast: (text, bad = false) => toast(esc(text), bad),
+};
 let editingGroup = null;
 function openGroupModal(g) {
   editingGroup = g?.id || null;
@@ -2187,6 +2206,8 @@ async function refreshTransfers() {
   [...list].reverse().slice(0, 60).forEach((t) => {
     const d = document.createElement("div");
     d.className = "tcard";
+    // Android открывает полученный файл по нажатию на карточку (mobile.js)
+    d.dataset.dir = t.direction; d.dataset.status = t.status; d.dataset.file = t.filename;
     d.innerHTML = `<b>${t.direction === "up" ? '<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M21.66,12a2,2,0,0,1-1.14,1.81L5.87,20.75A2.08,2.08,0,0,1,5,21a2,2,0,0,1-1.82-2.82L5.46,13H11a1,1,0,0,0,0-2H5.46L3.18,5.87A2,2,0,0,1,5.86,3.25h0l14.65,6.94A2,2,0,0,1,21.66,12Z"/></svg>' : '<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M20,11H7.83l5.59-5.59L12,4l-8,8,8,8,1.41-1.41L7.83,13H20Z"/></svg>'} ${esc(t.filename)}</b><div class="muted">${esc(t.peer)} · ${fmtSize(t.done)} / ${fmtSize(t.size)} · ${fmtSpeed(t.speed_bps)} · ${esc(trStatus(t.status))}${t.status === "error" && t.error ? ` · <svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M13.41,12l4.29-4.29a1,1,0,0,0-1.41-1.41L12,10.59,7.71,6.29A1,1,0,0,0,6.29,7.71L10.59,12,6.29,16.29a1,1,0,0,0,1.41,1.41L12,13.41l4.29,4.29a1,1,0,0,0,1.41-1.41Z"/></svg> ${esc(t.error)}` : ""}</div><div class="bar"><div style="width:${Math.round(t.progress * 100)}%"></div></div>${t.status === "active" ? `<div class="row"><button data-cancel="${esc(t.id)}"><svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M6,6H18V18H6Z"/></svg> Отменить</button></div>` : ""}`;
     box.appendChild(d);
   });

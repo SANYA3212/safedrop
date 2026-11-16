@@ -12,6 +12,9 @@ pub fn app_dir() -> std::path::PathBuf {
     if let Some(dir) = test_instance_dir() {
         return dir;
     }
+    #[cfg(target_os = "android")]
+    return crate::mobile::data_dir();
+    #[cfg(not(target_os = "android"))]
     dirs::config_dir()
         .map(|p| p.join("safedrop"))
         .unwrap_or(std::path::PathBuf::from("./safedrop-data"))
@@ -213,8 +216,14 @@ pub fn persist_peers_now(state: &AppState) {
     }
 }
 
+/// Android: автозапуска нет (приложение запускает пользователь).
+#[cfg(target_os = "android")]
+pub fn apply_autostart(_enabled: bool) -> Result<(), String> {
+    Ok(())
+}
+
 /// Linux autostart: ~/.config/autostart/safedrop.desktop (XDG).
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "android")))]
 pub fn apply_autostart(enabled: bool) -> Result<(), String> {
     let dir = dirs::config_dir().ok_or("no config dir")?.join("autostart");
     let file = dir.join("safedrop.desktop");
@@ -250,7 +259,7 @@ pub fn apply_autostart(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "android")))]
 fn desktop_exec(exe: &std::path::Path) -> Result<String, String> {
     let exe = exe.to_str().ok_or("Путь для автозапуска должен быть в UTF-8")?;
     if exe.contains('=') || exe.chars().any(char::is_control) {

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Откуда SdAndroidPlugin.openFile может отдать файл другому приложению:
+     «Загрузки/SafeDrop» и папки самого приложения -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+  <external-path name="downloads" path="Download/" />
+  <external-files-path name="external" path="." />
+  <files-path name="files" path="." />
+</paths>
