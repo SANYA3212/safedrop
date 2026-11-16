@@ -244,8 +244,21 @@ fn tls_config(cert: Vec<u8>, key: Vec<u8>) -> Result<Arc<rustls::ServerConfig>, 
 
 // ---------- состояние ----------
 
+/// Сколько живёт код сопряжения.
+const PAIR_TTL: Duration = Duration::from_secs(300);
+const MAX_PAIRS: usize = 1024;
+/// Попыток ввести код с одного соединения за минуту.
+const PAIR_JOINS_PER_MIN: usize = 5;
+
+/// Одно подключённое устройство. У аккаунта (ID = ключ) их может быть
+/// несколько: ПК и телефон одного человека с одним ключом.
 struct Client {
     conn: u64,
+    dev: String,
+    form: String,
+    /// не показывать другим (телефон, который только входит по коду)
+    quiet: bool,
+    since: Instant,
     tx: mpsc::Sender<String>,
     kick: Arc<Notify>,
     name: String,
@@ -254,17 +267,41 @@ struct Client {
     rtt: u32,
 }
 
+/// Устройство, к которому идут каналы без `dev` (от старых версий): ПК
+/// раньше телефона, из равных — кто подключён дольше.
+fn primary(list: &[Client]) -> Option<&Client> {
+    list.iter()
+        .filter(|c| !c.quiet)
+        .min_by_key(|c| (c.form != FORM_DESKTOP, c.since))
+        .or_else(|| list.first())
+}
+
+/// Устройство аккаунта по `dev`: точное совпадение; пусто — основное.
+fn pick<'a>(list: &'a [Client], dev: &str) -> Option<&'a Client> {
+    list.iter().find(|c| c.dev == dev).or_else(|| if dev.is_empty() { primary(list) } else { None })
+}
+
 struct Pending {
     from: String,
+    /// соединение, которое открыло канал (ему — `Fail`)
+    from_conn: u64,
     at: Instant,
     /// первый подключившийся конец ждёт здесь второй
     waiter: Option<oneshot::Sender<TcpStream>>,
     joined: bool,
 }
 
+/// Устройство ждёт новое по коду (`PairWait`).
+struct PairSlot {
+    id: String,
+    conn: u64,
+    at: Instant,
+}
+
 struct Hub {
-    clients: Mutex<HashMap<String, Client>>,
+    clients: Mutex<HashMap<String, Vec<Client>>>,
     pending: Mutex<HashMap<String, Pending>>,
+    pairs: Mutex<HashMap<String, PairSlot>>,
     next_conn: AtomicU64,
     password: String,
     max_clients: usize,
@@ -287,6 +324,26 @@ fn same_secret(a: &str, b: &str) -> bool {
     x.iter().zip(y.iter()).fold(0u8, |acc, (p, q)| acc | (p ^ q)) == 0
 }
 
+fn dev_info(c: &Client) -> DevInfo {
+    DevInfo { dev: c.dev.clone(), form: c.form.clone(), ver: c.ver.clone() }
+}
+
+/// Список для одного устройства (`me` — его соединение): все аккаунты, у
+/// которых есть видимые устройства, и свой — если подключены другие свои.
+fn peers_for(g: &HashMap<String, Vec<Client>>, me: u64) -> Vec<PeerInfo> {
+    let mut out = Vec::new();
+    for (id, list) in g.iter() {
+        let devs: Vec<&Client> = list.iter().filter(|c| !c.quiet && c.conn != me).collect();
+        if devs.is_empty() {
+            continue;
+        }
+        // имя и версия — основного устройства (старые версии видят одну строку)
+        let main = primary(list).filter(|c| c.conn != me && !c.quiet).unwrap_or(devs[0]);
+        out.push(PeerInfo { id: id.clone(), name: main.name.clone(), ver: main.ver.clone(), devs: devs.into_iter().map(dev_info).collect() });
+    }
+    out
+}
+
 impl Hub {
     fn turn_info(&self) -> Option<TurnInfo> {
         let t = self.turn.as_ref()?;
@@ -296,32 +353,21 @@ impl Hub {
 
     async fn broadcast_peers(&self) {
         let g = self.clients.lock().await;
-        let all: Vec<PeerInfo> = g
-            .iter()
-            .map(|(id, c)| PeerInfo { id: id.clone(), name: c.name.clone(), ver: c.ver.clone() })
-            .collect();
-        for (id, c) in g.iter() {
-            let list: Vec<PeerInfo> = all.iter().filter(|p| p.id != *id).cloned().collect();
-            let _ = c.tx.try_send(line(&ToClient::Peers { list }));
+        for list in g.values() {
+            for c in list {
+                let _ = c.tx.try_send(line(&ToClient::Peers { list: peers_for(&g, c.conn) }));
+            }
         }
     }
 
-    async fn send_to(&self, id: &str, m: &ToClient) {
-        if let Some(c) = self.clients.lock().await.get(id) {
+    async fn send_to_conn(&self, id: &str, conn: u64, m: &ToClient) {
+        if let Some(c) = self.clients.lock().await.get(id).and_then(|l| l.iter().find(|c| c.conn == conn)) {
             let _ = c.tx.try_send(line(m));
         }
     }
 
-    /// Открыть канал from → to. Ошибка — текст для `Fail`.
-    async fn open(&self, from: &str, to: &str, port: &str, tok: &str) -> Result<(), String> {
-        if !valid_id(to) || !valid_port(port) || !valid_token(tok) {
-            return Err("неверный запрос".into());
-        }
-        if to == from {
-            return Err("это же устройство".into());
-        }
-        let target = self.clients.lock().await.get(to).map(|c| c.tx.clone());
-        let Some(target) = target else { return Err("не в сети".into()) };
+    /// Запомнить канал и позвать второй конец. Ошибка — текст для `Fail`.
+    async fn invite(&self, from: &str, from_conn: u64, target: mpsc::Sender<String>, msg: ToClient, tok: &str) -> Result<(), String> {
         {
             let mut p = self.pending.lock().await;
             if p.len() >= MAX_PENDING {
@@ -333,19 +379,79 @@ impl Hub {
             if p.contains_key(tok) {
                 return Err("токен занят".into());
             }
-            p.insert(tok.to_string(), Pending { from: from.into(), at: Instant::now(), waiter: None, joined: false });
+            p.insert(tok.to_string(), Pending { from: from.into(), from_conn, at: Instant::now(), waiter: None, joined: false });
         }
-        let msg = line(&ToClient::Incoming { from: from.into(), port: port.into(), tok: tok.into() });
-        if target.try_send(msg).is_err() {
+        if target.try_send(line(&msg)).is_err() {
             self.pending.lock().await.remove(tok);
             return Err("адресат не успевает".into());
         }
         Ok(())
     }
 
+    /// Открыть канал from → to (устройство `dev`). Ошибка — текст для `Fail`.
+    async fn open(&self, from: &str, from_conn: u64, from_dev: &str, to: &str, dev: &str, port: &str, tok: &str) -> Result<(), String> {
+        if !valid_id(to) || !valid_port(port) || !valid_token(tok) || !valid_dev(dev) {
+            return Err("неверный запрос".into());
+        }
+        let target = {
+            let g = self.clients.lock().await;
+            let list = g.get(to).map(|l| l.as_slice()).unwrap_or(&[]);
+            let c = if to == from {
+                // к своему другому устройству — только по его dev
+                if dev.is_empty() {
+                    return Err("это же устройство".into());
+                }
+                list.iter().find(|c| c.dev == dev && c.conn != from_conn && !c.quiet)
+            } else {
+                pick(list, dev).filter(|c| !c.quiet)
+            };
+            c.map(|c| c.tx.clone())
+        };
+        let Some(target) = target else { return Err("не в сети".into()) };
+        let msg = ToClient::Incoming { from: from.into(), port: port.into(), tok: tok.into(), dev: from_dev.into() };
+        self.invite(from, from_conn, target, msg, tok).await
+    }
+
+    /// Устройство показало код: ждать по его открытой части.
+    async fn pair_wait(&self, id: &str, conn: u64, slot: &str) -> Result<(), String> {
+        if !valid_slot(slot) {
+            return Err("неверный код".into());
+        }
+        let mut p = self.pairs.lock().await;
+        p.retain(|_, s| s.conn != conn && s.at.elapsed() < PAIR_TTL);
+        if p.contains_key(slot) {
+            return Err("этот код занят — попробуйте ещё раз".into());
+        }
+        if p.len() >= MAX_PAIRS {
+            return Err("сервер занят".into());
+        }
+        p.insert(slot.to_string(), PairSlot { id: id.into(), conn, at: Instant::now() });
+        Ok(())
+    }
+
+    /// Новое устройство ввело код: канал к тому, кто его ждёт. Код действует
+    /// на одну попытку (секретную часть проверяют сами устройства).
+    async fn pair_join(&self, from: &str, from_conn: u64, from_dev: &str, slot: &str, tok: &str) -> Result<(), String> {
+        if !valid_slot(slot) || !valid_token(tok) {
+            return Err("неверный запрос".into());
+        }
+        let owner = self.pairs.lock().await.remove(slot).filter(|s| s.at.elapsed() < PAIR_TTL);
+        let Some(owner) = owner else { return Err("код не найден или устарел — получите новый".into()) };
+        if owner.conn == from_conn {
+            return Err("это же устройство".into());
+        }
+        let target = self.clients.lock().await.get(&owner.id).and_then(|l| l.iter().find(|c| c.conn == owner.conn)).map(|c| c.tx.clone());
+        let Some(target) = target else { return Err("устройство с этим кодом уже не в сети".into()) };
+        let msg = ToClient::Incoming { from: from.into(), port: PORT_PAIR.into(), tok: tok.into(), dev: from_dev.into() };
+        self.invite(from, from_conn, target, msg, tok).await
+    }
+
     async fn sweep(&self) {
-        let mut p = self.pending.lock().await;
-        p.retain(|_, e| e.joined || e.at.elapsed() < PAIR_TIMEOUT + Duration::from_secs(10));
+        {
+            let mut p = self.pending.lock().await;
+            p.retain(|_, e| e.joined || e.at.elapsed() < PAIR_TIMEOUT + Duration::from_secs(10));
+        }
+        self.pairs.lock().await.retain(|_, s| s.at.elapsed() < PAIR_TTL);
     }
 }
 
@@ -405,7 +511,7 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
         Ok(Ok(l)) => serde_json::from_slice::<ToServer>(&l).ok(),
         _ => None,
     };
-    let Some(ToServer::Hello { pass, name, ver, .. }) = hello else { return };
+    let Some(ToServer::Hello { pass, name, ver, dev, form, quiet, .. }) = hello else { return };
     let deny = |msg: &str| line(&ToClient::Deny { msg: msg.into() });
     if !hub.password.is_empty() && !same_secret(&pass, &hub.password) {
         eprintln!("{addr}: {} — неверный пароль", short(&id));
@@ -415,25 +521,56 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
         let _ = w.shutdown().await;
         return;
     }
+    if !valid_dev(&dev) {
+        let _ = w.write_all(deny("неверный номер устройства").as_bytes()).await;
+        let _ = w.shutdown().await;
+        return;
+    }
+    let form = clean_form(&form);
     let (tx, mut rx) = mpsc::channel::<String>(512);
     let kick = Arc::new(Notify::new());
     let conn = hub.next_conn.fetch_add(1, Ordering::Relaxed);
     {
         let mut g = hub.clients.lock().await;
-        if g.len() >= hub.max_clients && !g.contains_key(&id) {
+        let total: usize = g.values().map(|l| l.len()).sum();
+        let same = g.get(&id).and_then(|l| l.iter().position(|c| c.dev == dev));
+        let count = g.get(&id).map(|l| l.len()).unwrap_or(0);
+        let refuse = if same.is_some() {
+            None
+        } else if total >= hub.max_clients {
+            Some("сервер переполнен")
+        } else if count >= MAX_DEVS {
+            Some("у этого аккаунта слишком много устройств в сети")
+        } else {
+            None
+        };
+        if let Some(msg) = refuse {
             drop(g);
-            let _ = w.write_all(deny("сервер переполнен").as_bytes()).await;
+            let _ = w.write_all(deny(msg).as_bytes()).await;
             let _ = w.shutdown().await;
             return;
         }
-        let client = Client { conn, tx: tx.clone(), kick: kick.clone(), name: clean_name(&name), ver: clean_name(&ver), rtt: 0 };
-        if let Some(old) = g.insert(id.clone(), client) {
+        let client = Client {
+            conn,
+            dev: dev.clone(),
+            form: form.clone(),
+            quiet,
+            since: Instant::now(),
+            tx: tx.clone(),
+            kick: kick.clone(),
+            name: clean_name(&name),
+            ver: clean_name(&ver),
+            rtt: 0,
+        };
+        let list = g.entry(id.clone()).or_default();
+        if let Some(i) = same {
             // то же устройство подключилось заново (сменилась сеть): старое закрыть
-            old.kick.notify_one();
+            list.remove(i).kick.notify_one();
         }
+        list.push(client);
     }
-    eprintln!("{addr}: + {} «{}» {}", short(&id), clean_name(&name), clean_name(&ver));
-    let welcome = ToClient::Welcome { id: id.clone(), server_ver: VERSION.into(), turn: hub.turn_info() };
+    eprintln!("{addr}: + {} «{}» {} {}{}", short(&id), clean_name(&name), clean_name(&ver), if form.is_empty() { "?" } else { &form }, if quiet { " (вход по коду)" } else { "" });
+    let welcome = ToClient::Welcome { id: id.clone(), server_ver: VERSION.into(), turn: hub.turn_info(), multi: true };
     let _ = tx.try_send(line(&welcome));
     hub.broadcast_peers().await;
 
@@ -457,6 +594,7 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
     // смена имени рассылает список всем: не чаще раза в пару секунд
     let mut name_at: Option<Instant> = None;
     let mut rtt_at: Option<Instant> = None;
+    let mut joins: Vec<Instant> = Vec::new();
     loop {
         let got = tokio::select! {
             r = tokio::time::timeout(Duration::from_secs(PING_SECS * 3), read_line_limited(&mut reader, MAX_CTL_LINE)) => r,
@@ -465,8 +603,32 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
         let Ok(Ok(l)) = got else { break };
         let Ok(msg) = serde_json::from_slice::<ToServer>(&l) else { continue };
         match msg {
-            ToServer::Open { to, port, tok } => {
-                if let Err(e) = hub.open(&id, &to, &port, &tok).await {
+            ToServer::Open { to, port, tok, dev: to_dev } => {
+                if let Err(e) = hub.open(&id, conn, &dev, &to, &to_dev, &port, &tok).await {
+                    let _ = tx.try_send(line(&ToClient::Fail { tok, msg: e }));
+                }
+            }
+            ToServer::PairWait { slot } => {
+                // ждать новое устройство может только настоящее (не входящее само)
+                let r = if quiet { Err("сначала войдите в аккаунт".to_string()) } else { hub.pair_wait(&id, conn, &slot).await };
+                if let Err(msg) = r {
+                    let _ = tx.try_send(line(&ToClient::PairFail { slot, msg }));
+                }
+            }
+            ToServer::PairCancel => {
+                hub.pairs.lock().await.retain(|_, s| s.conn != conn);
+            }
+            ToServer::PairJoin { slot, tok } => {
+                // открытая часть кода — 4 цифры: перебирать их нельзя
+                joins.retain(|t| t.elapsed() < Duration::from_secs(60));
+                let r = if joins.len() >= PAIR_JOINS_PER_MIN {
+                    Err("слишком много попыток — подождите минуту".to_string())
+                } else {
+                    joins.push(Instant::now());
+                    hub.pair_join(&id, conn, &dev, &slot, &tok).await
+                };
+                if let Err(e) = r {
+                    eprintln!("{addr}: {} — код не подошёл: {e}", short(&id));
                     let _ = tx.try_send(line(&ToClient::Fail { tok, msg: e }));
                 }
             }
@@ -477,8 +639,8 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
                 name_at = Some(Instant::now());
                 let changed = {
                     let mut g = hub.clients.lock().await;
-                    match g.get_mut(&id) {
-                        Some(c) if c.conn == conn && c.name != clean_name(&name) => {
+                    match g.get_mut(&id).and_then(|l| l.iter_mut().find(|c| c.conn == conn)) {
+                        Some(c) if c.name != clean_name(&name) => {
                             c.name = clean_name(&name);
                             true
                         }
@@ -506,12 +668,15 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
                 rtt_at = Some(Instant::now());
                 let list: Vec<PeerRtt> = {
                     let mut g = hub.clients.lock().await;
-                    if let Some(c) = g.get_mut(&id).filter(|c| c.conn == conn) {
+                    if let Some(c) = g.get_mut(&id).and_then(|l| l.iter_mut().find(|c| c.conn == conn)) {
                         c.rtt = ms.min(MAX_RTT_MS);
                     }
+                    // у аккаунта с несколькими устройствами — лучший пинг из них
                     g.iter()
-                        .filter(|(other, c)| **other != id && c.rtt > 0)
-                        .map(|(other, c)| PeerRtt { id: other.clone(), ms: c.rtt })
+                        .filter_map(|(other, l)| {
+                            let ms = l.iter().filter(|c| c.conn != conn && !c.quiet && c.rtt > 0).map(|c| c.rtt).min()?;
+                            Some(PeerRtt { id: other.clone(), ms })
+                        })
                         .collect()
                 };
                 let _ = tx.try_send(line(&ToClient::Rtts { list }));
@@ -521,14 +686,19 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
     }
     drop(tx);
     writer.abort();
+    hub.pairs.lock().await.retain(|_, s| s.conn != conn);
     let removed = {
         let mut g = hub.clients.lock().await;
-        if g.get(&id).map(|c| c.conn) == Some(conn) {
-            g.remove(&id);
-            true
-        } else {
-            false
+        let mut removed = false;
+        if let Some(l) = g.get_mut(&id) {
+            let before = l.len();
+            l.retain(|c| c.conn != conn);
+            removed = l.len() != before;
+            if l.is_empty() {
+                g.remove(&id);
+            }
         }
+        removed
     };
     if removed {
         eprintln!("{addr}: - {}", short(&id));
@@ -566,13 +736,13 @@ async fn data(hub: Arc<Hub>, mut sock: TcpStream) {
             let (tx, rx) = oneshot::channel();
             e.waiter = Some(tx);
             e.joined = true;
-            let from = e.from.clone();
+            let (from, from_conn) = (e.from.clone(), e.from_conn);
             drop(p);
             match tokio::time::timeout(PAIR_TIMEOUT, rx).await {
                 Ok(Ok(other)) => pump(sock, other).await,
                 _ => {
                     hub.pending.lock().await.remove(&tok);
-                    hub.send_to(&from, &ToClient::Fail { tok, msg: "собеседник не ответил".into() }).await;
+                    hub.send_to_conn(&from, from_conn, &ToClient::Fail { tok, msg: "собеседник не ответил".into() }).await;
                 }
             }
             return;
@@ -679,6 +849,7 @@ async fn main() {
     let hub = Arc::new(Hub {
         clients: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
+        pairs: Mutex::new(HashMap::new()),
         next_conn: AtomicU64::new(1),
         password: cfg.password.clone(),
         max_clients: cfg.max_clients,
@@ -721,5 +892,133 @@ async fn main() {
             let _permit = permit;
             handle_conn(hub, tls, sock, addr).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(conn: u64, dev: &str, form: &str, quiet: bool, age_s: u64) -> (Client, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(16);
+        let c = Client {
+            conn,
+            dev: dev.into(),
+            form: form.into(),
+            quiet,
+            since: Instant::now() - Duration::from_secs(age_s),
+            tx,
+            kick: Arc::new(Notify::new()),
+            name: format!("n{conn}"),
+            ver: "1".into(),
+            rtt: 0,
+        };
+        (c, rx)
+    }
+
+    fn hub() -> Hub {
+        Hub {
+            clients: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            pairs: Mutex::new(HashMap::new()),
+            next_conn: AtomicU64::new(100),
+            password: String::new(),
+            max_clients: 10,
+            turn: None,
+        }
+    }
+
+    #[test]
+    fn primary_prefers_desktop_then_oldest() {
+        let (a, _ra) = client(1, "aaaaaaaa", FORM_PHONE, false, 100);
+        let (b, _rb) = client(2, "bbbbbbbb", FORM_DESKTOP, false, 5);
+        let (c, _rc) = client(3, "cccccccc", FORM_DESKTOP, false, 50);
+        let list = vec![a, b, c];
+        assert_eq!(primary(&list).unwrap().conn, 3);
+        assert_eq!(pick(&list, "").unwrap().conn, 3);
+        assert_eq!(pick(&list, "aaaaaaaa").unwrap().conn, 1);
+        assert!(pick(&list, "dddddddd").is_none());
+        // старая версия (dev пусто) — точное совпадение важнее основного
+        let (d, _rd) = client(4, "", "", false, 1);
+        let list2 = vec![list.into_iter().next().unwrap(), d];
+        assert_eq!(pick(&list2, "").unwrap().conn, 4);
+    }
+
+    #[test]
+    fn peer_list_shows_siblings_and_hides_quiet() {
+        let me = "a".repeat(64);
+        let friend = "b".repeat(64);
+        let lurker = "c".repeat(64);
+        let mut g: HashMap<String, Vec<Client>> = HashMap::new();
+        let (pc, _r1) = client(1, "11111111", FORM_DESKTOP, false, 10);
+        let (ph, _r2) = client(2, "22222222", FORM_PHONE, false, 5);
+        let (fr, _r3) = client(3, "", "", false, 5);
+        let (lk, _r4) = client(4, "44444444", FORM_PHONE, true, 5);
+        g.insert(me.clone(), vec![pc, ph]);
+        g.insert(friend.clone(), vec![fr]);
+        g.insert(lurker.clone(), vec![lk]);
+        let for_pc = peers_for(&g, 1);
+        let mine = for_pc.iter().find(|p| p.id == me).expect("свой телефон виден ПК");
+        assert_eq!(mine.devs.len(), 1);
+        assert_eq!(mine.devs[0].dev, "22222222");
+        assert!(for_pc.iter().any(|p| p.id == friend));
+        assert!(!for_pc.iter().any(|p| p.id == lurker), "входящий по коду не виден");
+        let for_friend = peers_for(&g, 3);
+        let acc = for_friend.iter().find(|p| p.id == me).unwrap();
+        assert_eq!(acc.devs.len(), 2);
+        assert_eq!(acc.name, "n1", "имя — основного устройства (ПК)");
+        assert!(!for_friend.iter().any(|p| p.id == friend), "себя без других устройств не видно");
+    }
+
+    #[tokio::test]
+    async fn open_routes_to_device_and_to_own_sibling() {
+        let h = hub();
+        let me = "a".repeat(64);
+        let friend = "b".repeat(64);
+        let (pc, mut rpc) = client(1, "11111111", FORM_DESKTOP, false, 10);
+        let (ph, mut rph) = client(2, "22222222", FORM_PHONE, false, 5);
+        let (fr, _rfr) = client(3, "33333333", FORM_DESKTOP, false, 5);
+        h.clients.lock().await.insert(me.clone(), vec![pc, ph]);
+        h.clients.lock().await.insert(friend.clone(), vec![fr]);
+        let tok = |c: char| c.to_string().repeat(32);
+        // друг — на телефон
+        h.open(&friend, 3, "33333333", &me, "22222222", PORT_SIG, &tok('1')).await.unwrap();
+        let m: ToClient = serde_json::from_str(rph.try_recv().unwrap().trim()).unwrap();
+        assert_eq!(m, ToClient::Incoming { from: friend.clone(), port: PORT_SIG.into(), tok: tok('1'), dev: "33333333".into() });
+        // старая версия без dev — на основное (ПК)
+        h.open(&friend, 3, "33333333", &me, "", PORT_SIG, &tok('2')).await.unwrap();
+        assert!(rpc.try_recv().is_ok());
+        // своё другое устройство — можно, себе — нельзя, без dev — нельзя
+        h.open(&me, 1, "11111111", &me, "22222222", PORT_SIG, &tok('3')).await.unwrap();
+        assert!(rph.try_recv().is_ok());
+        assert!(h.open(&me, 1, "11111111", &me, "11111111", PORT_SIG, &tok('4')).await.is_err());
+        assert!(h.open(&me, 1, "11111111", &me, "", PORT_SIG, &tok('5')).await.is_err());
+        // порт сопряжения обычным open не открыть
+        assert!(h.open(&friend, 3, "33333333", &me, "", PORT_PAIR, &tok('6')).await.is_err());
+        assert!(h.open(&friend, 3, "33333333", &me, "99999999", PORT_SIG, &tok('7')).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pairing_code_is_single_use() {
+        let h = hub();
+        let me = "a".repeat(64);
+        let newbie = "d".repeat(64);
+        let (pc, mut rpc) = client(1, "11111111", FORM_DESKTOP, false, 10);
+        let (nb, _rnb) = client(2, "22222222", FORM_PHONE, true, 1);
+        h.clients.lock().await.insert(me.clone(), vec![pc]);
+        h.clients.lock().await.insert(newbie.clone(), vec![nb]);
+        h.pair_wait(&me, 1, "0420").await.unwrap();
+        assert!(h.pair_wait(&newbie, 2, "0420").await.is_err(), "чужой код не перехватить");
+        assert!(h.pair_wait(&me, 1, "42").await.is_err());
+        let tok = "e".repeat(32);
+        h.pair_join(&newbie, 2, "22222222", "0420", &tok).await.unwrap();
+        let m: ToClient = serde_json::from_str(rpc.try_recv().unwrap().trim()).unwrap();
+        assert_eq!(m, ToClient::Incoming { from: newbie.clone(), port: PORT_PAIR.into(), tok: tok.clone(), dev: "22222222".into() });
+        // вторая попытка с тем же кодом — нет
+        assert!(h.pair_join(&newbie, 2, "22222222", "0420", &"f".repeat(32)).await.is_err());
+        // новый код того же устройства заменяет старый
+        h.pair_wait(&me, 1, "1111").await.unwrap();
+        h.pair_wait(&me, 1, "2222").await.unwrap();
+        assert!(!h.pairs.lock().await.contains_key("1111"));
     }
 }

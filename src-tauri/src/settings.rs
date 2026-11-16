@@ -72,6 +72,8 @@ pub fn init_chat_saver(app: &tauri::AppHandle) {
 /// of changes becomes one background write about 0.4 s later.
 pub fn save_chats_soon(state: &AppState) {
     use std::sync::atomic::Ordering;
+    // свои другие устройства (ПК и телефон одного аккаунта) получат изменения
+    crate::own::changed();
     let Some(app) = CHAT_APP.get() else { save_chats_now(state); return };
     if CHATS_DIRTY.swap(true, Ordering::SeqCst) {
         return; // запись уже запланирована и увидит это изменение

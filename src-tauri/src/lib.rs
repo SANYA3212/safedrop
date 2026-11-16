@@ -8,6 +8,8 @@ mod ident;
 #[cfg(target_os = "android")]
 mod mobile;
 mod peers_cmd;
+mod own;
+mod pair;
 mod quic;
 mod relay;
 mod settings;
@@ -93,6 +95,8 @@ async fn save_profile(
     let _ = app.emit("safedrop-profile", p.clone());
     let shown = if p.nickname.is_empty() { state.settings.lock().await.device_name.clone() } else { p.nickname.clone() };
     relay::send_name(&shown);
+    // тот же профиль на других своих устройствах
+    own::profile_changed(&app).await;
     // push to everyone
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1713,6 +1717,8 @@ async fn factory_reset(
     }
     #[cfg(target_os = "linux")]
     settings::apply_autostart(false).map_err(|e| format!("Автозапуск: {e}"))?;
+    // очистка здесь не должна стереть историю на других своих устройствах
+    own::reset(&app);
     for f in [
         state.settings_path(),
         state.peers_path(),
@@ -1769,6 +1775,16 @@ async fn factory_reset(
     tls::clear_pins();
     // сервер SafeDrop (server.json) и его запомненный ключ
     relay::reset();
+    // вошли по коду с другого своего устройства: «Выйти» не оставляет здесь
+    // ключ аккаунта (свой собственный ключ, как и раньше, сохраняется)
+    let linked = state.app_dir.join(relay::LINKED_MARK);
+    if linked.is_file() {
+        for f in ["quic_cert.der", "quic_key.der", "quic_cert.der.old", "quic_key.der.old"] {
+            let _ = std::fs::remove_file(state.app_dir.join(f));
+        }
+        let _ = std::fs::remove_file(&linked);
+        let _ = tls::reload(&state.app_dir);
+    }
     let fresh = Settings::default();
     let _ = std::fs::create_dir_all(&fresh.loaddrop_dir);
     *state.settings.lock().await = fresh;
@@ -2612,6 +2628,25 @@ async fn server_configure(app: tauri::AppHandle, mode: String, addr: String, pas
     Ok(st)
 }
 
+/// Показать код для входа другого своего устройства (ПК → телефон).
+#[tauri::command]
+async fn pair_start() -> Result<serde_json::Value, String> {
+    pair::start()
+}
+
+#[tauri::command]
+async fn pair_cancel() -> Result<(), String> {
+    pair::cancel();
+    Ok(())
+}
+
+/// Войти в свой аккаунт по коду с экрана другого своего устройства.
+#[tauri::command]
+async fn pair_join(app: tauri::AppHandle, addr: String, pass: String, code: String) -> Result<relay::Status, String> {
+    pair::join(&app, &addr, &pass, &code).await?;
+    Ok(relay::status())
+}
+
 /// Подтвердить новый ключ сервера (после переустановки сервера).
 #[tauri::command]
 async fn server_trust_key(app: tauri::AppHandle, fp: String) -> Result<(), String> {
@@ -3062,6 +3097,8 @@ pub fn run() {
             });
             // режим «через сервер»: держит связь с SafeDrop Server, если он выбран
             relay::start(app.handle().clone(), sport, port);
+            // свои другие устройства (тот же аккаунт на ПК и телефоне)
+            own::start(app.handle().clone());
             // QUIC server (beta): only when enabled, TCP path untouched otherwise
             let qhandle = app.handle().clone();
             let (qon, qport): (bool, u16) = app.state::<AppState>()
@@ -3162,6 +3199,7 @@ pub fn run() {
             fix_mic_blocked, take_mic_reset_flag, clear_cache, open_mic_settings,
             win_min, win_max_toggle, win_hide, win_quit, win_drag, flash_window, get_build_info, linux_audio_status, linux_audio_install, rtc_debug_on, rtc_debug, own_installer, get_key_info, trust_new_key, forget_key, win11_menu_status, win11_menu_set, fullscreen_app_running, ghupdate::check_github_update, ghupdate::download_github_update,
             server_status, server_configure, server_trust_key, server_ice,
+            pair_start, pair_cancel, pair_join,
             // браузер «вместе» — только на компьютере
             #[cfg(not(target_os = "android"))] ytbrowse::ytb_open,
             #[cfg(not(target_os = "android"))] ytbrowse::ytb_go,

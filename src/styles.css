@@ -810,4 +810,7 @@ details.set-sec > .card:first-of-type { border-top: 0; }
 .srv-key code { color: var(--text); font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
 .srv-peer { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; }
 .srv-peer b { color: var(--text); font-weight: 600; }
+.pair-box { margin: 8px 0; padding: 10px 12px; border-radius: 10px; background: rgba(255,255,255,.05); }
+.pair-code { font: 600 28px/1.3 ui-monospace, Consolas, monospace; letter-spacing: 3px; color: var(--text); margin: 6px 0; user-select: all; }
+.pair-code:empty { display: none; }
 .brand-ver.srv { background: linear-gradient(135deg,#23a559,#1a7f8f); }

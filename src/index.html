@@ -173,6 +173,19 @@
             <div id="srv-key" class="muted srv-key"></div>
             <div class="row hidden" id="srv-trust-row"><button id="srv-trust" data-set-label="Доверять новому ключу сервера">Доверять новому ключу</button></div>
           </div>
+          <div class="card" id="srv-devs-card"><h3>Мои устройства</h3>
+            <div id="srv-devs" class="muted">—</div>
+            <div class="row"><button id="pair-start" data-set-label="Подключить телефон">Подключить телефон</button></div>
+            <div id="pair-box" class="pair-box hidden">
+              <div class="muted">На телефоне: «Войти в аккаунт» → адрес и пароль этого сервера → код:</div>
+              <!-- QR для телефона: текст в data-text (safedrop://pair?v=1&s=…&p=…&c=…), пусто — QR не нужен -->
+              <div id="pair-qr" class="pair-qr"></div>
+              <div id="pair-code" class="pair-code"></div>
+              <div id="pair-status" class="muted"></div>
+              <div class="row"><button id="pair-cancel">Отмена</button></div>
+            </div>
+            <div class="muted">ПК и телефон — один аккаунт, как в Telegram: сообщения, звонки и файлы приходят на все устройства, а история, правки и прочитанное совпадают. Код одноразовый и действует 5 минут; ключ аккаунта передаётся только устройству, которое ввело верный код, — сервер его не видит.</div>
+          </div>
           <div class="card"><h3>На сервере <span id="srv-count" class="cnt-badge"></span></h3>
             <div id="srv-peers" class="muted">—</div>
             <div class="muted">Все, кто подключён к этому серверу, сами появляются в контактах. Сервер для своих: пароль задаёт тот, кто его запускает.</div>

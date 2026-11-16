@@ -20,6 +20,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+# вход в аккаунт по коду: ключ передаётся только тому, кто знает код (SPAKE2)
+spake2 = "0.4"
+hmac = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 local-ip-address = "0.6"

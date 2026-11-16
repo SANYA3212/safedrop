@@ -74,18 +74,35 @@ struct Identity {
     fp: String,
 }
 
-fn identity() -> &'static OnceLock<Identity> {
-    static I: OnceLock<Identity> = OnceLock::new();
-    &I
+/// Ключ устройства и готовые TLS-конфиги с ним. Меняется только при входе
+/// в аккаунт по коду (`reload`): новое устройство получает ключ аккаунта.
+struct Keys {
+    id: Identity,
+    server: Option<Arc<rustls::ServerConfig>>,
+    client: Option<Arc<rustls::ClientConfig>>,
+}
+
+fn keys() -> &'static std::sync::RwLock<Option<Arc<Keys>>> {
+    static K: std::sync::RwLock<Option<Arc<Keys>>> = std::sync::RwLock::new(None);
+    &K
+}
+
+fn current() -> Option<Arc<Keys>> {
+    keys().read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Свой сертификат и PKCS#8-ключ (для QUIC).
 pub(crate) fn my_cert() -> Option<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)> {
-    identity().get().map(|i| (i.cert.clone(), rustls::pki_types::PrivateKeyDer::Pkcs8(i.key.clone().into())))
+    current().map(|k| (k.id.cert.clone(), rustls::pki_types::PrivateKeyDer::Pkcs8(k.id.key.clone().into())))
+}
+
+/// Свой сертификат и ключ (DER) — отдать другому своему устройству при входе по коду.
+pub(crate) fn my_key_der() -> Option<(Vec<u8>, Vec<u8>)> {
+    current().map(|k| (k.id.cert.to_vec(), k.id.key.clone()))
 }
 
 pub fn my_fp() -> String {
-    identity().get().map(|i| i.fp.clone()).unwrap_or_default()
+    current().map(|k| k.id.fp.clone()).unwrap_or_default()
 }
 
 /// Собеседник предъявил наш же ключ: мы подключились к самим себе.
@@ -380,9 +397,58 @@ impl rustls::server::danger::ClientCertVerifier for ClientKeyVerify {
 
 // ---------- TLS-конфиги и соединения ----------
 
-fn server_config() -> &'static OnceLock<Option<Arc<rustls::ServerConfig>>> {
-    static S: OnceLock<Option<Arc<rustls::ServerConfig>>> = OnceLock::new();
-    &S
+fn server_config() -> Option<Arc<rustls::ServerConfig>> {
+    current().and_then(|k| k.server.clone())
+}
+
+fn build_server(id: &Identity) -> Option<Arc<rustls::ServerConfig>> {
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(id.key.clone().into());
+    let mut cfg = rustls::ServerConfig::builder_with_provider(crate::quic::ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13]).ok()?
+        .with_client_cert_verifier(Arc::new(ClientKeyVerify))
+        .with_single_cert(vec![id.cert.clone()], key).ok()?;
+    // возобновление сессий не используем (одно соединение — один кадр), а
+    // билеты приходят отправителю уже после рукопожатия, и он их не читает:
+    // закрытие с непрочитанными данными рвёт соединение сбросом и теряет
+    // хвост большого кадра у отправителей 0.3.31–0.3.32 (см. finish)
+    cfg.send_tls13_tickets = 0;
+    Some(Arc::new(cfg))
+}
+
+fn build_client(id: Option<&Identity>) -> Option<Arc<rustls::ClientConfig>> {
+    let builder = rustls::ClientConfig::builder_with_provider(crate::quic::ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13]).ok()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(KeyVerify));
+    let cfg = match id {
+        Some(i) => builder.with_client_auth_cert(vec![i.cert.clone()], rustls::pki_types::PrivateKeyDer::Pkcs8(i.key.clone().into())).ok()?,
+        None => builder.with_no_client_auth(),
+    };
+    Some(Arc::new(cfg))
+}
+
+/// Ключ и конфиги из файлов в папке приложения (создаёт ключ, если его нет).
+fn load_keys(app_dir: &Path) -> Result<Keys, String> {
+    let (cert_der, key_der) = crate::quic::load_or_gen_cert(app_dir)?;
+    let id = Identity { fp: fp_of(&cert_der), cert: cert_der.into(), key: key_der };
+    let server = build_server(&id);
+    if server.is_none() {
+        return Err("ключ устройства не подходит для TLS".into());
+    }
+    let client = build_client(Some(&id));
+    Ok(Keys { id, server, client })
+}
+
+/// Взять ключ из файлов заново (после `quic::install_cert`): соединения,
+/// начатые после этого, идут уже с новым ключом.
+pub fn reload(app_dir: &Path) -> Result<String, String> {
+    let k = load_keys(app_dir)?;
+    let fp = k.id.fp.clone();
+    if let Ok(mut map) = pins().lock() {
+        if drop_own_key(&mut map, &fp) { save_pins(&map); }
+    }
+    *keys().write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(k));
+    Ok(fp)
 }
 
 /// Подготовить TLS: ключ устройства из папки приложения и запомненные ключи
@@ -396,48 +462,36 @@ pub fn init(app_dir: &Path) {
         }
     }
     let _ = pins_path().set(path);
-    match crate::quic::load_or_gen_cert(app_dir) {
-        Ok((cert_der, key_der)) => {
-            let fp = fp_of(&cert_der);
+    // повторный вызов (тесты) ключ не меняет: замена — только через reload
+    if current().is_some() {
+        return;
+    }
+    match load_keys(app_dir) {
+        Ok(k) => {
             if let Ok(mut map) = pins().lock() {
-                if drop_own_key(&mut map, &fp) { save_pins(&map); }
+                if drop_own_key(&mut map, &k.id.fp) { save_pins(&map); }
             }
-            let _ = identity().set(Identity { cert: cert_der.into(), key: key_der, fp });
+            let mut g = keys().write().unwrap_or_else(|e| e.into_inner());
+            if g.is_none() {
+                *g = Some(Arc::new(k));
+            }
         }
         #[cfg(target_os = "linux")]
         Err(e) => eprintln!("SafeDrop: не удалось загрузить ключ устройства: {e}"),
         #[cfg(not(target_os = "linux"))]
         Err(_) => {}
     }
-    server_config().get_or_init(|| {
-        let (cert, key) = my_cert()?;
-        let mut cfg = rustls::ServerConfig::builder_with_provider(crate::quic::ring_provider())
-            .with_protocol_versions(&[&rustls::version::TLS13]).ok()?
-            .with_client_cert_verifier(Arc::new(ClientKeyVerify))
-            .with_single_cert(vec![cert], key).ok()?;
-        // возобновление сессий не используем (одно соединение — один кадр), а
-        // билеты приходят отправителю уже после рукопожатия, и он их не читает:
-        // закрытие с непрочитанными данными рвёт соединение сбросом и теряет
-        // хвост большого кадра у отправителей 0.3.31–0.3.32 (см. finish)
-        cfg.send_tls13_tickets = 0;
-        Some(Arc::new(cfg))
-    });
 }
 
 /// TLS-клиент с ключом устройства (к контактам и к серверу SafeDrop).
 pub(crate) fn client_config() -> Option<Arc<rustls::ClientConfig>> {
-    static C: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
-    C.get_or_init(|| {
-        let builder = rustls::ClientConfig::builder_with_provider(crate::quic::ring_provider())
-            .with_protocol_versions(&[&rustls::version::TLS13]).ok()?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(KeyVerify));
-        let cfg = match my_cert() {
-            Some((cert, key)) => builder.with_client_auth_cert(vec![cert], key).ok()?,
-            None => builder.with_no_client_auth(),
-        };
-        Some(Arc::new(cfg))
-    }).clone()
+    match current() {
+        Some(k) => k.client.clone(),
+        None => {
+            static C: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
+            C.get_or_init(|| build_client(None)).clone()
+        }
+    }
 }
 
 /// Входящее соединение: TLS, если клиент начал рукопожатие, иначе как есть.
@@ -453,8 +507,8 @@ pub async fn accept(sock: TcpStream) -> std::io::Result<(Stream, PeerAuth)> {
     }
     let is_tls = matches!(peeked, Ok(Ok(1))) && first[0] == 0x16;
     if is_tls {
-        if let Some(Some(cfg)) = server_config().get() {
-            let acceptor = tokio_rustls::TlsAcceptor::from(cfg.clone());
+        if let Some(cfg) = server_config() {
+            let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
             let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(sock))
                 .await
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timeout"))??;
@@ -547,10 +601,10 @@ async fn connect_one(ip: &str, port: u16, timeout: Duration) -> Result<Stream, S
 /// Входящий канал через сервер: только TLS с ключом собеседника (сервер
 /// не должен иметь возможности подсунуть открытый текст).
 pub async fn accept_relayed(sock: TcpStream) -> std::io::Result<(Stream, PeerAuth)> {
-    let Some(Some(cfg)) = server_config().get() else {
+    let Some(cfg) = server_config() else {
         return Err(std::io::Error::other("нет ключа устройства"));
     };
-    let acceptor = tokio_rustls::TlsAcceptor::from(cfg.clone());
+    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
     let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(sock))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timeout"))??;
@@ -686,7 +740,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         const N: usize = 4 * 1024 * 1024;
         // получатель 0.3.31–0.3.32 ещё шлёт билеты: от сброса спасает только finish
-        let mut old = (**server_config().get().unwrap().as_ref().unwrap()).clone();
+        let mut old = (*server_config().unwrap()).clone();
         old.send_tls13_tickets = 2;
         let old = tokio_rustls::TlsAcceptor::from(Arc::new(old));
         let server = tokio::spawn(async move {

@@ -702,7 +702,9 @@ pub(crate) async fn process_frame(
         Frame::ChatSyncRequest { known_ids } => {
             let app2 = app.clone();
             let peer_ip = ip.clone();
-            tokio::spawn(async move { send_chat_sync(&app2, &peer_ip, known_ids).await; });
+            // история — тому устройству контакта, которое спросило
+            let dev = crate::relay::from_dev();
+            tokio::spawn(async move { crate::relay::maybe_to_dev(dev, send_chat_sync(&app2, &peer_ip, known_ids)).await; });
         }
         Frame::ChatSync { messages } => {
             let (my_nick, loaddrop_dir) = {
@@ -715,6 +717,8 @@ pub(crate) async fn process_frame(
                 .map(|g| format!("g:{}", g.id)).collect();
             let mut changed = std::collections::HashSet::new();
             let mut ack_ids = Vec::new();
+            // удалённое на своём другом устройстве история контакта не возвращает
+            let own_key = crate::own::wire_key(&state, &ip).await;
             {
                 let mut chats = state.chats.lock().await;
                 for mut msg in messages {
@@ -748,6 +752,10 @@ pub(crate) async fn process_frame(
                     // LoadDrop (for restored own messages too, never a peer's path).
                     if !msg.audio.is_empty() {
                         msg.audio = local_audio_path(&loaddrop_dir, &msg.audio);
+                    }
+                    let wire = if is_group { Some(msg.peer.clone()) } else { own_key.clone() };
+                    if wire.is_some_and(|w| crate::own::is_gone(&w, &msg.id, msg.sent_at)) {
+                        continue;
                     }
                     let rows = chats.entry(msg.peer.clone()).or_default();
                     // Message IDs are the identity. Comparing only minute-level
@@ -833,6 +841,8 @@ pub(crate) async fn process_frame(
             }
         }
         Frame::CallOffer { from, sdp, group } => {
+            // у звонящего несколько устройств: отвечать тому, с которого звонят
+            crate::relay::pin_call(&ip);
             let _ = app.emit("safedrop-call-offer", serde_json::json!({"from": from, "ip": ip, "sdp": sdp, "group": group}));
             let av = state.peers.lock().await.get(&ip).map(|p| p.display_avatar());
             let icon = av.and_then(|a| avatar_icon_path(&state.app_dir, &ip, &a));
@@ -845,12 +855,19 @@ pub(crate) async fn process_frame(
             notify_silent(&title, &format!("{from} ({ip})"), icon);
         }
         Frame::CallAnswer { from, sdp } => {
+            // ответили с одного из устройств: дальше звонок — только с ним
+            crate::relay::pin_call(&ip);
             let _ = app.emit("safedrop-call-answer", serde_json::json!({"from": from, "ip": ip, "sdp": sdp}));
         }
         Frame::Ice { from, candidate } => {
             let _ = app.emit("safedrop-ice", serde_json::json!({"from": from, "ip": ip, "candidate": candidate}));
         }
         Frame::Hangup { from } => {
+            // звонок идёт с одним устройством контакта: отбой с другого — не наш
+            if crate::relay::other_call_dev(&ip) {
+                return Ok(());
+            }
+            crate::relay::unpin_call(&ip);
             let _ = app.emit("safedrop-hangup", serde_json::json!({"from": from, "ip": ip}));
         }
         Frame::ScreenOffer { from, sdp, share_id, label, with_audio, call_id } => {
@@ -1085,7 +1102,7 @@ pub(crate) async fn process_frame(
     Ok(())
 }
 
-fn local_audio_path(dir: &str, remote: &str) -> String {
+pub(crate) fn local_audio_path(dir: &str, remote: &str) -> String {
     let name = std::path::Path::new(remote)
         .file_name()
         .and_then(|s| s.to_str())
@@ -1104,6 +1121,7 @@ async fn persist_chats(state: &AppState) {
 }
 
 pub async fn persist_groups(state: &AppState) {
+    crate::own::changed();
     let g = state.groups.lock().await;
     let _ = std::fs::create_dir_all(&state.app_dir);
     if let Ok(data) = serde_json::to_string_pretty(&*g) {
@@ -1221,6 +1239,50 @@ fn notify_impl(title: &str, body: &str, icon: Option<String>) {
 /// Send one frame to peer. If wait_reply, read hello-reply (up to 5s),
 /// otherwise flush and return immediately (chat/call/ice must not wait).
 pub async fn send_frame(ip: &str, port: u16, value: serde_json::Value, wait_reply: bool) -> Result<Option<serde_json::Value>, String> {
+    if crate::relay::is_relay(ip) {
+        let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+        // «занят» (здесь уже идёт звонок): решают другие свои устройства — пусть
+        // звонок звонит там, а звонящему отбой не шлём, если есть кому ответить
+        let busy = kind == "call-hangup" && value.get("busy").and_then(|b| b.as_bool()).unwrap_or(false);
+        if busy && !crate::relay::siblings().is_empty() {
+            return Ok(None);
+        }
+        // ответил или отклонил звонок здесь — на других своих устройствах он не звонит
+        if (kind == "call-answer" || kind == "call-hangup") && !busy {
+            crate::own::call_elsewhere(ip, &kind);
+        }
+        // ответ (hello) нужен один: его даёт основное устройство
+        if !wait_reply {
+            match crate::relay::plan(ip, &kind) {
+                crate::relay::Plan::Default => {}
+                crate::relay::Plan::One(dev) => return crate::relay::to_dev(dev, send_frame_one(ip, port, value, false)).await,
+                crate::relay::Plan::All(devs) => {
+                    // у контакта несколько устройств (ПК и телефон): каждому
+                    let jobs: Vec<_> = devs
+                        .into_iter()
+                        .map(|dev| {
+                            let (ip, v) = (ip.to_string(), value.clone());
+                            tokio::spawn(crate::relay::to_dev(dev, async move { send_frame_one(&ip, port, v, false).await }))
+                        })
+                        .collect();
+                    let mut err = String::from("не отправлено");
+                    let mut ok = false;
+                    for j in jobs {
+                        match j.await {
+                            Ok(Ok(_)) => ok = true,
+                            Ok(Err(e)) => err = e,
+                            Err(e) => err = e.to_string(),
+                        }
+                    }
+                    return if ok { Ok(None) } else { Err(err) };
+                }
+            }
+        }
+    }
+    send_frame_one(ip, port, value, wait_reply).await
+}
+
+async fn send_frame_one(ip: &str, port: u16, value: serde_json::Value, wait_reply: bool) -> Result<Option<serde_json::Value>, String> {
     let mut s = crate::tls::connect(ip, port, std::time::Duration::from_secs(13)).await?;
     let mut out = serde_json::to_string(&value).map_err(|e| e.to_string())?;
     out.push('\n');

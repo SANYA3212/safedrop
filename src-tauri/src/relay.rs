@@ -27,7 +27,8 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 use crate::state::{AppState, Peer};
 
 #[path = "../../server/src/proto.rs"]
-mod proto;
+pub(crate) mod proto;
+pub(crate) use proto::DevInfo;
 use proto::{PeerInfo, ToClient, ToServer, TurnInfo};
 
 pub const PREFIX: &str = "sd-";
@@ -51,6 +52,9 @@ pub struct ServerConf {
     /// запомненный ключ сервера
     #[serde(default)]
     pub fp: String,
+    /// это устройство внутри аккаунта (у ПК и телефона с одним ключом — разные)
+    #[serde(default)]
+    pub dev: String,
 }
 
 /// Состояние для интерфейса (событие `safedrop-server`).
@@ -70,6 +74,12 @@ pub struct Status {
     pub peers: Vec<PeerInfo>,
     pub turn: bool,
     pub rtt_ms: Option<u64>,
+    /// другие свои устройства в сети (тот же аккаунт)
+    pub siblings: Vec<DevInfo>,
+    /// сервер умеет несколько устройств на аккаунт и вход по коду
+    pub multi: bool,
+    /// ключ этого устройства пришёл с другого своего (вход по коду)
+    pub linked: bool,
 }
 
 #[derive(Default)]
@@ -92,6 +102,13 @@ struct Shared {
     rtts_known: bool,
     sig_port: u16,
     file_port: u16,
+    multi: bool,
+    /// свои другие устройства в сети
+    siblings: Vec<DevInfo>,
+    /// звонок с контактом идёт с этим его устройством (ID → dev, когда)
+    call_pins: HashMap<String, (String, Instant)>,
+    /// ждём новое устройство по коду (`pair::start`)
+    pair: Option<crate::pair::Waiting>,
 }
 
 fn shared() -> &'static Mutex<Shared> {
@@ -165,6 +182,147 @@ pub fn ping(addr: &str) -> Option<u64> {
     (g.state == "online" && g.peers.contains_key(id)).then(|| peer_ping(&g, id).unwrap_or(0))
 }
 
+// ---------- устройства аккаунта ----------
+//
+// У одного аккаунта (ключа) может быть несколько устройств: ПК и телефон.
+// Сообщения, файлы и звонок контакту рассылаются на все его устройства
+// (`plan`), ответы в звонке — тому устройству, с которым звонок идёт
+// (`pin_call`). Свои другие устройства — `siblings` (синхронизация — `own`).
+
+tokio::task_local! {
+    /// к какому устройству контакта открывать каналы (`to_dev`)
+    static TARGET_DEV: String;
+    /// с какого устройства контакта пришёл обрабатываемый кадр
+    static FROM_DEV: String;
+}
+
+/// Выполнить отправку к одному устройству контакта.
+pub async fn to_dev<F: std::future::Future>(dev: String, f: F) -> F::Output {
+    TARGET_DEV.scope(dev, f).await
+}
+
+/// То же, но только если устройство известно (иначе — как обычно).
+pub async fn maybe_to_dev<F: std::future::Future>(dev: Option<String>, f: F) -> F::Output {
+    match dev {
+        Some(d) => TARGET_DEV.scope(d, f).await,
+        None => f.await,
+    }
+}
+
+fn target_dev() -> Option<String> {
+    TARGET_DEV.try_with(|d| d.clone()).ok()
+}
+
+/// С какого устройства контакта пришёл текущий кадр (через сервер).
+pub fn from_dev() -> Option<String> {
+    FROM_DEV.try_with(|d| d.clone()).ok()
+}
+
+/// Кадры звонка: после ответа идут только устройству, с которым звонок.
+const CALL_KINDS: &[&str] = &["call-offer", "call-answer", "ice", "call-hangup", "screen-offer", "screen-answer", "screen-ice", "screen-stop"];
+/// Звонок дольше этого без единого кадра — не тот же звонок.
+const PIN_FOR: Duration = Duration::from_secs(12 * 3600);
+
+/// Куда слать кадр `kind` контакту `addr`.
+pub enum Plan {
+    /// как раньше: одно соединение (устройство выберет сервер или `to_dev`)
+    Default,
+    One(String),
+    All(Vec<String>),
+}
+
+pub fn plan(addr: &str, kind: &str) -> Plan {
+    if target_dev().is_some() {
+        return Plan::Default;
+    }
+    let Some(id) = id_of(addr) else { return Plan::Default };
+    let mut g = lock();
+    if !g.multi {
+        return Plan::Default;
+    }
+    let devs: Vec<String> = g.peers.get(id).map(|p| p.devs.iter().map(|d| d.dev.clone()).collect()).unwrap_or_default();
+    if CALL_KINDS.contains(&kind) {
+        // новый звонок — снова всем устройствам; ответ — тому, кто звонит
+        if kind == "call-offer" {
+            g.call_pins.remove(id);
+        } else if let Some((dev, at)) = g.call_pins.get(id).cloned() {
+            if at.elapsed() < PIN_FOR && devs.contains(&dev) {
+                if kind == "call-hangup" {
+                    g.call_pins.remove(id);
+                } else if let Some(p) = g.call_pins.get_mut(id) {
+                    p.1 = Instant::now();
+                }
+                return Plan::One(dev);
+            }
+            g.call_pins.remove(id);
+        }
+    }
+    if devs.len() > 1 { Plan::All(devs) } else { Plan::Default }
+}
+
+/// Звонок с контактом идёт с устройством, с которого пришёл текущий кадр.
+pub fn pin_call(addr: &str) {
+    let (Some(id), Some(dev)) = (id_of(addr), from_dev()) else { return };
+    lock().call_pins.insert(id.to_string(), (dev, Instant::now()));
+}
+
+/// Кадр пришёл не с того устройства контакта, с которым идёт звонок.
+pub fn other_call_dev(addr: &str) -> bool {
+    let (Some(id), Some(dev)) = (id_of(addr), from_dev()) else { return false };
+    let g = lock();
+    matches!(g.call_pins.get(id), Some((pinned, at)) if *pinned != dev && at.elapsed() < PIN_FOR)
+}
+
+pub fn unpin_call(addr: &str) {
+    if let Some(id) = id_of(addr) {
+        lock().call_pins.remove(id);
+    }
+}
+
+/// Ожидание нового устройства по коду (`pair`).
+pub(crate) fn with_pair<R>(f: impl FnOnce(&mut Option<crate::pair::Waiting>) -> R) -> R {
+    f(&mut lock().pair)
+}
+
+/// Отправить сообщение серверу по текущему соединению.
+pub(crate) fn ctl_send(m: &ToServer) -> Result<(), String> {
+    let tx = lock().tx.clone().ok_or("нет связи с сервером SafeDrop")?;
+    tx.try_send(line(m)).map_err(|_| "связь с сервером занята — попробуйте ещё раз".to_string())
+}
+
+/// Сервер на связи и умеет несколько устройств на аккаунт.
+pub(crate) fn multi_online() -> bool {
+    let g = lock();
+    g.state == "online" && g.multi
+}
+
+pub(crate) fn conf() -> ServerConf {
+    lock().conf.clone()
+}
+
+/// Записать настройки сервера целиком (новое устройство вошло по коду).
+pub(crate) fn set_conf(app: &AppHandle, conf: ServerConf) {
+    ACTIVE.store(conf.mode == MODE_SERVER, Ordering::Relaxed);
+    {
+        let mut g = lock();
+        g.conf = conf;
+        g.pending_fp.clear();
+        save(&g);
+    }
+    kick().notify_waiters();
+    emit_status(app);
+}
+
+pub(crate) fn split_addr_pub(s: &str) -> Result<(String, u16), String> {
+    split_addr(s)
+}
+
+/// Свои другие устройства в сети.
+pub fn siblings() -> Vec<DevInfo> {
+    let g = lock();
+    if g.state == "online" { g.siblings.clone() } else { Vec::new() }
+}
+
 /// Разобрать «хост[:порт]» (IPv6 — в квадратных скобках).
 fn split_addr(s: &str) -> Result<(String, u16), String> {
     let s = s.trim();
@@ -213,15 +371,39 @@ fn save(g: &Shared) {
 
 pub fn init(app_dir: &Path) {
     let path = app_dir.join("server.json");
-    let conf = std::fs::read_to_string(&path)
+    let mut conf = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str::<ServerConf>(&s).ok())
         .unwrap_or_default();
     ACTIVE.store(conf.mode == MODE_SERVER, Ordering::Relaxed);
+    let fresh_dev = conf.dev.is_empty() || !proto::valid_dev(&conf.dev);
+    if fresh_dev {
+        conf.dev = new_dev();
+    }
     let mut g = lock();
     g.conf = conf;
     g.path = Some(path);
     g.state = "off".into();
+    if fresh_dev && g.conf.mode == MODE_SERVER {
+        save(&g);
+    }
+}
+
+fn new_dev() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
+}
+
+/// Это устройство внутри аккаунта.
+pub fn my_dev() -> String {
+    let mut g = lock();
+    if g.conf.dev.is_empty() {
+        g.conf.dev = new_dev();
+    }
+    g.conf.dev.clone()
+}
+
+fn my_form() -> &'static str {
+    if cfg!(target_os = "android") { proto::FORM_PHONE } else { proto::FORM_DESKTOP }
 }
 
 pub fn status() -> Status {
@@ -241,8 +423,14 @@ pub fn status() -> Status {
         peers,
         turn: g.turn.is_some(),
         rtt_ms: g.rtt_ms,
+        siblings: g.siblings.clone(),
+        multi: g.multi,
+        linked: g.path.as_ref().and_then(|p| p.parent()).is_some_and(|d| d.join(LINKED_MARK).is_file()),
     }
 }
+
+/// Файл-отметка: ключ получен входом по коду (`pair::install`).
+pub(crate) const LINKED_MARK: &str = "account-linked";
 
 fn emit_status(app: &AppHandle) {
     let _ = app.emit("safedrop-server", status());
@@ -269,6 +457,9 @@ pub fn configure(app: &AppHandle, mode: &str, addr: &str, pass: &str) -> Result<
         g.conf.mode = mode.into();
         g.conf.addr = addr;
         g.conf.pass = pass.to_string();
+        if g.conf.dev.is_empty() {
+            g.conf.dev = new_dev();
+        }
         save(&g);
     }
     ACTIVE.store(mode == MODE_SERVER, Ordering::Relaxed);
@@ -378,27 +569,79 @@ pub async fn open(addr: &str, port: u16) -> Result<TcpStream, String> {
         }
         (g.tx.clone().ok_or("нет связи с сервером SafeDrop")?, g.host.clone(), g.port, kind)
     };
+    let dev = target_dev().unwrap_or_default();
+    open_raw(&tx, &host, sport, &id, kind, &dev).await
+}
+
+/// Канал к устройству `dev` аккаунта `id` (к своему — тоже, `own`).
+async fn open_raw(tx: &mpsc::Sender<String>, host: &str, sport: u16, id: &str, kind: &str, dev: &str) -> Result<TcpStream, String> {
     let tok = uuid::Uuid::new_v4().simple().to_string();
-    tx.send(line(&ToServer::Open { to: id, port: kind.into(), tok: tok.clone() }))
+    tx.send(line(&ToServer::Open { to: id.to_string(), port: kind.into(), tok: tok.clone(), dev: dev.to_string() }))
         .await
         .map_err(|_| "связь с сервером прервалась".to_string())?;
-    data_conn(&host, sport, &tok).await
+    data_conn(host, sport, &tok).await
+}
+
+/// Канал к своему другому устройству: TLS, и ответить обязан свой же ключ.
+/// Запомненные ключи контактов при этом не трогаются.
+pub async fn own_connect(dev: &str) -> Result<crate::tls::Stream, String> {
+    let mine = crate::tls::my_fp();
+    let (tx, host, sport) = {
+        let g = lock();
+        if g.conf.mode != MODE_SERVER || g.state != "online" {
+            return Err("нет связи с сервером SafeDrop".into());
+        }
+        if !g.siblings.iter().any(|d| d.dev == dev) {
+            return Err("своё устройство не в сети".into());
+        }
+        (g.tx.clone().ok_or("нет связи с сервером SafeDrop")?, g.host.clone(), g.port)
+    };
+    let sock = tokio::time::timeout(CONNECT_TIMEOUT, open_raw(&tx, &host, sport, &mine, proto::PORT_SIG, dev))
+        .await
+        .map_err(|_| "тайм-аут канала к своему устройству".to_string())??;
+    let cfg = crate::tls::client_config().ok_or("нет ключа устройства")?;
+    let name = rustls::pki_types::ServerName::try_from("safedrop").map_err(|e| e.to_string())?;
+    let tls = tokio::time::timeout(CONNECT_TIMEOUT, tokio_rustls::TlsConnector::from(cfg).connect(name, sock))
+        .await
+        .map_err(|_| "своё устройство не завершило TLS".to_string())?
+        .map_err(|e| format!("TLS со своим устройством: {e}"))?;
+    let fp = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| crate::tls::fp_of(c));
+    if mine.is_empty() || fp.as_deref() != Some(mine.as_str()) {
+        return Err("ответило не своё устройство (другой ключ)".into());
+    }
+    Ok(Box::new(tls))
+}
+
+/// Канал сопряжения к тому, кто ждёт код (вход нового устройства).
+pub(crate) async fn data_conn_pub(host: &str, port: u16, tok: &str) -> Result<TcpStream, String> {
+    data_conn(host, port, tok).await
 }
 
 /// Кто-то открыл канал к нам: подключиться и обслужить как обычное входящее.
-async fn incoming(app: AppHandle, host: String, port: u16, from: String, kind: String, tok: String) {
+async fn incoming(app: AppHandle, host: String, port: u16, from: String, kind: String, tok: String, dev: String) {
     let file = kind == proto::PORT_FILE;
     let Ok(_permit) = slots(file).try_acquire_owned() else { return };
     let r: Result<(), String> = async {
         let sock = data_conn(&host, port, &tok).await?;
         let (stream, auth) = crate::tls::accept_relayed(sock).await.map_err(|e| e.to_string())?;
+        if from == crate::tls::my_fp() {
+            // своё другое устройство: ключ — свой же, кадры — синхронизация
+            if auth.fp.as_deref() != Some(from.as_str()) || file {
+                return Err("канал от своего ID: не тот ключ".into());
+            }
+            return crate::own::serve(app, stream, dev).await;
+        }
         let ip = addr_of(&from);
         crate::tls::check_inbound(&ip, &auth)?;
-        if file {
-            crate::transfer::serve_relayed(app, stream, ip).await
-        } else {
-            crate::signal::serve_frame(app, stream, ip).await
-        }
+        FROM_DEV
+            .scope(dev, async move {
+                if file {
+                    crate::transfer::serve_relayed(app, stream, ip).await
+                } else {
+                    crate::signal::serve_frame(app, stream, ip).await
+                }
+            })
+            .await
     }
     .await;
     if let Err(e) = r {
@@ -524,7 +767,15 @@ async fn session(
         let s = st.settings.lock().await;
         if s.profile.nickname.is_empty() { s.device_name.clone() } else { s.profile.nickname.clone() }
     };
-    let hello = ToServer::Hello { proto: proto::PROTO, pass: conf.pass.clone(), name: proto::clean_name(&nick), ver: crate::app_version() };
+    let hello = ToServer::Hello {
+        proto: proto::PROTO,
+        pass: conf.pass.clone(),
+        name: proto::clean_name(&nick),
+        ver: crate::app_version(),
+        dev: my_dev(),
+        form: my_form().into(),
+        quiet: false,
+    };
     w.write_all(line(&hello).as_bytes()).await.map_err(|e| e.to_string())?;
     w.flush().await.map_err(|e| e.to_string())?;
 
@@ -581,7 +832,7 @@ async fn session(
                 };
                 let Ok(msg) = serde_json::from_slice::<ToClient>(&l) else { continue };
                 match msg {
-                    ToClient::Welcome { id, server_ver, turn } => {
+                    ToClient::Welcome { id, server_ver, turn, multi } => {
                         if id != crate::tls::my_fp() {
                             break Err("сервер назвал чужой ID устройства".into());
                         }
@@ -589,28 +840,62 @@ async fn session(
                             let mut g = lock();
                             g.server_ver = proto::clean_name(&server_ver);
                             g.turn = turn.filter(|t| t.port != 0);
+                            g.multi = multi;
                         }
                         set_state(app, "online", "");
                     }
                     ToClient::Deny { msg } => break Err(Stop::Wait(format!("Сервер отказал: {}", proto::clean_name(&msg)))),
                     ToClient::Peers { list } => {
                         let mine = crate::tls::my_fp();
-                        {
+                        let me_dev = my_dev();
+                        let new_sibling = {
                             let mut g = lock();
+                            let clean = |d: &DevInfo| DevInfo { dev: d.dev.clone(), form: proto::clean_form(&d.form), ver: proto::clean_name(&d.ver) };
+                            let siblings: Vec<DevInfo> = list
+                                .iter()
+                                .find(|p| p.id == mine)
+                                .map(|p| {
+                                    p.devs.iter()
+                                        .filter(|d| !d.dev.is_empty() && d.dev != me_dev && proto::valid_dev(&d.dev))
+                                        .take(proto::MAX_DEVS)
+                                        .map(clean)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let fresh = siblings.iter().any(|d| !g.siblings.iter().any(|o| o.dev == d.dev));
+                            g.siblings = siblings;
                             g.peers = list
                                 .into_iter()
                                 .filter(|p| proto::valid_id(&p.id) && p.id != mine)
                                 .take(2000)
-                                .map(|p| (p.id.clone(), PeerInfo { id: p.id, name: proto::clean_name(&p.name), ver: proto::clean_name(&p.ver) }))
+                                .map(|p| {
+                                    let devs = p.devs.iter().filter(|d| proto::valid_dev(&d.dev)).take(proto::MAX_DEVS).map(clean).collect();
+                                    (p.id.clone(), PeerInfo { id: p.id, name: proto::clean_name(&p.name), ver: proto::clean_name(&p.ver), devs })
+                                })
                                 .collect();
-                        }
+                            fresh
+                        };
                         emit_status(app);
                         apply_presence(app).await;
-                    }
-                    ToClient::Incoming { from, port: kind, tok } => {
-                        if proto::valid_id(&from) && proto::valid_port(&kind) && proto::valid_token(&tok) {
-                            tokio::spawn(incoming(app.clone(), host.clone(), port, from, kind, tok));
+                        if new_sibling {
+                            crate::own::siblings_online(app);
                         }
+                    }
+                    ToClient::Incoming { from, port: kind, tok, dev } => {
+                        if !proto::valid_id(&from) || !proto::valid_token(&tok) || !proto::valid_dev(&dev) {
+                            continue;
+                        }
+                        if kind == proto::PORT_PAIR {
+                            // только если сами ждём новое устройство по коду
+                            if crate::pair::waiting() {
+                                tokio::spawn(crate::pair::host(app.clone(), host.clone(), port, from, tok));
+                            }
+                        } else if proto::valid_port(&kind) {
+                            tokio::spawn(incoming(app.clone(), host.clone(), port, from, kind, tok, dev));
+                        }
+                    }
+                    ToClient::PairFail { slot, msg } => {
+                        crate::pair::failed(app, &slot, &proto::clean_name(&msg));
                     }
                     ToClient::Turn { turn } => {
                         lock().turn = (turn.port != 0).then_some(turn);
@@ -647,15 +932,23 @@ async fn session(
     };
     reader.abort();
     writer.abort();
-    {
+    let had_pair = {
         let mut g = lock();
         g.tx = None;
         g.peers.clear();
+        g.siblings.clear();
+        g.call_pins.clear();
+        let had_pair = g.pair.take().is_some();
         g.turn = None;
         g.rtt_ms = None;
         g.peer_rtt.clear();
         g.rtts_known = false;
         g.state = "off".into();
+        had_pair
+    };
+    // сервер забыл код вместе с соединением
+    if had_pair {
+        let _ = app.emit("safedrop-pair", serde_json::json!({"state": "error", "msg": "связь с сервером прервалась — получите новый код"}));
     }
     emit_status(app);
     result

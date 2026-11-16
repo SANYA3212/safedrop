@@ -3393,7 +3393,59 @@ function renderServer(st) {
   $("#srv-disconnect").disabled = !server;
   if (prevMode !== srv.mode) refreshMyIp();
   refreshSrvIce();
+  renderMyDevices();
 }
+// ---------- свои устройства (один аккаунт на ПК и телефоне) ----------
+const devFormName = (f) => f === "phone" ? "Телефон" : f === "desktop" ? "Компьютер" : "Устройство";
+function renderMyDevices() {
+  const live = srv.mode === "server" && srv.state === "online";
+  const sib = srv.siblings || [];
+  $("#srv-devs").innerHTML = !live ? "Подключись к серверу, чтобы видеть свои устройства"
+    : `<div class="srv-peer"><b>Это устройство</b><span class="muted">в сети</span></div>`
+      + (sib.length ? sib.map((d) => `<div class="srv-peer"><b>${esc(devFormName(d.form))}</b><span class="muted">в сети${d.ver ? " · " + esc(d.ver) : ""}</span></div>`).join("")
+        : `<div class="muted">Других своих устройств сейчас нет в сети</div>`);
+  const btn = $("#pair-start");
+  btn.disabled = !live || !srv.multi;
+  btn.title = live && !srv.multi ? "Сервер SafeDrop старой версии: обнови его, чтобы подключать устройства" : "";
+}
+let pairTimer = null, pairEnds = 0;
+// QR-код с тем же, что в коде, плюс адрес и пароль сервера: телефон сканирует
+// его в настройках. Текст — в data-text и событии; картинку рисует renderPairQr.
+function setPairQr(text) {
+  const box = $("#pair-qr");
+  if (!box) return;
+  box.dataset.text = text;
+  box.replaceChildren();
+  box.dispatchEvent(new CustomEvent("pair-qr", { detail: text }));
+}
+function pairStop(msg) {
+  if (pairTimer) { clearInterval(pairTimer); pairTimer = null; }
+  pairEnds = 0;
+  $("#pair-code").textContent = "";
+  setPairQr("");
+  $("#pair-status").textContent = msg || "";
+  $("#pair-box").classList.toggle("hidden", !msg);
+  $("#pair-cancel").textContent = "Закрыть";
+}
+async function pairStart(retry) {
+  try {
+    const r = await invoke("pair_start");
+    $("#pair-box").classList.remove("hidden");
+    $("#pair-code").textContent = r.code;
+    setPairQr(r.qr || "");
+    $("#pair-cancel").textContent = "Отмена";
+    pairEnds = Date.now() + (r.secs || 300) * 1000;
+    const tick = () => {
+      const left = Math.max(0, Math.round((pairEnds - Date.now()) / 1000));
+      if (!left) { invoke("pair_cancel").catch(() => {}); pairStop("Код устарел — нажми «Подключить телефон» ещё раз"); return; }
+      $("#pair-status").textContent = `Код действует ещё ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+    };
+    if (pairTimer) clearInterval(pairTimer);
+    pairTimer = setInterval(tick, 1000); tick();
+  } catch (e) { if (!retry && /занят/.test("" + e)) return pairStart(true); toast("" + e, true); }
+}
+$("#pair-start").onclick = () => pairStart(false);
+$("#pair-cancel").onclick = () => { invoke("pair_cancel").catch(() => {}); pairStop(""); };
 async function srvApply(mode) {
   const addr = $("#srv-addr").value.trim(), pass = $("#srv-pass").value;
   if (mode === "server" && !addr) { toast("Впиши адрес сервера", true); $("#srv-addr").focus(); renderServer(); return; }
@@ -6229,7 +6281,8 @@ try {
         return;
       }
       if (currentCall || groupCall || pendingOffer || callSetupPeer) {
-        await invoke("sig_send", { peerIp: ip, payload: { kind: "call-hangup", from: myNick() } }).catch(() => {});
+        // занят: busy — на другом своём устройстве звонок пусть звонит дальше
+        await invoke("sig_send", { peerIp: ip, payload: { kind: "call-hangup", from: myNick(), busy: true } }).catch(() => {});
         return;
       }
       pendingOffer = { ip, sdp, group };
@@ -6241,7 +6294,7 @@ try {
     }
     if (currentCall || groupCall || pendingOffer || callSetupPeer) {
       if (currentCall === ip) return;
-      await invoke("sig_send", { peerIp: ip, payload: { kind: "call-hangup", from: myNick() } }).catch(() => {});
+      await invoke("sig_send", { peerIp: ip, payload: { kind: "call-hangup", from: myNick(), busy: true } }).catch(() => {});
       return;
     }
     pendingOffer = { ip, sdp };
@@ -6324,6 +6377,38 @@ try {
   });
   await listen("safedrop-key-changed", (e) => onKeyChanged(e.payload || {}));
   await listen("safedrop-server", (e) => renderServer(e.payload));
+  await listen("safedrop-pair", (e) => {
+    const { state, msg } = e.payload || {};
+    if (state === "joining") {
+      if (pairTimer) { clearInterval(pairTimer); pairTimer = null; }
+      $("#pair-code").textContent = "";
+      setPairQr("");
+      $("#pair-status").textContent = "Новое устройство вводит код…";
+    } else if (state === "done") {
+      pairStop(`Подключено: ${msg || "новое устройство"}. История чатов сейчас перейдёт на него.`);
+      toast(`Подключено: ${esc(msg || "новое устройство")}`);
+    } else if (state === "error") {
+      if (/занят/.test(msg || "") && pairEnds) { pairStart(true); return; }
+      pairStop(`Не вышло: ${msg || "ошибка"}`);
+    }
+  });
+  // свой профиль поменяли на другом своём устройстве
+  await listen("safedrop-profile", (e) => {
+    if (!e.payload) return;
+    profile = e.payload;
+    $("#me-nick").textContent = profile.nickname || settings.device_name;
+    if ($("#set-nick") && document.activeElement !== $("#set-nick")) $("#set-nick").value = profile.nickname || "";
+    try { renderMyAvatar(); } catch {}
+  });
+  // звонок приняли или отклонили на другом своём устройстве — здесь не звонит
+  await listen("safedrop-call-elsewhere", (e) => {
+    const { ip, what } = e.payload || {};
+    if (!ip || pendingOffer?.ip !== ip) return;
+    pendingOffer = null;
+    $("#call-modal").classList.add("hidden");
+    ringbackStop();
+    toast(what === "call-answer" ? "Звонок принят на другом устройстве" : "Звонок отклонён на другом устройстве");
+  });
   loadServer();
   await listen("safedrop-linux-update-available", (e) => noteLinuxUpdate(e.payload));
   await listen("safedrop-update-offer", async (e) => {

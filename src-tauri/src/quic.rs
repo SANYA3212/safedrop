@@ -73,6 +73,26 @@ pub(crate) fn load_or_gen_cert(app_dir: &std::path::Path) -> Result<(Vec<u8>, Ve
     Ok((cert_der, key_der))
 }
 
+/// Заменить ключ устройства (вход в аккаунт по коду: ключ пришёл с другого
+/// своего устройства). Старый ключ сохраняется рядом (`*.old`), новый
+/// пишется во временный файл и подменяет старый целиком.
+pub(crate) fn install_cert(app_dir: &std::path::Path, cert_der: &[u8], key_der: &[u8]) -> Result<(), String> {
+    let (cert_path, key_path) = cert_paths(app_dir);
+    std::fs::create_dir_all(app_dir).map_err(|e| e.to_string())?;
+    for p in [&cert_path, &key_path] {
+        if p.is_file() {
+            let _ = std::fs::copy(p, p.with_extension("der.old"));
+        }
+    }
+    let put = |path: &PathBuf, data: &[u8]| -> Result<(), String> {
+        let tmp = path.with_extension("der.new");
+        std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    };
+    put(&key_path, key_der)?;
+    put(&cert_path, cert_der)
+}
+
 pub(crate) fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
@@ -359,6 +379,21 @@ pub async fn send_file_dual(
     // QUIC fallback on a whole-file operation was unsafe: the 5s wrapper
     // cancelled a valid TCP upload mid-stream, then tried UDP even when the
     // remote peer had no QUIC listener. File data therefore always uses TCP.
+    if kind == "file" {
+        // у контакта несколько устройств (ПК и телефон): файл — каждому, по очереди
+        if let crate::relay::Plan::All(devs) = crate::relay::plan(&peer_ip, "file") {
+            let mut res = Err("не отправлено".to_string());
+            for dev in devs {
+                let r = crate::relay::to_dev(dev, crate::transfer::send_file_to(
+                    app.clone(), peer_ip.clone(), tcp_port, file_path.clone(), device_name.clone(), kind.clone(), require_confirmation, version.clone(), sig.clone(),
+                )).await;
+                if r.is_ok() || res.is_err() {
+                    res = r;
+                }
+            }
+            return res;
+        }
+    }
     crate::transfer::send_file_to(
         app.clone(), peer_ip, tcp_port, file_path, device_name, kind, require_confirmation, version, sig,
     ).await

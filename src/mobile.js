@@ -89,6 +89,7 @@ function go(name) {
 }
 // «назад» сначала закрывает то, что открыто поверх экрана: меню, окно, экран звонка
 function closeTopmost() {
+  if (scanStop) { scanStop(); return true; }
   const ov = document.querySelector(".m-sheet-ov");
   if (ov) { ov.remove(); return true; }
   const shown = (sel) => { const n = $(sel); return n && !n.classList.contains("hidden") ? n : null; };
@@ -119,7 +120,7 @@ function buildLogin() {
   const box = el("div", { class: "m-login-box" });
   const addr = el("input", { id: "m-l-addr", placeholder: "IP сервера, например 203.0.113.5", autocomplete: "off", spellcheck: "false", inputmode: "url" });
   const pass = el("input", { id: "m-l-pass", type: "password", placeholder: "если сервер с паролем", autocomplete: "off" });
-  const code = el("input", { id: "m-l-code", placeholder: "код с компьютера (вкладка «Сервер» → Мой ID)", autocomplete: "off", spellcheck: "false" });
+  const code = el("input", { id: "m-l-code", placeholder: "1234-567890", autocomplete: "off", spellcheck: "false", inputmode: "numeric", maxlength: "13" });
   const nick = el("input", { id: "m-l-nick", placeholder: "как тебя будут видеть друзья", maxlength: "32" });
   const state = el("div", { id: "m-l-state" });
   const loginBtn = el("button", { id: "m-l-login", text: "Войти в свой аккаунт" });
@@ -131,7 +132,8 @@ function buildLogin() {
     el("label", {}, el("span", { text: "Адрес сервера" }), addr),
     el("label", {}, el("span", { text: "Пароль сервера" }), pass),
     el("div", { class: "m-sep", text: "есть SafeDrop на компьютере" }),
-    el("label", {}, el("span", { text: "Код устройства" }), code),
+    el("p", { class: "m-hint", text: "На компьютере: Настройки → Сервер → «Подключить телефон». Там появится код." }),
+    el("label", {}, el("span", { text: "Код с компьютера" }), code),
     loginBtn,
     el("div", { class: "m-sep", text: "или" }),
     el("label", {}, el("span", { text: "Ник" }), nick),
@@ -140,14 +142,8 @@ function buildLogin() {
   );
   const page = el("div", { id: "m-login" }, box);
   document.body.append(page);
-  loginBtn.onclick = () => {
-    const c = code.value.trim();
-    if (!c) { say("Впиши код устройства с компьютера", true); code.focus(); return; }
-    // Вход в аккаунт компьютера = одно и то же ID на двух устройствах сразу.
-    // Сейчас сервер держит одно подключение на ID, а сам ID — отпечаток ключа
-    // компьютера: по одному коду войти нельзя, иначе войдёт любой, кто код знает.
-    say("Вход в аккаунт компьютера будет в следующей версии: компьютер должен подтвердить телефон, а сервер — доставлять сообщения на оба устройства. Пока зайди новым аккаунтом.", true);
-  };
+  loginBtn.onclick = () => loginByCode(addr.value.trim(), pass.value, code.value.trim());
+  code.onkeydown = (e) => { if (e.key === "Enter") loginBtn.click(); };
   newBtn.onclick = () => createAccount(addr.value.trim(), pass.value, nick.value.trim());
   addr.onkeydown = (e) => { if (e.key === "Enter") pass.focus(); };
   return page;
@@ -174,6 +170,26 @@ function waitServer(ms) {
   });
 }
 let creating = false;
+// один аккаунт с компьютером: код с его экрана, ключ аккаунта приходит с него
+async function loginByCode(addr, pass, code) {
+  if (creating) return;
+  if (!addr) { say("Впиши адрес сервера — тот же, что на компьютере", true); $("#m-l-addr").focus(); return; }
+  if (!/^\d{4}[- ]?\d{3} ?\d{3}$/.test(code)) { say("Код — 10 цифр с экрана компьютера, например 1234-567890", true); $("#m-l-code").focus(); return; }
+  creating = true;
+  $("#m-l-login").disabled = true; $("#m-l-new").disabled = true;
+  say("Вхожу… подтверждаю код с компьютером");
+  try {
+    await invoke("pair_join", { addr, pass, code });
+    say("Готово! Переписка сейчас придёт с компьютера.", false, true);
+    await askNotifications();
+    setTimeout(() => location.reload(), 900);
+  } catch (e) {
+    say(String(e), true);
+  } finally {
+    creating = false;
+    for (const id of ["#m-l-login", "#m-l-new"]) { const b = $(id); if (b) b.disabled = false; }
+  }
+}
 async function createAccount(addr, pass, nick) {
   if (creating) return;
   if (!addr) { say("Впиши адрес сервера", true); $("#m-l-addr").focus(); return; }
@@ -228,6 +244,94 @@ async function askNotifications() {
     const granted = await invoke("plugin:notification|is_permission_granted");
     if (!granted) await invoke("plugin:notification|request_permission");
   } catch (e) { console.warn("notifications:", e); }
+}
+
+// ---------- QR-код с компьютера: вход в его аккаунт ----------
+// В QR: safedrop://pair?v=1&s=<адрес сервера>&p=<пароль сервера>&c=<код 1234-567890>
+let scanStop = null;
+function parsePairQR(text) {
+  let u;
+  try { u = new URL(String(text).trim()); } catch { return null; }
+  if (u.protocol !== "safedrop:" || !/pair/.test(u.host + u.pathname)) return null;
+  const q = u.searchParams;
+  const s = (q.get("s") || "").trim(), p = q.get("p") || "", c = (q.get("c") || "").trim();
+  if (!s || !/^\d{4}-?\d{6}$/.test(c)) return null;
+  return { addr: s, pass: p, code: c };
+}
+function loadJsQR() {
+  if (window.jsQR) return Promise.resolve(window.jsQR);
+  return new Promise((resolve, reject) => {
+    const s = el("script", { src: "vendor/jsQR.js" });
+    s.onload = () => (window.jsQR ? resolve(window.jsQR) : reject(new Error("сканер не загрузился")));
+    s.onerror = () => reject(new Error("сканер не загрузился"));
+    document.head.append(s);
+  });
+}
+async function qrDetector() {
+  // встроенный в WebView распознаватель (быстрее); нет его — jsQR
+  try {
+    if ("BarcodeDetector" in window && (await BarcodeDetector.getSupportedFormats()).includes("qr_code")) {
+      const bd = new BarcodeDetector({ formats: ["qr_code"] });
+      return async (canvas) => (await bd.detect(canvas))[0]?.rawValue || "";
+    }
+  } catch {}
+  const jsQR = await loadJsQR();
+  return async (canvas, ctx) => {
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    return jsQR(img.data, img.width, img.height, { inversionAttempts: "attemptBoth" })?.data || "";
+  };
+}
+async function scanQR() {
+  if (scanStop) return;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  } catch (e) { note("Нет доступа к камере: " + (e?.message || e)); return; }
+  let detect;
+  try { detect = await qrDetector(); } catch (e) { stream.getTracks().forEach((t) => t.stop()); note(String(e?.message || e)); return; }
+  const video = el("video", { playsinline: "", muted: "", autoplay: "" });
+  video.muted = true;
+  video.srcObject = stream;
+  const hint = el("div", { class: "m-scan-hint", text: "Наведи камеру на QR-код на экране компьютера" });
+  const ov = el("div", { id: "m-scan" }, video, el("div", { class: "m-scan-frame" }), hint,
+    el("button", { class: "m-scan-close", onclick: () => scanStop?.() }, ic("close")));
+  document.body.append(ov);
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  let alive = true, busy = false;
+  const stop = () => {
+    alive = false; scanStop = null;
+    clearInterval(timer);
+    stream.getTracks().forEach((t) => t.stop());
+    ov.remove();
+  };
+  scanStop = stop;
+  try { await video.play(); } catch {}
+  const timer = setInterval(async () => {
+    if (!alive || busy || !video.videoWidth) return;
+    busy = true;
+    try {
+      const k = Math.min(1, 800 / Math.max(video.videoWidth, video.videoHeight));
+      canvas.width = Math.round(video.videoWidth * k);
+      canvas.height = Math.round(video.videoHeight * k);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const text = await detect(canvas, ctx);
+      if (!alive || !text) return;
+      const pair = parsePairQR(text);
+      if (!pair) { hint.textContent = "Это не QR-код SafeDrop. Нужен код из «Подключить телефон» на компьютере"; return; }
+      stop();
+      await joinFromQR(pair);
+    } catch {} finally { busy = false; }
+  }, 250);
+}
+async function joinFromQR({ addr, pass, code }) {
+  if (!confirm(`Войти в аккаунт компьютера через сервер ${addr}?\n\nПереписка, которая сейчас на телефоне, заменится перепиской с компьютера.`)) return;
+  note("Вхожу… подтверждаю код с компьютером", 60000);
+  try {
+    await invoke("pair_join", { addr, pass, code });
+    note("Готово! Переписка сейчас придёт с компьютера.");
+    setTimeout(() => location.reload(), 900);
+  } catch (e) { note(String(e), 8000); }
 }
 
 // ---------- выбор файлов (WebView) → Rust по частям ----------
@@ -471,6 +575,12 @@ function buildSettings() {
   const title = el("b", { text: "Настройки" });
   const bar = el("div", { class: "m-bar", id: "m-bar-set" }, iconBtn("back", "Назад", () => history.back()), el("div", { class: "m-title" }, title));
   det.prepend(bar);
+  // самое видное место: войти в аккаунт компьютера по QR-коду с его экрана
+  const qr = el("div", { class: "card", id: "m-qr-card" },
+    el("button", { class: "primary m-qr-btn", id: "m-qr-scan", onclick: scanQR }, ic("qr"), el("span", { text: "Сканировать QR-код" })),
+    el("div", { class: "muted", text: "Один аккаунт с компьютером: на ПК — Настройки → Сервер → «Подключить телефон», и наведи камеру на QR-код." }),
+  );
+  det.insertBefore(qr, $(".settings-search"));
   // карточка аккаунта: ник, код на сервере, выход
   const card = el("div", { class: "card", id: "m-account" });
   det.insertBefore(card, $(".settings-search"));
@@ -496,8 +606,15 @@ function openSettings() {
   go("settings");
 }
 async function logout() {
-  if (!confirm("Выйти с сервера? Переписка останется на телефоне, при следующем входе на этот же сервер твой код не изменится.")) return;
   const st = await serverStatus();
+  if (st?.linked) {
+    // телефон вошёл в аккаунт компьютера: выход стирает с телефона ключ и переписку
+    if (!confirm("Выйти из аккаунта на этом телефоне? Переписка с телефона удалится — на компьютере она останется. Войти снова можно по новому коду с компьютера.")) return;
+    try { await invoke("factory_reset"); } catch (e) { note(String(e)); return; }
+    location.reload();
+    return;
+  }
+  if (!confirm("Выйти с сервера? Переписка останется на телефоне, при следующем входе на этот же сервер твой код не изменится.")) return;
   try { await invoke("server_configure", { mode: "p2p", addr: st?.addr || "", pass: st?.pass || "" }); } catch (e) { note(String(e)); return; }
   location.reload();
 }
