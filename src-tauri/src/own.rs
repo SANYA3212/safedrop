@@ -1144,7 +1144,8 @@ mod tests {
         let mut evil = msg("2", "g:x");
         evil.audio = "../../etc/passwd".into();
         let c = clean(evil, "/d").unwrap();
-        assert_eq!(c.audio, "/d/passwd");
+        // разделитель папок свой у каждой системы (на Windows — «\»)
+        assert_eq!(c.audio, std::path::Path::new("/d").join("passwd").to_string_lossy());
     }
 
     #[test]
