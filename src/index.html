@@ -6,7 +6,12 @@
 <title>SafeDrop</title>
 <link rel="stylesheet" href="styles.css" />
 <!-- Android: раскладка для телефона (mobile.css/mobile.js); на компьютере не включается -->
-<script>if (/Android/i.test(navigator.userAgent)) { document.documentElement.classList.add("mobile"); setTimeout(() => document.documentElement.classList.add("m-ready"), 15000); }</script>
+<script>if (/Android/i.test(navigator.userAgent)) {
+  document.documentElement.classList.add("mobile"); setTimeout(() => document.documentElement.classList.add("m-ready"), 15000);
+  // высота строки состояния и кнопок навигации (MainActivity.kt): окно на весь экран
+  window.__sdInsets = (v) => { const s = document.documentElement.style; for (const [k, n] of [["--sat", v.top], ["--sab", v.bottom]]) s.setProperty(k, (Math.max(0, Math.min(200, +n || 0))) + "px"); };
+  try { if (window.SdInsets) window.__sdInsets(JSON.parse(window.SdInsets.get())); } catch {}
+}</script>
 <link rel="stylesheet" href="mobile.css" />
 <style id="theme-tokens">:root {}</style>
 <style id="custom-css"></style>

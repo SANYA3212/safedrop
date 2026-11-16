@@ -316,3 +316,26 @@ html.mobile #voice-bar .vb-btns { flex: 0 0 auto; gap: 6px; }
 html.mobile :is(#vb-open, #vb-cam, #m-vb-flip, #vb-deaf, #vb-panel, #vb-screen) { display: none !important; }
 html.mobile #voice-bar .vb-btns button { width: 36px; height: 36px; border-radius: 50%; border: 0; background: rgba(0, 0, 0, .22); color: #fff; display: grid; place-items: center; padding: 0; }
 html.mobile #voice-bar .vb-btns button.danger, html.mobile #vb-hang { background: #e5484d; }
+
+/* ---------- окно на весь экран: строка состояния и кнопки навигации ----------
+   Системные панели прозрачные (MainActivity.kt), своих полос под ними нет:
+   шапки уходят под строку состояния, поле ввода и низ экранов — под кнопки.
+   --sat / --sab — высота панелей в CSS-пикселях (приходят из Android). */
+html.mobile { --m-top: var(--sat, 0px); --m-bot: var(--sab, 0px); }
+html.mobile :is(.m-bar, #conv-head) { padding-top: var(--m-top); height: calc(var(--m-bar) + var(--m-top)); min-height: calc(var(--m-bar) + var(--m-top)); }
+html.mobile #composer { padding-bottom: calc(6px + var(--m-bot)); }
+html.mobile #m-list { padding-bottom: calc(96px + var(--m-bot)); }
+html.mobile #m-fab { bottom: calc(22px + var(--m-bot)); }
+html.mobile #details { padding-bottom: calc(24px + var(--m-bot)); }
+html.mobile #chat-scroll-bottom { bottom: calc(74px + var(--m-bot)); }
+html.mobile #m-rec-lock { bottom: calc(64px + var(--m-bot)); }
+html.mobile .m-sheet { padding-bottom: calc(14px + var(--m-bot)); }
+html.mobile #m-note { bottom: calc(16px + var(--m-bot)); }
+html.mobile #toast { top: calc(10px + var(--m-top)); }
+html.mobile #call-panel { bottom: calc(8px + var(--m-bot)); }
+html.mobile .modal { max-height: calc(100% - 24px - var(--m-top) - var(--m-bot)); }
+html.mobile #m-login { padding-top: calc(28px + var(--m-top)); padding-bottom: calc(32px + var(--m-bot)); }
+html.mobile #call-screen .cs-top { padding-top: var(--m-top); height: calc(44px + var(--m-top)); flex-basis: calc(44px + var(--m-top)); }
+html.mobile #call-screen .cs-controls { bottom: calc(22px + var(--m-bot)); }
+html.mobile #m-scan .m-scan-hint { bottom: calc(40px + var(--m-bot)); }
+html.mobile #m-scan .m-scan-close { top: calc(14px + var(--m-top)); }

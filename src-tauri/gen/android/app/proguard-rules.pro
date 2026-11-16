@@ -27,3 +27,5 @@
 -keep class com.safedrop.app.ScreenArgs { *; }
 # nativeFrame / nativeStopped реализованы в Rust (mobile.rs) по имени класса
 -keep class com.safedrop.app.ScreenCaptureService { native <methods>; }
+# отступы от системных панелей читает страница (window.SdInsets.get, MainActivity.kt)
+-keepclassmembers class com.safedrop.app.MainActivity$Insets { @android.webkit.JavascriptInterface <methods>; }
