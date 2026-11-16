@@ -129,10 +129,15 @@ function buildLogin() {
     el("img", { class: "m-logo", src: "logo.png", alt: "" }),
     el("h1", { text: "SafeDrop" }),
     el("p", { text: "Чаты, файлы и звонки через твой сервер SafeDrop" }),
+    // есть SafeDrop на компьютере — проще всего войти по QR-коду с его экрана
+    el("button", { class: "primary m-qr-btn", id: "m-l-scan", onclick: () => scanQR((pair) => {
+      addr.value = pair.addr; pass.value = pair.pass; code.value = pair.code;
+      loginByCode(pair.addr, pair.pass, pair.code);
+    }) }, ic("qr"), el("span", { text: "Сканировать QR-код" })),
+    el("p", { class: "m-hint", text: "На компьютере: Настройки → Сервер → «Подключить телефон», и наведи камеру на QR-код. Или впиши всё вручную:" }),
     el("label", {}, el("span", { text: "Адрес сервера" }), addr),
     el("label", {}, el("span", { text: "Пароль сервера" }), pass),
     el("div", { class: "m-sep", text: "есть SafeDrop на компьютере" }),
-    el("p", { class: "m-hint", text: "На компьютере: Настройки → Сервер → «Подключить телефон». Там появится код." }),
     el("label", {}, el("span", { text: "Код с компьютера" }), code),
     loginBtn,
     el("div", { class: "m-sep", text: "или" }),
@@ -176,7 +181,7 @@ async function loginByCode(addr, pass, code) {
   if (!addr) { say("Впиши адрес сервера — тот же, что на компьютере", true); $("#m-l-addr").focus(); return; }
   if (!/^\d{4}[- ]?\d{3} ?\d{3}$/.test(code)) { say("Код — 10 цифр с экрана компьютера, например 1234-567890", true); $("#m-l-code").focus(); return; }
   creating = true;
-  $("#m-l-login").disabled = true; $("#m-l-new").disabled = true;
+  for (const id of ["#m-l-login", "#m-l-new", "#m-l-scan"]) { const b = $(id); if (b) b.disabled = true; }
   say("Вхожу… подтверждаю код с компьютером");
   try {
     await invoke("pair_join", { addr, pass, code });
@@ -187,7 +192,7 @@ async function loginByCode(addr, pass, code) {
     say(String(e), true);
   } finally {
     creating = false;
-    for (const id of ["#m-l-login", "#m-l-new"]) { const b = $(id); if (b) b.disabled = false; }
+    for (const id of ["#m-l-login", "#m-l-new", "#m-l-scan"]) { const b = $(id); if (b) b.disabled = false; }
   }
 }
 async function createAccount(addr, pass, nick) {
@@ -281,8 +286,10 @@ async function qrDetector() {
     return jsQR(img.data, img.width, img.height, { inversionAttempts: "attemptBoth" })?.data || "";
   };
 }
-async function scanQR() {
+// onPair — что делать с прочитанным кодом (по умолчанию — войти из настроек)
+async function scanQR(onPair) {
   if (scanStop) return;
+  const done = typeof onPair === "function" ? onPair : joinFromQR;
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
@@ -320,7 +327,7 @@ async function scanQR() {
       const pair = parsePairQR(text);
       if (!pair) { hint.textContent = "Это не QR-код SafeDrop. Нужен код из «Подключить телефон» на компьютере"; return; }
       stop();
-      await joinFromQR(pair);
+      await done(pair);
     } catch {} finally { busy = false; }
   }, 250);
 }
