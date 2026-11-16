@@ -851,6 +851,12 @@ export const mobileApi = {
   voiceStop: (discard) => stopVoiceRecording(discard),
   voiceRecording: () => voiceRecorder?.state === "recording",
   voiceStarting: () => voiceStarting,
+  // демонстрация экрана с телефона: источник потока и остановка
+  setScreenSource: (fn) => { phoneScreenSource = fn; },
+  stopScreenShares: async () => {
+    for (const [id, s] of Object.entries(myShares)) if (s.kind !== "camera") await stopShare(id);
+    updateScreenBtn();
+  },
   // перевернуть камеру: в звонке — сразу, иначе — следующее включение
   flipCamera: async () => {
     camFacing = camFacing === "environment" ? "user" : "environment";
@@ -4218,6 +4224,7 @@ function shareTargets() {
   if (selectedIp) return [selectedIp];
   return [];
 }
+let phoneScreenSource = null; // Android: () => Promise<MediaStream> (mobile.js)
 async function startScreen() {
   if (noRtc()) return;
   const screens = Object.entries(myShares).filter(([, s]) => s.kind !== "camera");
@@ -4225,6 +4232,16 @@ async function startScreen() {
     if (!await askConfirm("Остановить все свои демонстрации?", "", "Остановить")) return;
     for (const [id] of screens) await stopShare(id);
     updateScreenBtn(); return;
+  }
+  // Android: WebView не захватывает экран — поток даёт телефон (mobile.js)
+  if (phoneScreenSource) {
+    let phoneStream = null;
+    try { phoneStream = await phoneScreenSource(); }
+    catch (e) { return toast("Демонстрация отменена: " + (e?.message || e), true); }
+    if (!phoneStream) return;
+    await startShareStream(phoneStream, `Экран • ${myNick()}`, false, "screen", "no-audio-android");
+    updateScreenBtn();
+    return;
   }
   const q = shareQ();
   const videoC = { width: { max: q.w }, height: { max: q.h }, frameRate: { max: q.fps } };

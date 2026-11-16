@@ -9,6 +9,9 @@
     <!-- уведомления о сообщениях (Android 13+ спрашивает при входе) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- демонстрация экрана: запись экрана идёт в службе с уведомлением -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- полученные файлы — в «Загрузки/SafeDrop»; на Android 10+ разрешение не нужно -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -37,6 +40,11 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+          android:name=".ScreenCaptureService"
+          android:exported="false"
+          android:foregroundServiceType="mediaProjection" />
 
         <provider
           android:name="androidx.core.content.FileProvider"

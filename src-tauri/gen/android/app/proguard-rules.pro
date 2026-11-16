@@ -24,3 +24,6 @@
 -keep class com.safedrop.app.SdAndroidPlugin { *; }
 -keep class com.safedrop.app.UrlArgs { *; }
 -keep class com.safedrop.app.FileArgs { *; }
+-keep class com.safedrop.app.ScreenArgs { *; }
+# nativeFrame / nativeStopped реализованы в Rust (mobile.rs) по имени класса
+-keep class com.safedrop.app.ScreenCaptureService { native <methods>; }

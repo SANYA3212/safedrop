@@ -640,6 +640,77 @@ function registerAttachMenu() {
   }, true);
 }
 
+// ---------- демонстрация экрана ----------
+// Экран снимает Android (ScreenCaptureService.kt), кадры приходят событием
+// safedrop-screen-frame (JPEG). Из них — видеодорожка, которую app.js шлёт как
+// обычную демонстрацию. MediaStreamTrackGenerator пишет кадры без отрисовки
+// на экране и работает, пока SafeDrop в фоне; холст — запасной путь.
+const SCREEN_FPS = 12;
+let screenSession = null;
+function b64ToBlob(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: "image/jpeg" });
+}
+async function startPhoneScreen() {
+  if (screenSession) return null;
+  await invoke("m_screen_start", { fps: SCREEN_FPS, max: 1280 }); // отказ — исключение
+  let track, draw;
+  if (typeof window.MediaStreamTrackGenerator === "function" && typeof window.VideoFrame === "function") {
+    const gen = new MediaStreamTrackGenerator({ kind: "video" });
+    const writer = gen.writable.getWriter();
+    const t0 = performance.now();
+    track = gen;
+    draw = async (bmp) => {
+      const frame = new VideoFrame(bmp, { timestamp: Math.round((performance.now() - t0) * 1000) });
+      try { await writer.write(frame); } finally { frame.close(); }
+    };
+  } else {
+    const canvas = el("canvas");
+    canvas.width = 720; canvas.height = 1280;
+    const ctx = canvas.getContext("2d");
+    track = canvas.captureStream(SCREEN_FPS).getVideoTracks()[0];
+    draw = async (bmp) => {
+      if (canvas.width !== bmp.width || canvas.height !== bmp.height) { canvas.width = bmp.width; canvas.height = bmp.height; }
+      ctx.drawImage(bmp, 0, 0);
+    };
+  }
+  const session = { alive: true, unlisten: null };
+  screenSession = session;
+  const stopNative = () => {
+    if (!session.alive) return;
+    session.alive = false;
+    if (screenSession === session) screenSession = null;
+    session.unlisten?.();
+    invoke("m_screen_stop").catch(() => {});
+  };
+  // app.js заканчивает показ через track.stop() — тогда и Android перестаёт снимать
+  const origStop = track.stop.bind(track);
+  track.stop = () => { stopNative(); origStop(); };
+  session.unlisten = await listen("safedrop-screen-frame", async (e) => {
+    const f = e.payload;
+    try {
+      if (session.alive && f?.data) {
+        const bmp = await createImageBitmap(b64ToBlob(f.data));
+        try { await draw(bmp); } finally { bmp.close(); }
+      }
+    } catch (err) {
+      console.warn("screen frame:", err);
+    } finally {
+      invoke("m_screen_ack").catch(() => {});
+    }
+  });
+  invoke("m_screen_ack").catch(() => {});
+  return new MediaStream([track]);
+}
+function registerScreenShare() {
+  if (isDemo || !app?.setScreenSource) return;
+  app.setScreenSource(startPhoneScreen);
+  // показ остановили из уведомления Android или система его прервала
+  listen("safedrop-screen-stopped", () => { if (screenSession) app.stopScreenShares(); }).catch(() => {});
+}
+
 // ---------- полоска звонка ----------
 // Нажатие на полоску (не на кнопки) — вернуться на экран звонка, как в Telegram
 function registerCallBar() {
@@ -764,6 +835,7 @@ async function start() {
   registerCameraFlip();
   registerAttachMenu();
   registerCallBar();
+  registerScreenShare();
   decorate();
   refreshPreviews();
   if (loggedIn(st)) askNotifications();

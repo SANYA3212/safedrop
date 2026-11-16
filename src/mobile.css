@@ -206,8 +206,8 @@ html.mobile #call-screen .cs-sep { display: none; }
 /* ---------- чего на телефоне нет: P2P, Windows, совместный просмотр и браузер ---------- */
 html.mobile :is(#btn-add, #btn-scan, #btn-details, #me-update, #btn-screen, #sec-net, #srv-disconnect, #btn-notif-win,
   #btn-open-loaddrop2, #btn-move-loaddrop2, #win11-menu-row, #btn-ctx-refresh, #upd-gh-status, #updates-pane,
-  #linux-update-info, #update-modal, #watch-modal, #vb-watch, #vb-wt-play, #vb-browser, #vb-web, #vb-screen,
-  #cs-screen, #cs-browser, #cs-web, #cs-yt, #cs-wt-play) { display: none !important; }
+  #linux-update-info, #update-modal, #watch-modal, #vb-watch, #vb-wt-play, #vb-browser, #vb-web,
+  #cs-browser, #cs-web, #cs-yt, #cs-wt-play) { display: none !important; }
 html.mobile #sec-server .card:has(#srv-mode-p2p),
 html.mobile #sec-call .card:has(#set-ptt),
 html.mobile label:has(> #set-autostart),
@@ -302,6 +302,6 @@ html.mobile #vb-text { flex: 1; min-width: 0; font-size: 14.5px; white-space: no
 html.mobile #vb-text::after { content: " · нажми, чтобы вернуться"; font-weight: 400; opacity: .8; }
 html.mobile #vb-time { font-variant-numeric: tabular-nums; font-size: 13px; opacity: .9; }
 html.mobile #voice-bar .vb-btns { flex: 0 0 auto; gap: 6px; }
-html.mobile :is(#vb-open, #vb-cam, #m-vb-flip, #vb-deaf, #vb-panel) { display: none !important; }
+html.mobile :is(#vb-open, #vb-cam, #m-vb-flip, #vb-deaf, #vb-panel, #vb-screen) { display: none !important; }
 html.mobile #voice-bar .vb-btns button { width: 36px; height: 36px; border-radius: 50%; border: 0; background: rgba(0, 0, 0, .22); color: #fff; display: grid; place-items: center; padding: 0; }
 html.mobile #voice-bar .vb-btns button.danger, html.mobile #vb-hang { background: #e5484d; }

@@ -3187,6 +3187,9 @@ pub fn run() {
             #[cfg(target_os = "android")] mobile::m_stage_chunk,
             #[cfg(target_os = "android")] mobile::m_open_file,
             #[cfg(target_os = "android")] mobile::m_chat_previews,
+            #[cfg(target_os = "android")] mobile::m_screen_start,
+            #[cfg(target_os = "android")] mobile::m_screen_stop,
+            #[cfg(target_os = "android")] mobile::m_screen_ack,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SafeDrop");

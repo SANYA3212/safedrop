@@ -328,3 +328,79 @@ pub async fn m_open_file(app: AppHandle, state: tauri::State<'_, crate::state::A
         .map_err(|e| e.to_string())?
 }
 
+// ---------- демонстрация экрана ----------
+// Кадры снимает Android (ScreenCaptureService.kt) и отдаёт сюда JPEG-ами, а
+// отсюда они сразу уходят в страницу событием `safedrop-screen-frame`. Не по
+// таймеру страницы: пока показываешь другое приложение, SafeDrop в фоне, и
+// таймеры страницы Android замедляет до раза в секунду. Следующий кадр уходит,
+// только когда страница забрала прошлый (m_screen_ack), — иначе пропускается.
+
+static FRAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAME_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Кадр больше этого — не кадр экрана (страховка от мусора по JNI).
+const MAX_FRAME: usize = 4 * 1024 * 1024;
+
+#[no_mangle]
+pub extern "system" fn Java_com_safedrop_app_ScreenCaptureService_nativeFrame(
+    env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    data: jni::objects::JByteArray,
+    w: jni::sys::jint,
+    h: jni::sys::jint,
+) {
+    use std::sync::atomic::Ordering;
+    use tauri::Emitter;
+    if FRAME_BUSY.swap(true, Ordering::AcqRel) {
+        return; // страница ещё рисует прошлый кадр
+    }
+    let Some(app) = APP.get() else { FRAME_BUSY.store(false, Ordering::Release); return };
+    let jpeg = match env.convert_byte_array(&data) {
+        Ok(j) if !j.is_empty() && j.len() <= MAX_FRAME && w > 0 && h > 0 => j,
+        _ => { FRAME_BUSY.store(false, Ordering::Release); return; }
+    };
+    use base64::Engine;
+    let seq = FRAME_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let payload = serde_json::json!({
+        "seq": seq, "w": w, "h": h,
+        "data": base64::engine::general_purpose::STANDARD.encode(&jpeg),
+    });
+    if app.emit("safedrop-screen-frame", payload).is_err() {
+        FRAME_BUSY.store(false, Ordering::Release);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_safedrop_app_ScreenCaptureService_nativeStopped(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+) {
+    FRAME_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    if let Some(app) = APP.get() {
+        use tauri::Emitter;
+        let _ = app.emit("safedrop-screen-stopped", ());
+    }
+}
+
+/// Начать показ экрана: Android спросит разрешение, потом запустит службу.
+#[tauri::command]
+pub async fn m_screen_start(app: AppHandle, fps: u32, max: u32) -> Result<(), String> {
+    FRAME_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    let args = serde_json::json!({ "fps": fps.clamp(1, 30), "max": max.clamp(320, 1920) });
+    tokio::task::spawn_blocking(move || run_native(&app, "startScreenCapture", args))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn m_screen_stop(app: AppHandle) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || run_native(&app, "stopScreenCapture", serde_json::json!({})))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Страница нарисовала кадр — можно слать следующий.
+#[tauri::command]
+pub fn m_screen_ack() {
+    FRAME_BUSY.store(false, std::sync::atomic::Ordering::Release);
+}
