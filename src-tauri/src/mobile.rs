@@ -131,7 +131,9 @@ pub fn init(app: &AppHandle) {
 pub fn notify(title: &str, body: &str) {
     use tauri_plugin_notification::NotificationExt;
     if let Some(app) = APP.get() {
-        if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        // значок — res/drawable/ic_notification.xml (настроек у плагина в Rust нет:
+        // `plugins.notification` в tauri.conf ломает запуск)
+        if let Err(e) = app.notification().builder().title(title).body(body).icon("ic_notification").show() {
             eprintln!("SafeDrop notify failed: {e}");
         }
     }

@@ -9,11 +9,5 @@
   },
   "bundle": {
     "resources": []
-  },
-  "plugins": {
-    "notification": {
-      "icon": "ic_notification",
-      "iconColor": "#5B8CFF"
-    }
   }
 }
