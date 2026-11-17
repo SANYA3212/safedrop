@@ -3073,8 +3073,9 @@ function incomingRingtoneStart() {
   ringbackStop();
   incomingRingtoneStop();
   if (!settings?.sound) return;
-  // телефон, окно не на экране: звонит уведомление Android (CallNotifier), не страница
-  try { if (window.SdInsets?.shown && !window.SdInsets.shown()) return; } catch {}
+  // телефон: звонит сам Android (мелодия вызова и вибрация, CallNotifier.kt) —
+  // звук страницы на Android ненадёжен и звонил бы вдвоём
+  if (window.SdInsets) return;
   if (settings.ringtone) {
     try {
       const a = incomingRingAudio = new Audio(tauriFile(settings.ringtone));

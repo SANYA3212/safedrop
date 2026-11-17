@@ -8,37 +8,43 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.Ringtone
 import android.media.RingtoneManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 
-// Входящий звонок, когда окна SafeDrop не видно (свёрнуто, закрыто, экран
-// заблокирован): уведомление со звонком на весь экран, как в Telegram, —
-// «Ответить» открывает SafeDrop и принимает звонок, «Отклонить» сбрасывает.
-// Вызывает Rust (mobile.rs) через JNI; сам звонок принимает страница.
+// Входящий звонок на телефоне. Звонит сам Android, как у Telegram: мелодия
+// вызова телефона и вибрация (Ringer) — и когда SafeDrop открыт, и когда
+// закрыт. Пока окна SafeDrop не видно (свёрнуто, закрыто, экран
+// заблокирован), ещё и уведомление на весь экран: «Ответить» открывает
+// SafeDrop и принимает звонок, «Отклонить» сбрасывает. Само уведомление
+// беззвучное — звук только от Ringer (каналы уведомлений Xiaomi часто глушит).
+// Вызывает Rust (mobile.rs) через JNI и сторож (KeepAliveService.kt).
 object CallNotifier {
-  const val CHANNEL = "safedrop_calls_v1"
+  const val CHANNEL = "safedrop_calls_v2"
+  private const val OLD_CHANNEL = "safedrop_calls_v1"
   const val MISSED_CHANNEL = "safedrop_missed"
   const val EXTRA_IP = "sd_call_ip"
   const val EXTRA_ANSWER = "sd_call_answer"
   const val ACTION_DECLINE = "com.safedrop.app.DECLINE"
+  const val ACTION_STOP_RING = "com.safedrop.app.STOP_RING"
   private const val NOTIFICATION_ID = 4713
   private const val MISSED_ID = 4714
 
   private fun channels(ctx: Context) {
     if (Build.VERSION.SDK_INT < 26) return
     val nm = ctx.getSystemService(NotificationManager::class.java)
+    if (nm.getNotificationChannel(OLD_CHANNEL) != null) nm.deleteNotificationChannel(OLD_CHANNEL)
     if (nm.getNotificationChannel(CHANNEL) == null) {
       val ch = NotificationChannel(CHANNEL, "Входящие звонки", NotificationManager.IMPORTANCE_HIGH)
-      ch.description = "Звонок, когда SafeDrop закрыт или экран заблокирован"
-      ch.setSound(
-        RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
-        AudioAttributes.Builder()
-          .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-          .build()
-      )
-      ch.enableVibration(true)
-      ch.vibrationPattern = longArrayOf(0, 800, 600, 800, 600, 800)
+      ch.description = "Звонок на весь экран, когда SafeDrop закрыт или экран заблокирован"
+      ch.setSound(null, null)
+      ch.enableVibration(false)
       ch.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
       nm.createNotificationChannel(ch)
     }
@@ -47,9 +53,10 @@ object CallNotifier {
     }
   }
 
+  /** Звонок: звонит всегда; уведомление — только если окна SafeDrop не видно. */
   @JvmStatic
   fun show(ctx: Context, ip: String, title: String, text: String) {
-    // окно на экране — звонит сама страница
+    Ringer.start(ctx)
     if (MainActivity.onScreen) return
     channels(ctx)
     val open = Intent(ctx, MainActivity::class.java)
@@ -80,20 +87,23 @@ object CallNotifier {
     if (Build.VERSION.SDK_INT < 26) {
       @Suppress("DEPRECATION")
       b.setPriority(Notification.PRIORITY_MAX)
-        .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE))
     }
-    val n = b.build()
-    n.flags = n.flags or Notification.FLAG_INSISTENT // звонит, пока не ответят
     try {
-      ctx.getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, n)
+      ctx.getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, b.build())
     } catch (e: SecurityException) {
-      // нет разрешения на уведомления
+      // нет разрешения на уведомления — звонит хотя бы Ringer
     }
   }
 
+  /** Звонок кончился (ответили, отклонили, сбросили): тихо — здесь и у сторожа. */
   @JvmStatic
   fun cancel(ctx: Context) {
+    Ringer.stop(ctx)
     ctx.getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
+    // сторож (`:watch`) мог звонить в своём процессе
+    try {
+      ctx.sendBroadcast(Intent(ctx, CallActionReceiver::class.java).setAction(ACTION_STOP_RING))
+    } catch (e: Exception) {}
   }
 
   @JvmStatic
@@ -120,17 +130,84 @@ object CallNotifier {
   }
 }
 
-/// «Отклонить» в уведомлении звонка. Работает в процессе сторожа (`:watch`):
-/// отказ уходит звонящему через сервер, даже если SafeDrop закрыт.
+/** Мелодия вызова телефона и вибрация — пока звонок ждёт ответа (не дольше минуты). */
+object Ringer {
+  private var ringtone: Ringtone? = null
+  private var vibrator: Vibrator? = null
+  private val main = Handler(Looper.getMainLooper())
+  private val timeout = Runnable { stopNow() }
+
+  @JvmStatic
+  @Synchronized
+  fun start(ctx: Context) {
+    stopNow()
+    val am = ctx.getSystemService(AudioManager::class.java)
+    val mode = am?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
+    // режим «Без звука» уважаем, «Вибрация» — только вибрируем
+    if (mode == AudioManager.RINGER_MODE_NORMAL) {
+      try {
+        val uri = RingtoneManager.getActualDefaultRingtoneUri(ctx, RingtoneManager.TYPE_RINGTONE)
+          ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+        val r = RingtoneManager.getRingtone(ctx.applicationContext, uri)
+        if (r != null) {
+          r.audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+          if (Build.VERSION.SDK_INT >= 28) r.isLooping = true
+          r.play()
+          ringtone = r
+        }
+      } catch (e: Exception) {}
+    }
+    if (mode != AudioManager.RINGER_MODE_SILENT) {
+      try {
+        val v = if (Build.VERSION.SDK_INT >= 31) {
+          ctx.getSystemService(VibratorManager::class.java)?.defaultVibrator
+        } else {
+          @Suppress("DEPRECATION") ctx.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
+        val pattern = longArrayOf(0, 800, 600, 800, 1400)
+        if (v != null && v.hasVibrator()) {
+          if (Build.VERSION.SDK_INT >= 26) v.vibrate(VibrationEffect.createWaveform(pattern, 0))
+          else @Suppress("DEPRECATION") v.vibrate(pattern, 0)
+          vibrator = v
+        }
+      } catch (e: Exception) {}
+    }
+    main.postDelayed(timeout, 60_000)
+  }
+
+  @JvmStatic
+  fun stop(ctx: Context) = stopNow()
+
+  @Synchronized
+  private fun stopNow() {
+    main.removeCallbacks(timeout)
+    try { ringtone?.stop() } catch (e: Exception) {}
+    ringtone = null
+    try { vibrator?.cancel() } catch (e: Exception) {}
+    vibrator = null
+  }
+}
+
+/// «Отклонить» в уведомлении звонка и «замолчать» от процесса SafeDrop.
+/// Работает в процессе сторожа (`:watch`): отказ уходит звонящему через
+/// сервер, даже если SafeDrop закрыт.
 class CallActionReceiver : BroadcastReceiver() {
   override fun onReceive(ctx: Context, intent: Intent) {
-    if (intent.action != CallNotifier.ACTION_DECLINE) return
-    CallNotifier.cancel(ctx)
-    val ip = intent.getStringExtra(CallNotifier.EXTRA_IP) ?: return
-    val done = goAsync()
-    Thread {
-      try { RingWatcher.decline(ip) } catch (e: Throwable) {}
-      done.finish()
-    }.start()
+    when (intent.action) {
+      CallNotifier.ACTION_STOP_RING -> Ringer.stop(ctx)
+      CallNotifier.ACTION_DECLINE -> {
+        Ringer.stop(ctx)
+        CallNotifier.cancel(ctx)
+        val ip = intent.getStringExtra(CallNotifier.EXTRA_IP) ?: return
+        val done = goAsync()
+        Thread {
+          try { RingWatcher.decline(ip) } catch (e: Throwable) {}
+          done.finish()
+        }.start()
+      }
+    }
   }
 }

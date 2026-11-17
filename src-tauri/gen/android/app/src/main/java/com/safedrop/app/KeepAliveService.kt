@@ -146,6 +146,12 @@ class RingWatcher(private val ctx: Context) {
       } ?: false
     }
 
+    /** Уведомление о звонке уже висит (его показал сам SafeDrop). */
+    fun callShown(ctx: Context): Boolean = try {
+      ctx.getSystemService(android.app.NotificationManager::class.java)
+        ?.activeNotifications?.any { it.id == 4713 } ?: false
+    } catch (e: Exception) { false }
+
     fun killMainProcess(ctx: Context) {
       val am = ctx.getSystemService(ActivityManager::class.java) ?: return
       am.runningAppProcesses?.filter { it.processName == ctx.packageName }?.forEach { Process.killProcess(it.pid) }
@@ -156,7 +162,7 @@ class RingWatcher(private val ctx: Context) {
   @Volatile private var out: OutputStream? = null
   @Volatile private var lastPing = 0L
   private var thread: Thread? = null
-  private var ringingFrom = ""
+  @Volatile private var ringingFrom = ""
   private var ringingName = ""
 
   fun start() {
@@ -273,11 +279,15 @@ class RingWatcher(private val ctx: Context) {
     val who = name.filter { !it.isISOControl() }.take(64).ifBlank { "SafeDrop" }
     when (state) {
       "" -> {
-        // SafeDrop на экране — звонит сам; иначе — уведомление на весь экран
-        if (mainOnScreen(ctx)) return
         ringingFrom = from
         ringingName = who
-        CallNotifier.show(ctx, ip, who, "Входящий звонок")
+        // сам SafeDrop жив и звонок получил — звонит он; сторож — только если
+        // его нет (смахнули, система закрыла): ждём, успел ли он показать звонок
+        Thread {
+          try { Thread.sleep(2_500) } catch (e: InterruptedException) { return@Thread }
+          if (ringingFrom != from || mainOnScreen(ctx) || callShown(ctx)) return@Thread
+          CallNotifier.show(ctx, ip, who, "Входящий звонок")
+        }.start()
       }
       "stop" -> if (ringingFrom == from) {
         ringingFrom = ""
