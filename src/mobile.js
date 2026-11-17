@@ -251,6 +251,52 @@ async function askNotifications() {
   } catch (e) { console.warn("notifications:", e); }
 }
 
+// ---------- звонки и сообщения, когда приложение закрыто ----------
+// Пока выполнен вход, работает служба «SafeDrop на связи» (KeepAliveService):
+// окно можно закрыть, а звонок придёт уведомлением на весь экран. Звонок,
+// пришедший без страницы, она забирает при открытии (m_replay_call).
+function answerWhenReady(ip) {
+  let n = 0;
+  const t = setInterval(() => {
+    const cur = app?.pendingIp?.() || "";
+    if (cur && (!ip || cur === ip)) { clearInterval(t); $("#cm-accept")?.click(); }
+    else if (++n > 50) clearInterval(t);
+  }, 150);
+}
+async function registerBackgroundCalls(st) {
+  if (isDemo || !loggedIn(st)) return;
+  invoke("m_keep_alive", { on: true }).catch((e) => console.warn("keep-alive:", e));
+  listen("safedrop-answer-call", (e) => answerWhenReady(e.payload?.ip || "")).catch(() => {});
+  // окно снова на экране, а звонок ещё звонит — теперь звонит страница
+  const ring = () => { if (!document.hidden) app?.ringIfPending?.(); };
+  document.addEventListener("visibilitychange", ring);
+  window.addEventListener("focus", ring);
+  try { if (await invoke("m_replay_call")) answerWhenReady(""); } catch {}
+  ring();
+}
+function batteryCard() {
+  const state = el("div", { class: "muted", text: "" });
+  const btn = el("button", { text: "Разрешить работу в фоне", onclick: async () => {
+    try { await invoke("m_battery", { open: true }); } catch (e) { note(String(e)); }
+    setTimeout(fill, 1500);
+  } });
+  const card = el("div", { class: "card", id: "m-bg-card" },
+    el("b", { text: "Звонки, когда приложение закрыто" }),
+    el("div", { class: "muted", text: "SafeDrop остаётся на связи в фоне (уведомление «SafeDrop на связи»): звонок приходит, даже если окно закрыто или телефон заблокирован. Чтобы Android его не выключал, разреши работу без ограничений батареи. На Xiaomi ещё: Настройки → Приложения → SafeDrop → «Автозапуск» — включить, «Контроль активности» — «Нет ограничений»." }),
+    state, btn,
+  );
+  async function fill() {
+    if (isDemo) return;
+    try {
+      const free = await invoke("m_battery", { open: false });
+      state.textContent = free ? "Батарея: без ограничений ✓" : "Батарея: Android может выключать SafeDrop в фоне";
+      btn.classList.toggle("hidden", !!free);
+    } catch {}
+  }
+  card.addEventListener("m-open", fill);
+  return card;
+}
+
 // ---------- QR-код с компьютера: вход в его аккаунт ----------
 // В QR: safedrop://pair?v=1&s=<адрес сервера>&p=<пароль сервера>&c=<код 1234-567890>
 let scanStop = null;
@@ -588,6 +634,9 @@ function buildSettings() {
     el("div", { class: "muted", text: "Один аккаунт с компьютером: на ПК — Настройки → Сервер → «Подключить телефон», и наведи камеру на QR-код." }),
   );
   det.insertBefore(qr, $(".settings-search"));
+  const bg = batteryCard();
+  det.insertBefore(bg, $(".settings-search"));
+  det.addEventListener("m-open", () => bg.dispatchEvent(new Event("m-open")));
   // карточка аккаунта: ник, код на сервере, выход
   const card = el("div", { class: "card", id: "m-account" });
   det.insertBefore(card, $(".settings-search"));
@@ -617,11 +666,13 @@ async function logout() {
   if (st?.linked) {
     // телефон вошёл в аккаунт компьютера: выход стирает с телефона ключ и переписку
     if (!confirm("Выйти из аккаунта на этом телефоне? Переписка с телефона удалится — на компьютере она останется. Войти снова можно по новому коду с компьютера.")) return;
+    await invoke("m_keep_alive", { on: false }).catch(() => {});
     try { await invoke("factory_reset"); } catch (e) { note(String(e)); return; }
     location.reload();
     return;
   }
   if (!confirm("Выйти с сервера? Переписка останется на телефоне, при следующем входе на этот же сервер твой код не изменится.")) return;
+  await invoke("m_keep_alive", { on: false }).catch(() => {});
   try { await invoke("server_configure", { mode: "p2p", addr: st?.addr || "", pass: st?.pass || "" }); } catch (e) { note(String(e)); return; }
   location.reload();
 }
@@ -963,6 +1014,7 @@ async function start() {
   decorate();
   refreshPreviews();
   if (loggedIn(st)) askNotifications();
+  registerBackgroundCalls(st);
   for (const ev of ["safedrop-chat", "safedrop-chat-changed", "safedrop-chat-ack", "safedrop-peers"]) {
     listen(ev, () => refreshPreviews()).catch(() => {});
   }

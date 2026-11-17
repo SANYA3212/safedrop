@@ -841,6 +841,9 @@ export function closeChat() {
 }
 export const mobileApi = {
   closeChat,
+  // звонок, который сейчас звонит (ждёт «Принять» / «Отклонить»)
+  pendingIp: () => pendingOffer?.ip || "",
+  ringIfPending: () => { if (pendingOffer && !incomingRingAudio && !incomingRingTimer) incomingRingtoneStart(); },
   openKey: () => curKey() || "",
   isGroupOpen: () => !!selGroup,
   unreadOf: (key) => unread[key] || 0,
@@ -3070,6 +3073,8 @@ function incomingRingtoneStart() {
   ringbackStop();
   incomingRingtoneStop();
   if (!settings?.sound) return;
+  // телефон, окно не на экране: звонит уведомление Android (CallNotifier), не страница
+  try { if (window.SdInsets?.shown && !window.SdInsets.shown()) return; } catch {}
   if (settings.ringtone) {
     try {
       const a = incomingRingAudio = new Audio(tauriFile(settings.ringtone));

@@ -3228,7 +3228,18 @@ pub fn run() {
             #[cfg(target_os = "android")] mobile::m_screen_start,
             #[cfg(target_os = "android")] mobile::m_screen_stop,
             #[cfg(target_os = "android")] mobile::m_screen_ack,
+            #[cfg(target_os = "android")] mobile::m_replay_call,
+            #[cfg(target_os = "android")] mobile::m_keep_alive,
+            #[cfg(target_os = "android")] mobile::m_battery,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running SafeDrop");
+        .build(tauri::generate_context!())
+        .expect("error while running SafeDrop")
+        .run(|_app, _event| {
+            // телефон: закрыли окно (смахнули, «назад») — SafeDrop остаётся на
+            // связи в фоне (KeepAliveService), окно потом создаётся заново
+            #[cfg(target_os = "android")]
+            if let tauri::RunEvent::ExitRequested { code: None, api, .. } = &_event {
+                api.prevent_exit();
+            }
+        });
 }

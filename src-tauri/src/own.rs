@@ -665,6 +665,9 @@ pub async fn serve(app: AppHandle, sock: crate::tls::Stream, dev: String) -> Res
         OwnFrame::Profile { profile } => apply_profile(&app, profile).await,
         OwnFrame::Call { peer, what } => {
             if crate::relay::is_relay(&peer) && (what == "call-answer" || what == "call-hangup") {
+                // ответили или отклонили на другом своём устройстве: здесь не звонить
+                #[cfg(target_os = "android")]
+                crate::mobile::call_gone(&peer, false);
                 let _ = app.emit("safedrop-call-elsewhere", serde_json::json!({"ip": peer, "what": what}));
             }
         }

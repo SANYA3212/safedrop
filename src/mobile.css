@@ -161,7 +161,8 @@ html.mobile #call-stage { margin: 6px 10px 0; max-height: 34vh; }
 /* ---------- настройки и профиль ---------- */
 html.mobile #details > :not(.m-bar) { margin: 8px 12px 0; }
 html.mobile body.m-settings :is(#peer-card, #rc-key) { display: none; }
-html.mobile body.m-profile :is(.settings-search, #settings-acc, #m-account, #m-qr-card) { display: none; }
+html.mobile body.m-profile :is(.settings-search, #settings-acc, #m-account, #m-qr-card, #m-bg-card) { display: none; }
+html.mobile #m-bg-card { display: flex; flex-direction: column; gap: 8px; }
 /* сканер QR-кода с компьютера — первым в настройках */
 html.mobile #m-qr-card { display: flex; flex-direction: column; gap: 8px; }
 html.mobile .m-qr-btn { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; min-height: 52px; font-size: 17px; font-weight: 600; }

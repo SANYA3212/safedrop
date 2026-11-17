@@ -843,16 +843,33 @@ pub(crate) async fn process_frame(
         Frame::CallOffer { from, sdp, group } => {
             // у звонящего несколько устройств: отвечать тому, с которого звонят
             crate::relay::pin_call(&ip);
-            let _ = app.emit("safedrop-call-offer", serde_json::json!({"from": from, "ip": ip, "sdp": sdp, "group": group}));
-            let av = state.peers.lock().await.get(&ip).map(|p| p.display_avatar());
-            let icon = av.and_then(|a| avatar_icon_path(&state.app_dir, &ip, &a));
+            let offer = serde_json::json!({"from": from, "ip": ip, "sdp": sdp, "group": group});
+            let _ = app.emit("safedrop-call-offer", offer.clone());
             let title = match &group {
                 Some(g) if !g.name.is_empty() => format!("📞 Групповой звонок: {}", g.name),
                 _ => "📞 Входящий звонок".to_string(),
             };
-            // The WebView plays the user's selected looping ringtone for calls.
-            // Keep the Windows toast silent so it does not overlap that ringtone.
-            notify_silent(&title, &format!("{from} ({ip})"), icon);
+            // телефон: звонок ждёт страницу (её может не быть — окно закрыто), а
+            // звонит уведомление на весь экран, если окна не видно
+            #[cfg(target_os = "android")]
+            {
+                let who = state.peers.lock().await.get(&ip).map(|p| if p.nickname.trim().is_empty() { p.name.clone() } else { p.nickname.clone() }).unwrap_or_default();
+                let who = if who.trim().is_empty() { from.clone() } else { who };
+                let caller = match &group {
+                    Some(g) if !g.name.is_empty() => format!("{} — звонит {who}", g.name),
+                    _ => who,
+                };
+                crate::mobile::call_offer(&ip, offer, &caller, &title.replace("📞 ", ""));
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let _ = offer;
+                let av = state.peers.lock().await.get(&ip).map(|p| p.display_avatar());
+                let icon = av.and_then(|a| avatar_icon_path(&state.app_dir, &ip, &a));
+                // The WebView plays the user's selected looping ringtone for calls.
+                // Keep the Windows toast silent so it does not overlap that ringtone.
+                notify_silent(&title, &format!("{from} ({ip})"), icon);
+            }
         }
         Frame::CallAnswer { from, sdp } => {
             // ответили с одного из устройств: дальше звонок — только с ним
@@ -860,7 +877,10 @@ pub(crate) async fn process_frame(
             let _ = app.emit("safedrop-call-answer", serde_json::json!({"from": from, "ip": ip, "sdp": sdp}));
         }
         Frame::Ice { from, candidate } => {
-            let _ = app.emit("safedrop-ice", serde_json::json!({"from": from, "ip": ip, "candidate": candidate}));
+            let ice = serde_json::json!({"from": from, "ip": ip, "candidate": candidate});
+            #[cfg(target_os = "android")]
+            crate::mobile::call_ice(&ip, ice.clone());
+            let _ = app.emit("safedrop-ice", ice);
         }
         Frame::Hangup { from } => {
             // звонок идёт с одним устройством контакта: отбой с другого — не наш
@@ -868,6 +888,9 @@ pub(crate) async fn process_frame(
                 return Ok(());
             }
             crate::relay::unpin_call(&ip);
+            // звонящий сбросил, пока звонок ждал ответа здесь — пропущенный
+            #[cfg(target_os = "android")]
+            crate::mobile::call_gone(&ip, true);
             let _ = app.emit("safedrop-hangup", serde_json::json!({"from": from, "ip": ip}));
         }
         Frame::ScreenOffer { from, sdp, share_id, label, with_audio, call_id } => {
@@ -1206,6 +1229,8 @@ pub fn notify(title: &str, body: &str, icon: Option<String>) {
     notify_impl(title, body, icon);
 }
 
+// телефон звонок показывает сам (mobile::call_offer)
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn notify_silent(title: &str, body: &str, icon: Option<String>) {
     notify_impl(title, body, icon);
 }
@@ -1250,6 +1275,9 @@ pub async fn send_frame(ip: &str, port: u16, value: serde_json::Value, wait_repl
         // ответил или отклонил звонок здесь — на других своих устройствах он не звонит
         if (kind == "call-answer" || kind == "call-hangup") && !busy {
             crate::own::call_elsewhere(ip, &kind);
+            // и уведомление о звонке здесь больше не нужно
+            #[cfg(target_os = "android")]
+            crate::mobile::call_gone(ip, false);
         }
         // ответ (hello) нужен один: его даёт основное устройство
         if !wait_reply {

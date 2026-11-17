@@ -5,6 +5,9 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
 import android.media.projection.MediaProjectionManager
+import android.os.PowerManager
+import android.provider.Settings
+import androidx.appcompat.app.AppCompatActivity
 import android.webkit.MimeTypeMap
 import androidx.activity.result.ActivityResult
 import androidx.core.content.ContextCompat
@@ -28,6 +31,11 @@ class FileArgs {
 }
 
 @InvokeArg
+class KeepArgs {
+  var on: Boolean = true
+}
+
+@InvokeArg
 class ScreenArgs {
   var fps: Int = 12
   var max: Int = 1280
@@ -37,9 +45,45 @@ class ScreenArgs {
 // остановить демонстрацию экрана (ScreenCaptureService). Вызывается из Rust
 // (src-tauri/src/mobile.rs), путь к файлу там уже проверен.
 @TauriPlugin
-class SdAndroidPlugin(private val activity: Activity) : Plugin(activity) {
+class SdAndroidPlugin(private val first: Activity) : Plugin(first) {
   private var screenFps = 12
   private var screenMax = 1280
+  // окно могли закрыть и открыть заново (SafeDrop работал в фоне): берём текущее
+  private var current: Activity = first
+  private val activity: Activity get() = current
+
+  override fun onResume(activity: AppCompatActivity) {
+    current = activity
+  }
+
+  /** Работа в фоне: служба «SafeDrop на связи» (KeepAliveService). */
+  @Command
+  fun keepAlive(invoke: Invoke) {
+    val args = invoke.parseArgs(KeepArgs::class.java)
+    val ctx = activity.applicationContext
+    if (args.on) KeepAliveService.start(ctx) else KeepAliveService.stop(ctx)
+    invoke.resolve()
+  }
+
+  /** Работает ли SafeDrop без ограничений батареи; open — попросить это у Android. */
+  @Command
+  fun battery(invoke: Invoke) {
+    val args = invoke.parseArgs(KeepArgs::class.java)
+    val pm = activity.getSystemService(PowerManager::class.java)
+    val free = pm?.isIgnoringBatteryOptimizations(activity.packageName) ?: true
+    if (args.on && !free) {
+      try {
+        activity.startActivity(
+          Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + activity.packageName))
+        )
+      } catch (e: Exception) {
+        try { activity.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } catch (e2: Exception) {}
+      }
+    }
+    val r = app.tauri.plugin.JSObject()
+    r.put("free", free)
+    invoke.resolve(r)
+  }
 
   @Command
   fun startScreenCapture(invoke: Invoke) {

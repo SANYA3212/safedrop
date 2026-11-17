@@ -404,3 +404,236 @@ pub async fn m_screen_stop(app: AppHandle) -> Result<(), String> {
 pub fn m_screen_ack() {
     FRAME_BUSY.store(false, std::sync::atomic::Ordering::Release);
 }
+
+// ---------- работа в фоне и звонок, когда окна нет ----------
+//
+// Окно закрыли (смахнули, «назад»), а процесс живёт: держит его служба
+// `KeepAliveService`, а `lib.rs` не даёт Tauri завершиться вместе с окном.
+// Связь с сервером остаётся. Входящий звонок, пока окна не видно, показывает
+// Android (`CallNotifier.kt`) — на весь экран, со звонком. Сам звонок (offer и
+// кандидаты ICE) ждёт здесь: новая страница забирает его (`m_replay_call`) и
+// обрабатывает так, будто он только что пришёл.
+
+/// Звонок дольше этого без ответа — уже не звонок.
+const CALL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+const CALL_ICE_MAX: usize = 64;
+
+struct PendingCall {
+    ip: String,
+    offer: serde_json::Value,
+    ice: Vec<serde_json::Value>,
+    at: std::time::Instant,
+    answer: bool,
+    title: String,
+}
+
+fn pending_call() -> &'static std::sync::Mutex<Option<PendingCall>> {
+    static P: std::sync::Mutex<Option<PendingCall>> = std::sync::Mutex::new(None);
+    &P
+}
+
+/// Вызвать статический метод Kotlin-класса приложения (из любого потока:
+/// класс берётся через загрузчик классов приложения).
+fn call_static(class: &str, method: &str, sig: &str, args: &[jni::objects::JValue]) {
+    let _ = with_context(|env, ctx| {
+        let loader = env.call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
+        let name = env.new_string(format!("{PACKAGE}.{class}"))?;
+        let cls = env.call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[(&name).into()])?.l()?;
+        let cls = jni::objects::JClass::from(cls);
+        let mut full: Vec<jni::objects::JValue> = vec![jni::objects::JValue::Object(ctx)];
+        full.extend_from_slice(args);
+        env.call_static_method(&cls, method, sig, &full)?;
+        Ok(())
+    });
+}
+
+fn notify_call(ip: &str, title: &str, text: &str) {
+    let _ = with_context(|env, ctx| {
+        let loader = env.call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
+        let name = env.new_string(format!("{PACKAGE}.CallNotifier"))?;
+        let cls = env.call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[(&name).into()])?.l()?;
+        let cls = jni::objects::JClass::from(cls);
+        let (ip, title, text) = (env.new_string(ip)?, env.new_string(title)?, env.new_string(text)?);
+        env.call_static_method(
+            &cls,
+            "show",
+            "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[ctx.into(), (&ip).into(), (&title).into(), (&text).into()],
+        )?;
+        Ok(())
+    });
+}
+
+fn missed_call(title: &str, text: &str) {
+    let _ = with_context(|env, ctx| {
+        let loader = env.call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
+        let name = env.new_string(format!("{PACKAGE}.CallNotifier"))?;
+        let cls = env.call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[(&name).into()])?.l()?;
+        let cls = jni::objects::JClass::from(cls);
+        let (title, text) = (env.new_string(title)?, env.new_string(text)?);
+        env.call_static_method(
+            &cls,
+            "missed",
+            "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V",
+            &[ctx.into(), (&title).into(), (&text).into()],
+        )?;
+        Ok(())
+    });
+}
+
+/// Входящий звонок: запомнить для страницы и позвонить уведомлением (если
+/// окна не видно — это решает `CallNotifier`).
+pub fn call_offer(ip: &str, offer: serde_json::Value, title: &str, text: &str) {
+    {
+        let mut g = pending_call().lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some(PendingCall {
+            ip: ip.to_string(),
+            offer,
+            ice: Vec::new(),
+            at: std::time::Instant::now(),
+            answer: false,
+            title: title.to_string(),
+        });
+    }
+    notify_call(ip, title, text);
+}
+
+/// Кандидат ICE звонящего: пока звонок ждёт страницу — тоже ждёт.
+pub fn call_ice(ip: &str, ice: serde_json::Value) {
+    let mut g = pending_call().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = g.as_mut().filter(|p| p.ip == ip && p.ice.len() < CALL_ICE_MAX) {
+        p.ice.push(ice);
+    }
+}
+
+/// Звонок закончился до ответа здесь: звонящий сбросил (`missed`), ответили
+/// или отклонили здесь или на другом своём устройстве.
+pub fn call_gone(ip: &str, missed: bool) {
+    let taken = {
+        let mut g = pending_call().lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_ref() {
+            Some(p) if p.ip == ip => g.take(),
+            _ => None,
+        }
+    };
+    let Some(p) = taken else { return };
+    if missed && !p.answer {
+        missed_call("Пропущенный звонок", &p.title);
+    } else {
+        call_static("CallNotifier", "cancel", "(Landroid/content/Context;)V", &[]);
+    }
+}
+
+/// Новая страница: отдать ей звонок, который пришёл без неё. true — его уже
+/// приняли кнопкой «Ответить» в уведомлении (страница сразу отвечает).
+#[tauri::command]
+pub fn m_replay_call(app: AppHandle) -> bool {
+    use tauri::Emitter;
+    let p = {
+        let mut g = pending_call().lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_ref() {
+            Some(p) if p.at.elapsed() < CALL_WAIT => {}
+            _ => {
+                *g = None;
+                return false;
+            }
+        }
+        g.take()
+    };
+    let Some(p) = p else { return false };
+    let _ = app.emit("safedrop-call-offer", p.offer.clone());
+    for ice in &p.ice {
+        let _ = app.emit("safedrop-ice", ice.clone());
+    }
+    // ответ ещё может прийти: звонок остаётся «ждущим» до ответа страницы
+    let answer = p.answer;
+    *pending_call().lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingCall { ice: Vec::new(), ..p });
+    answer
+}
+
+/// Включить / выключить работу в фоне (служба с уведомлением).
+#[tauri::command]
+pub async fn m_keep_alive(app: AppHandle, on: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || run_native(&app, "keepAlive", serde_json::json!({ "on": on })))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Без ограничений ли батареи; `open` — попросить Android снять ограничения.
+#[tauri::command]
+pub async fn m_battery(app: AppHandle, open: bool) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || {
+        let n = app.try_state::<Native<tauri::Wry>>().ok_or("нет плагина Android")?;
+        let v = n.0.run_mobile_plugin::<serde_json::Value>("battery", serde_json::json!({ "on": open })).map_err(|e| e.to_string())?;
+        Ok(v.get("free").and_then(|x| x.as_bool()).unwrap_or(true))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Окно открыли снова, а SafeDrop всё это время работал в фоне: создать
+/// страницу для нового окна (как при запуске).
+#[no_mangle]
+pub extern "system" fn Java_com_safedrop_app_MainActivity_nativeReopen(_env: jni::JNIEnv, _class: jni::objects::JClass) {
+    let Some(app) = APP.get().cloned() else { return };
+    std::thread::spawn(move || {
+        if app.get_webview_window("main").is_some() {
+            return;
+        }
+        let Some(cfg) = app.config().app.windows.first().cloned() else { return };
+        if let Err(e) = tauri::WebviewWindowBuilder::from_config(&app, &cfg).and_then(|b| b.build()) {
+            eprintln!("SafeDrop: окно не создалось заново: {e}");
+        }
+    });
+}
+
+fn jstring(env: &mut jni::JNIEnv, s: &jni::objects::JString) -> String {
+    env.get_string(s).map(|x| x.to_string_lossy().chars().take(200).collect()).unwrap_or_default()
+}
+
+/// «Ответить» в уведомлении звонка.
+#[no_mangle]
+pub extern "system" fn Java_com_safedrop_app_MainActivity_nativeAnswer(mut env: jni::JNIEnv, _class: jni::objects::JClass, ip: jni::objects::JString) {
+    use tauri::Emitter;
+    let ip = jstring(&mut env, &ip);
+    if let Some(p) = pending_call().lock().unwrap_or_else(|e| e.into_inner()).as_mut().filter(|p| p.ip == ip) {
+        p.answer = true;
+    }
+    // страница жива (окно было свёрнуто) — пусть отвечает сразу
+    if let Some(app) = APP.get() {
+        let _ = app.emit("safedrop-answer-call", serde_json::json!({ "ip": ip }));
+    }
+}
+
+/// «Отклонить» в уведомлении звонка: отбой звонящему, как кнопкой в окне.
+#[no_mangle]
+pub extern "system" fn Java_com_safedrop_app_MainActivity_nativeDecline(mut env: jni::JNIEnv, _class: jni::objects::JClass, ip: jni::objects::JString) {
+    use tauri::Emitter;
+    let ip = jstring(&mut env, &ip);
+    let ours = pending_call().lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|p| p.ip == ip);
+    if !ours {
+        return;
+    }
+    call_gone(&ip, false);
+    let Some(app) = APP.get().cloned() else { return };
+    let _ = app.emit("safedrop-hangup", serde_json::json!({ "ip": ip, "from": "" }));
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<crate::state::AppState>();
+        let (port, nick) = {
+            let s = state.settings.lock().await;
+            (s.sig_port, if s.profile.nickname.is_empty() { s.device_name.clone() } else { s.profile.nickname.clone() })
+        };
+        let v = serde_json::json!({ "kind": "call-hangup", "from": nick });
+        let _ = crate::quic::send_frame_dual(&app, &ip, port, v, false).await;
+    });
+}
+
+/// «Выключить» в уведомлении «SafeDrop на связи»: сохранить и завершиться.
+#[no_mangle]
+pub extern "system" fn Java_com_safedrop_app_MainActivity_nativeQuit(_env: jni::JNIEnv, _class: jni::objects::JClass) {
+    if let Some(app) = APP.get() {
+        let state = app.state::<crate::state::AppState>();
+        crate::settings::save_chats_now(&state);
+    }
+    std::process::exit(0);
+}

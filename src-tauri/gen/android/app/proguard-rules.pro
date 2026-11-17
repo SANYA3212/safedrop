@@ -25,7 +25,14 @@
 -keep class com.safedrop.app.UrlArgs { *; }
 -keep class com.safedrop.app.FileArgs { *; }
 -keep class com.safedrop.app.ScreenArgs { *; }
+-keep class com.safedrop.app.KeepArgs { *; }
 # nativeFrame / nativeStopped реализованы в Rust (mobile.rs) по имени класса
 -keep class com.safedrop.app.ScreenCaptureService { native <methods>; }
 # отступы от системных панелей читает страница (window.SdInsets.get, MainActivity.kt)
 -keepclassmembers class com.safedrop.app.MainActivity$Insets { @android.webkit.JavascriptInterface <methods>; }
+# фоновые звонки: Rust вызывает CallNotifier и KeepAliveService по имени (mobile.rs),
+# а native-методы MainActivity реализованы в Rust
+-keep class com.safedrop.app.CallNotifier { public static *; }
+-keep class com.safedrop.app.KeepAliveService { public static *; }
+-keep class com.safedrop.app.MainActivity { native <methods>; }
+-keepclassmembers class com.safedrop.app.MainActivity$Companion { *; }

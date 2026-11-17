@@ -12,6 +12,12 @@
     <!-- демонстрация экрана: запись экрана идёт в службе с уведомлением -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- работа в фоне: звонки и сообщения, когда окно закрыто (KeepAliveService) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+    <!-- входящий звонок на весь экран, в том числе на заблокированном телефоне -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- кнопка «Работать без ограничений батареи» в настройках -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- полученные файлы — в «Загрузки/SafeDrop»; на Android 10+ разрешение не нужно -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -32,6 +38,7 @@
             android:windowSoftInputMode="adjustResize"
             android:label="@string/main_activity_title"
             android:name=".MainActivity"
+            android:showWhenLocked="false"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -40,6 +47,16 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+          android:name=".KeepAliveService"
+          android:exported="false"
+          android:stopWithTask="false"
+          android:foregroundServiceType="remoteMessaging" />
+
+        <receiver
+          android:name=".CallActionReceiver"
+          android:exported="false" />
 
         <service
           android:name=".ScreenCaptureService"
