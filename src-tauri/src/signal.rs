@@ -874,6 +874,7 @@ pub(crate) async fn process_frame(
         Frame::CallAnswer { from, sdp } => {
             // ответили с одного из устройств: дальше звонок — только с ним
             crate::relay::pin_call(&ip);
+            crate::relay::note_answered(&ip);
             let _ = app.emit("safedrop-call-answer", serde_json::json!({"from": from, "ip": ip, "sdp": sdp}));
         }
         Frame::Ice { from, candidate } => {
@@ -888,6 +889,8 @@ pub(crate) async fn process_frame(
                 return Ok(());
             }
             crate::relay::unpin_call(&ip);
+            // мой исходящий звонок отклонён — новым устройствам его не досылать
+            crate::relay::note_answered(&ip);
             // звонящий сбросил, пока звонок ждал ответа здесь — пропущенный
             #[cfg(target_os = "android")]
             crate::mobile::call_gone(&ip, true);
@@ -1279,6 +1282,8 @@ pub async fn send_frame(ip: &str, port: u16, value: serde_json::Value, wait_repl
             #[cfg(target_os = "android")]
             crate::mobile::call_gone(ip, false);
         }
+        // свой исходящий звонок: запомнить приглашение, разбудить сторожей
+        crate::relay::note_out_frame(ip, &kind, &value);
         // ответ (hello) нужен один: его даёт основное устройство
         if !wait_reply {
             match crate::relay::plan(ip, &kind) {

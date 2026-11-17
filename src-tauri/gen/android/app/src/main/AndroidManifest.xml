@@ -50,12 +50,14 @@
 
         <service
           android:name=".KeepAliveService"
+          android:process=":watch"
           android:exported="false"
           android:stopWithTask="false"
           android:foregroundServiceType="remoteMessaging" />
 
         <receiver
           android:name=".CallActionReceiver"
+          android:process=":watch"
           android:exported="false" />
 
         <service

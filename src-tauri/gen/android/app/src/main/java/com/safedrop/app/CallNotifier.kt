@@ -120,12 +120,17 @@ object CallNotifier {
   }
 }
 
-/// «Отклонить» в уведомлении звонка.
+/// «Отклонить» в уведомлении звонка. Работает в процессе сторожа (`:watch`):
+/// отказ уходит звонящему через сервер, даже если SafeDrop закрыт.
 class CallActionReceiver : BroadcastReceiver() {
   override fun onReceive(ctx: Context, intent: Intent) {
     if (intent.action != CallNotifier.ACTION_DECLINE) return
     CallNotifier.cancel(ctx)
     val ip = intent.getStringExtra(CallNotifier.EXTRA_IP) ?: return
-    try { MainActivity.nativeDecline(ip) } catch (e: Throwable) {}
+    val done = goAsync()
+    Thread {
+      try { RingWatcher.decline(ip) } catch (e: Throwable) {}
+      done.finish()
+    }.start()
   }
 }

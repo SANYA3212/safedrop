@@ -229,6 +229,7 @@ async fn join_inner(app: &AppHandle, addr: &str, host: &str, port: u16, pass: &s
         dev: temp_dev,
         form: if cfg!(target_os = "android") { proto::FORM_PHONE.into() } else { proto::FORM_DESKTOP.into() },
         quiet: true,
+        watch: false,
     };
     send_ctl(&mut w, &hello).await?;
     // ждём welcome (пароль верный и сервер умеет несколько устройств)

@@ -260,7 +260,7 @@ function answerWhenReady(ip) {
   const t = setInterval(() => {
     const cur = app?.pendingIp?.() || "";
     if (cur && (!ip || cur === ip)) { clearInterval(t); $("#cm-accept")?.click(); }
-    else if (++n > 50) clearInterval(t);
+    else if (++n > 300) clearInterval(t); // SafeDrop мог только запускаться: ждём звонок до 45 с
   }, 150);
 }
 async function registerBackgroundCalls(st) {

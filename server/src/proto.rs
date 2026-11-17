@@ -43,6 +43,14 @@ pub const FORM_PHONE: &str = "phone";
 /// Сколько устройств одного аккаунта (ID) сервер держит одновременно.
 pub const MAX_DEVS: usize = 8;
 
+/// `Ring.state`: звонок начался (пусто), звонящий сбросил, вызываемый отклонил.
+pub const RING_STOP: &str = "stop";
+pub const RING_DECLINE: &str = "decline";
+/// Сторож (`Hello.watch`) молчит дольше обычного: телефон спит; сервер сам
+/// шлёт ему `Pong` раз в столько секунд, чтобы связь не засыпала.
+pub const WATCH_IDLE_SECS: u64 = 180;
+pub const WATCH_KEEPALIVE_SECS: u64 = 50;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "t")]
 pub enum ToServer {
@@ -67,6 +75,20 @@ pub enum ToServer {
         /// Не показывать в списке (телефон, который пока только входит по коду).
         #[serde(default)]
         quiet: bool,
+        /// Сторож телефона: лёгкое соединение, которое живёт, даже когда сам
+        /// SafeDrop на телефоне закрыт, и ждёт только `Ring` (звонок). Его нет
+        /// в списке, и каналы к нему не открываются.
+        #[serde(default)]
+        watch: bool,
+    },
+    /// Звоню `to` (или: сбросил — `state` = stop; отклоняю звонок от `to` —
+    /// decline). Сам звонок идёт как раньше, каналами; это только «разбудить»
+    /// сторожей телефона, у которых закрыт SafeDrop.
+    #[serde(rename = "ring")]
+    Ring {
+        to: String,
+        #[serde(default)]
+        state: String,
     },
     /// Открыть канал к устройству `to` (порт `port`) с токеном `tok`,
     /// придуманным клиентом. Сразу после этого клиент подключается каналом.
@@ -146,6 +168,16 @@ pub enum ToClient {
     /// Код для нового устройства не принят (занят другим и т. п.).
     #[serde(rename = "pair-fail")]
     PairFail { slot: String, msg: String },
+    /// `from` звонит этому аккаунту (`state` пусто), сбросил (stop) или
+    /// отклонил звонок отсюда (decline). `from` подставляет сервер.
+    #[serde(rename = "ring")]
+    Ring {
+        from: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        state: String,
+    },
     /// Канал не открылся (адресат не в сети и т. п.).
     #[serde(rename = "fail")]
     Fail { tok: String, msg: String },
@@ -218,6 +250,10 @@ pub fn valid_slot(s: &str) -> bool {
     s.len() == 4 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+pub fn valid_ring_state(s: &str) -> bool {
+    s.is_empty() || s == RING_STOP || s == RING_DECLINE
+}
+
 pub fn clean_form(s: &str) -> String {
     if s == FORM_PHONE { FORM_PHONE.into() } else if s == FORM_DESKTOP { FORM_DESKTOP.into() } else { String::new() }
 }
@@ -261,6 +297,11 @@ mod tests {
         // старый клиент получает список с devs и не спотыкается: PeerInfo без devs
         let p = PeerInfo { id: "a".into(), name: "n".into(), ver: "v".into(), devs: vec![] };
         assert_eq!(serde_json::to_string(&p).unwrap(), r#"{"id":"a","name":"n","ver":"v"}"#);
+        let w: ToServer = serde_json::from_str(r#"{"t":"hello","watch":true}"#).unwrap();
+        assert!(matches!(w, ToServer::Hello { watch: true, .. }));
+        let r: ToClient = serde_json::from_str(r#"{"t":"ring","from":"a"}"#).unwrap();
+        assert_eq!(r, ToClient::Ring { from: "a".into(), name: String::new(), state: String::new() });
+        assert!(valid_ring_state("") && valid_ring_state("stop") && valid_ring_state("decline") && !valid_ring_state("x"));
         let j = serde_json::to_string(&ToServer::PairJoin { slot: "1234".into(), tok: "t".into() }).unwrap();
         assert_eq!(j, r#"{"t":"pair-join","slot":"1234","tok":"t"}"#);
     }

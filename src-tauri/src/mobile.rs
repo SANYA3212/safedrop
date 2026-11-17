@@ -427,6 +427,13 @@ struct PendingCall {
     title: String,
 }
 
+/// «Ответить» нажали в уведомлении сторожа, когда SafeDrop был закрыт: сам
+/// звонок придёт, когда SafeDrop подключится (звонящий дошлёт приглашение).
+fn pre_answer() -> &'static std::sync::Mutex<Option<(String, std::time::Instant)>> {
+    static P: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
+    &P
+}
+
 fn pending_call() -> &'static std::sync::Mutex<Option<PendingCall>> {
     static P: std::sync::Mutex<Option<PendingCall>> = std::sync::Mutex::new(None);
     &P
@@ -484,6 +491,14 @@ fn missed_call(title: &str, text: &str) {
 /// Входящий звонок: запомнить для страницы и позвонить уведомлением (если
 /// окна не видно — это решает `CallNotifier`).
 pub fn call_offer(ip: &str, offer: serde_json::Value, title: &str, text: &str) {
+    let answered = {
+        let mut g = pre_answer().lock().unwrap_or_else(|e| e.into_inner());
+        let hit = g.as_ref().is_some_and(|(who, at)| who == ip && at.elapsed() < CALL_WAIT + CALL_WAIT);
+        if hit {
+            *g = None;
+        }
+        hit
+    };
     {
         let mut g = pending_call().lock().unwrap_or_else(|e| e.into_inner());
         *g = Some(PendingCall {
@@ -491,9 +506,17 @@ pub fn call_offer(ip: &str, offer: serde_json::Value, title: &str, text: &str) {
             offer,
             ice: Vec::new(),
             at: std::time::Instant::now(),
-            answer: false,
+            answer: answered,
             title: title.to_string(),
         });
+    }
+    if answered {
+        // уже нажали «Ответить» — не звонить, а принять
+        if let Some(app) = APP.get() {
+            use tauri::Emitter;
+            let _ = app.emit("safedrop-answer-call", serde_json::json!({ "ip": ip }));
+        }
+        return;
     }
     notify_call(ip, title, text);
 }
@@ -596,8 +619,16 @@ fn jstring(env: &mut jni::JNIEnv, s: &jni::objects::JString) -> String {
 pub extern "system" fn Java_com_safedrop_app_MainActivity_nativeAnswer(mut env: jni::JNIEnv, _class: jni::objects::JClass, ip: jni::objects::JString) {
     use tauri::Emitter;
     let ip = jstring(&mut env, &ip);
-    if let Some(p) = pending_call().lock().unwrap_or_else(|e| e.into_inner()).as_mut().filter(|p| p.ip == ip) {
-        p.answer = true;
+    let known = match pending_call().lock().unwrap_or_else(|e| e.into_inner()).as_mut().filter(|p| p.ip == ip) {
+        Some(p) => {
+            p.answer = true;
+            true
+        }
+        None => false,
+    };
+    if !known {
+        // звонок ещё не дошёл (SafeDrop только запускается) — принять, когда придёт
+        *pre_answer().lock().unwrap_or_else(|e| e.into_inner()) = Some((ip.clone(), std::time::Instant::now()));
     }
     // страница жива (окно было свёрнуто) — пусть отвечает сразу
     if let Some(app) = APP.get() {

@@ -107,6 +107,8 @@ struct Shared {
     siblings: Vec<DevInfo>,
     /// звонок с контактом идёт с этим его устройством (ID → dev, когда)
     call_pins: HashMap<String, (String, Instant)>,
+    /// свои исходящие звонки, на которые ещё не ответили (ID → приглашение)
+    out_calls: HashMap<String, OutCall>,
     /// ждём новое устройство по коду (`pair::start`)
     pair: Option<crate::pair::Waiting>,
 }
@@ -258,6 +260,118 @@ pub fn plan(addr: &str, kind: &str) -> Plan {
         }
     }
     if devs.len() > 1 { Plan::All(devs) } else { Plan::Default }
+}
+
+/// Исходящий звонок, пока не ответили: его приглашение и кандидаты ICE. Если у
+/// вызываемого появится новое устройство (телефон разбудил сторож, и SafeDrop
+/// на нём запустился), приглашение уходит и туда.
+pub(crate) struct OutCall {
+    offer: serde_json::Value,
+    ice: Vec<serde_json::Value>,
+    at: Instant,
+    devs: Vec<String>,
+}
+
+/// Звонок ждёт ответа не дольше этого.
+const OUT_CALL_FOR: Duration = Duration::from_secs(70);
+
+/// Кадр звонка уходит контакту `addr` (из `signal::send_frame`): запомнить
+/// приглашение и разбудить сторожей его телефона (`Ring`).
+pub fn note_out_frame(addr: &str, kind: &str, value: &serde_json::Value) {
+    // повтор приглашения новому устройству (`resend_out_calls`) — не новый звонок
+    if target_dev().is_some() {
+        return;
+    }
+    let Some(id) = id_of(addr) else { return };
+    let ring = {
+        let mut g = lock();
+        if !g.multi {
+            return;
+        }
+        match kind {
+            "call-offer" => {
+                let devs = g.peers.get(id).map(|p| p.devs.iter().map(|d| d.dev.clone()).collect()).unwrap_or_default();
+                g.out_calls.insert(id.to_string(), OutCall { offer: value.clone(), ice: Vec::new(), at: Instant::now(), devs });
+                g.out_calls.retain(|_, c| c.at.elapsed() < OUT_CALL_FOR);
+                Some("")
+            }
+            "ice" => {
+                if let Some(c) = g.out_calls.get_mut(id).filter(|c| c.ice.len() < 64) {
+                    c.ice.push(value.clone());
+                }
+                None
+            }
+            // сбросил, пока не ответили: сторож покажет «пропущенный»
+            "call-hangup" => g.out_calls.remove(id).filter(|c| c.at.elapsed() < OUT_CALL_FOR).map(|_| proto::RING_STOP),
+            _ => None,
+        }
+    };
+    if let Some(state) = ring {
+        let _ = ctl_send(&ToServer::Ring { to: id.to_string(), state: state.into() });
+    }
+}
+
+/// На звонок ответили: больше никому его не досылать.
+pub fn note_answered(addr: &str) {
+    if let Some(id) = id_of(addr) {
+        lock().out_calls.remove(id);
+    }
+}
+
+/// Список устройств обновился: тем, кто подключился во время звонка, —
+/// приглашение и уже отправленные кандидаты.
+fn resend_out_calls(app: &AppHandle) {
+    let jobs: Vec<(String, String, serde_json::Value, Vec<serde_json::Value>, u16)> = {
+        let mut g = lock();
+        let sig_port = g.sig_port;
+        g.out_calls.retain(|_, c| c.at.elapsed() < OUT_CALL_FOR);
+        let mut jobs = Vec::new();
+        let peers = g.peers.clone();
+        for (id, c) in g.out_calls.iter_mut() {
+            let Some(p) = peers.get(id) else { continue };
+            for d in &p.devs {
+                if !c.devs.contains(&d.dev) {
+                    c.devs.push(d.dev.clone());
+                    jobs.push((addr_of(id), d.dev.clone(), c.offer.clone(), c.ice.clone(), sig_port));
+                }
+            }
+        }
+        jobs
+    };
+    for (addr, dev, offer, ice, port) in jobs {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let _ = app;
+            to_dev(dev, async move {
+                if crate::signal::send_frame(&addr, port, offer, false).await.is_ok() {
+                    for v in ice {
+                        let _ = crate::signal::send_frame(&addr, port, v, false).await;
+                    }
+                }
+            })
+            .await;
+        });
+    }
+}
+
+/// Вызываемый отклонил звонок со сторожа (SafeDrop на телефоне был закрыт).
+async fn ring_declined(app: &AppHandle, from: &str) {
+    let had = lock().out_calls.remove(from).is_some();
+    if !had {
+        return;
+    }
+    let addr = addr_of(from);
+    unpin_call(&addr);
+    let _ = app.emit("safedrop-hangup", serde_json::json!({ "ip": addr, "from": "" }));
+    // его другие устройства (ПК) ещё звонят — отбой и им
+    let port = lock().sig_port;
+    let nick = {
+        let st: tauri::State<'_, AppState> = app.state();
+        let s = st.settings.lock().await;
+        if s.profile.nickname.is_empty() { s.device_name.clone() } else { s.profile.nickname.clone() }
+    };
+    let v = serde_json::json!({ "kind": "call-hangup", "from": nick });
+    let _ = crate::signal::send_frame(&addr, port, v, false).await;
 }
 
 /// Звонок с контактом идёт с устройством, с которого пришёл текущий кадр.
@@ -775,6 +889,7 @@ async fn session(
         dev: my_dev(),
         form: my_form().into(),
         quiet: false,
+        watch: false,
     };
     w.write_all(line(&hello).as_bytes()).await.map_err(|e| e.to_string())?;
     w.flush().await.map_err(|e| e.to_string())?;
@@ -877,6 +992,7 @@ async fn session(
                         };
                         emit_status(app);
                         apply_presence(app).await;
+                        resend_out_calls(app);
                         if new_sibling {
                             crate::own::siblings_online(app);
                         }
@@ -892,6 +1008,12 @@ async fn session(
                             }
                         } else if proto::valid_port(&kind) {
                             tokio::spawn(incoming(app.clone(), host.clone(), port, from, kind, tok, dev));
+                        }
+                    }
+                    ToClient::Ring { from, state, .. } => {
+                        if state == proto::RING_DECLINE && proto::valid_id(&from) {
+                            let a = app.clone();
+                            tokio::spawn(async move { ring_declined(&a, &from).await });
                         }
                     }
                     ToClient::PairFail { slot, msg } => {
@@ -938,6 +1060,7 @@ async fn session(
         g.peers.clear();
         g.siblings.clear();
         g.call_pins.clear();
+        g.out_calls.clear();
         let had_pair = g.pair.take().is_some();
         g.turn = None;
         g.rtt_ms = None;

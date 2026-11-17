@@ -249,6 +249,8 @@ const PAIR_TTL: Duration = Duration::from_secs(300);
 const MAX_PAIRS: usize = 1024;
 /// Попыток ввести код с одного соединения за минуту.
 const PAIR_JOINS_PER_MIN: usize = 5;
+/// `Ring` с одного соединения за минуту.
+const RINGS_PER_MIN: usize = 60;
 
 /// Одно подключённое устройство. У аккаунта (ID = ключ) их может быть
 /// несколько: ПК и телефон одного человека с одним ключом.
@@ -256,7 +258,7 @@ struct Client {
     conn: u64,
     dev: String,
     form: String,
-    /// не показывать другим (телефон, который только входит по коду)
+    /// не показывать другим (телефон, который только входит по коду, и сторож)
     quiet: bool,
     since: Instant,
     tx: mpsc::Sender<String>,
@@ -358,6 +360,22 @@ impl Hub {
                 let _ = c.tx.try_send(line(&ToClient::Peers { list: peers_for(&g, c.conn) }));
             }
         }
+    }
+
+    /// Звонок / отбой / отказ: всем подключениям аккаунта `to`, кроме себя.
+    async fn ring(&self, from: &str, from_conn: u64, to: &str, state: &str) -> Result<(), String> {
+        if !valid_id(to) || !valid_ring_state(state) {
+            return Err("неверный запрос".into());
+        }
+        let g = self.clients.lock().await;
+        let name = g.get(from).and_then(|l| l.iter().find(|c| c.conn == from_conn)).map(|c| c.name.clone()).unwrap_or_default();
+        let msg = line(&ToClient::Ring { from: from.into(), name, state: state.into() });
+        for c in g.get(to).map(|l| l.as_slice()).unwrap_or(&[]) {
+            if c.conn != from_conn {
+                let _ = c.tx.try_send(msg.clone());
+            }
+        }
+        Ok(())
     }
 
     async fn send_to_conn(&self, id: &str, conn: u64, m: &ToClient) {
@@ -511,7 +529,9 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
         Ok(Ok(l)) => serde_json::from_slice::<ToServer>(&l).ok(),
         _ => None,
     };
-    let Some(ToServer::Hello { pass, name, ver, dev, form, quiet, .. }) = hello else { return };
+    let Some(ToServer::Hello { pass, name, ver, dev, form, quiet, watch, .. }) = hello else { return };
+    // сторожа не видно в списке, и каналы к нему не открываются
+    let quiet = quiet || watch;
     let deny = |msg: &str| line(&ToClient::Deny { msg: msg.into() });
     if !hub.password.is_empty() && !same_secret(&pass, &hub.password) {
         eprintln!("{addr}: {} — неверный пароль", short(&id));
@@ -569,7 +589,7 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
         }
         list.push(client);
     }
-    eprintln!("{addr}: + {} «{}» {} {}{}", short(&id), clean_name(&name), clean_name(&ver), if form.is_empty() { "?" } else { &form }, if quiet { " (вход по коду)" } else { "" });
+    eprintln!("{addr}: + {} «{}» {} {}{}", short(&id), clean_name(&name), clean_name(&ver), if form.is_empty() { "?" } else { &form }, if watch { " (сторож)" } else if quiet { " (вход по коду)" } else { "" });
     let welcome = ToClient::Welcome { id: id.clone(), server_ver: VERSION.into(), turn: hub.turn_info(), multi: true };
     let _ = tx.try_send(line(&welcome));
     hub.broadcast_peers().await;
@@ -595,10 +615,18 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
     let mut name_at: Option<Instant> = None;
     let mut rtt_at: Option<Instant> = None;
     let mut joins: Vec<Instant> = Vec::new();
+    let mut rings: Vec<Instant> = Vec::new();
+    let idle = Duration::from_secs(if watch { WATCH_IDLE_SECS } else { PING_SECS * 3 });
+    let mut keepalive = tokio::time::interval(Duration::from_secs(WATCH_KEEPALIVE_SECS));
     loop {
         let got = tokio::select! {
-            r = tokio::time::timeout(Duration::from_secs(PING_SECS * 3), read_line_limited(&mut reader, MAX_CTL_LINE)) => r,
+            r = tokio::time::timeout(idle, read_line_limited(&mut reader, MAX_CTL_LINE)) => r,
             _ = kick.notified() => break,
+            // сторожу — сами: входящий пакет будит спящий телефон, и он отвечает ping
+            _ = keepalive.tick(), if watch => {
+                let _ = tx.try_send(line(&ToClient::Pong));
+                continue;
+            }
         };
         let Ok(Ok(l)) = got else { break };
         let Ok(msg) = serde_json::from_slice::<ToServer>(&l) else { continue };
@@ -614,6 +642,14 @@ async fn control(hub: Arc<Hub>, s: tokio_rustls::server::TlsStream<TcpStream>, i
                 if let Err(msg) = r {
                     let _ = tx.try_send(line(&ToClient::PairFail { slot, msg }));
                 }
+            }
+            ToServer::Ring { to, state } => {
+                rings.retain(|t| t.elapsed() < Duration::from_secs(60));
+                if rings.len() >= RINGS_PER_MIN {
+                    continue;
+                }
+                rings.push(Instant::now());
+                let _ = hub.ring(&id, conn, &to, &state).await;
             }
             ToServer::PairCancel => {
                 hub.pairs.lock().await.retain(|_, s| s.conn != conn);
@@ -996,6 +1032,32 @@ mod tests {
         // порт сопряжения обычным open не открыть
         assert!(h.open(&friend, 3, "33333333", &me, "", PORT_PAIR, &tok('6')).await.is_err());
         assert!(h.open(&friend, 3, "33333333", &me, "99999999", PORT_SIG, &tok('7')).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ring_reaches_every_session_including_watcher() {
+        let h = hub();
+        let me = "a".repeat(64);
+        let friend = "b".repeat(64);
+        let (pc, mut rpc) = client(1, "11111111", FORM_DESKTOP, false, 10);
+        let (watcher, mut rw) = client(2, "22222222", FORM_PHONE, true, 5);
+        let (fr, mut rfr) = client(3, "33333333", FORM_DESKTOP, false, 5);
+        h.clients.lock().await.insert(me.clone(), vec![pc, watcher]);
+        h.clients.lock().await.insert(friend.clone(), vec![fr]);
+        h.ring(&friend, 3, &me, "").await.unwrap();
+        for rx in [&mut rpc, &mut rw] {
+            let m: ToClient = serde_json::from_str(rx.try_recv().unwrap().trim()).unwrap();
+            assert_eq!(m, ToClient::Ring { from: friend.clone(), name: "n3".into(), state: String::new() });
+        }
+        assert!(rfr.try_recv().is_err(), "себе — нет");
+        // сторож отклоняет: звонящий получает decline от аккаунта сторожа
+        h.ring(&me, 2, &friend, RING_DECLINE).await.unwrap();
+        let m: ToClient = serde_json::from_str(rfr.try_recv().unwrap().trim()).unwrap();
+        assert!(matches!(m, ToClient::Ring { ref from, ref state, .. } if *from == me && state == RING_DECLINE));
+        assert!(h.ring(&friend, 3, &me, "boom").await.is_err());
+        assert!(h.ring(&friend, 3, "nope", "").await.is_err());
+        // каналы к сторожу (quiet) не открываются
+        assert!(h.open(&friend, 3, "33333333", &me, "22222222", PORT_SIG, &"9".repeat(32)).await.is_err());
     }
 
     #[tokio::test]
