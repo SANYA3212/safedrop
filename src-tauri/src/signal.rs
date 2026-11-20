@@ -20,6 +20,10 @@ pub struct GroupRef {
     pub members: Vec<String>,
     #[serde(default)]
     pub initiator: String,
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub mesh: bool,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -841,10 +845,21 @@ pub(crate) async fn process_frame(
             }
         }
         Frame::CallOffer { from, sdp, group } => {
+            let mesh = group.as_ref().is_some_and(|g| g.mesh);
+            if mesh && (sdp.len() > 64 * 1024 || group.as_ref().is_some_and(|g| {
+                g.id.is_empty() || g.id.len() > 128
+                    || (!g.session.is_empty() && uuid::Uuid::parse_str(&g.session).is_err())
+            })) {
+                return Ok(());
+            }
             // у звонящего несколько устройств: отвечать тому, с которого звонят
             crate::relay::pin_call(&ip);
             let offer = serde_json::json!({"from": from, "ip": ip, "sdp": sdp, "group": group});
             let _ = app.emit("safedrop-call-offer", offer.clone());
+            // Между участниками соединение открывается только после принятия вызова.
+            if mesh {
+                return Ok(());
+            }
             let title = match &group {
                 Some(g) if !g.name.is_empty() => format!("📞 Групповой звонок: {}", g.name),
                 _ => "📞 Входящий звонок".to_string(),
@@ -1283,7 +1298,9 @@ pub async fn send_frame(ip: &str, port: u16, value: serde_json::Value, wait_repl
             crate::mobile::call_gone(ip, false);
         }
         // свой исходящий звонок: запомнить приглашение, разбудить сторожей
-        crate::relay::note_out_frame(ip, &kind, &value);
+        if kind != "call-offer" || value.pointer("/group/mesh").and_then(|v| v.as_bool()) != Some(true) {
+            crate::relay::note_out_frame(ip, &kind, &value);
+        }
         // ответ (hello) нужен один: его даёт основное устройство
         if !wait_reply {
             match crate::relay::plan(ip, &kind) {
