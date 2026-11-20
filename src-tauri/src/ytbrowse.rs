@@ -38,6 +38,9 @@ static CHAT_OPEN: AtomicBool = AtomicBool::new(false);
 const REMOTE_QUIET: Duration = Duration::from_secs(6);
 /// Окно браузера показано (спрятанное крестиком считается закрытым).
 static OPEN: AtomicBool = AtomicBool::new(false);
+/// Поколение фоновых циклов (адрес, медиа, «вместе»). Цикл живёт, пока его
+/// номер равен текущему; закрытие окна и новый запуск делают старые устаревшими.
+static WATCH_GEN: AtomicU64 = AtomicU64::new(0);
 /// Пользователь сам выключил «Листать вместе»: чужие переходы не подхватываем.
 static OPT_OUT: AtomicBool = AtomicBool::new(false);
 /// Время последнего клика/нажатия клавиши на странице (мс, как Date.now()).
@@ -198,12 +201,15 @@ fn layout(app: &AppHandle) {
 
 /// Следим за адресом: многие сайты (YouTube, Reddit) — одностраничные,
 /// переходы идут через history API без настоящей навигации, поэтому опрашиваем.
-fn spawn_url_watch(app: AppHandle) {
+fn spawn_url_watch(app: AppHandle, gen: u64) {
     tauri::async_runtime::spawn(async move {
         let mut last = String::new();
         let mut last_title = String::new();
         loop {
             tokio::time::sleep(Duration::from_millis(600)).await;
+            if !watch_alive(gen) {
+                return; // окно закрыто (или запущен новый цикл): shut уже всё сбросил
+            }
             let Some(view) = app.get_webview(VIEW) else { break };
             if SHARE.load(Ordering::Relaxed) {
                 // в режиме «вместе» адрес отслеживает spawn_agent_watch
@@ -310,16 +316,29 @@ fn build_window(app: &AppHandle, start: Url) -> Result<(), String> {
     });
     OPEN.store(true, Ordering::Relaxed);
     layout(app);
-    spawn_url_watch(app.clone());
-    spawn_media_watch(app.clone());
-    spawn_agent_watch(app.clone());
+    start_watchers(app);
     Ok(())
+}
+
+/// Цикл с номером `gen` ещё нужен: окно открыто и запуск не заменён новым.
+fn watch_alive(gen: u64) -> bool {
+    WATCH_GEN.load(Ordering::SeqCst) == gen && OPEN.load(Ordering::Relaxed)
+}
+
+/// Запустить три фоновых цикла для только что открытого окна. Старые (если
+/// были) становятся устаревшими и выходят сами — дублей не бывает.
+fn start_watchers(app: &AppHandle) {
+    let gen = WATCH_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    spawn_url_watch(app.clone(), gen);
+    spawn_media_watch(app.clone(), gen);
+    spawn_agent_watch(app.clone(), gen);
 }
 
 /// «Закрыть» окно браузера: спрятать, остановить страницу (уходим на
 /// стартовую — звук и видео замолкают), выключить «вместе» и чат.
 fn shut(app: &AppHandle) {
     OPEN.store(false, Ordering::Relaxed);
+    WATCH_GEN.fetch_add(1, Ordering::SeqCst); // фоновые циклы остановятся
     LAST_INPUT.store(0, Ordering::Relaxed);
     SHARE.store(false, Ordering::Relaxed);
     CHAT_OPEN.store(false, Ordering::Relaxed);
@@ -376,7 +395,11 @@ pub async fn ytb_open(app: AppHandle, url: Option<String>, remote: Option<bool>)
         if let (Some(u), Some(view)) = (target, app.get_webview(VIEW)) {
             view.navigate(u).map_err(|e| e.to_string())?;
         }
-        OPEN.store(true, Ordering::Relaxed);
+        // окно было спрятано крестиком — циклы остановлены, запускаем снова
+        // (если оно просто свёрнуто или уже открыто, циклы идут и так)
+        if !OPEN.swap(true, Ordering::SeqCst) {
+            start_watchers(&app);
+        }
         layout(&app);
         let _ = win.unminimize();
         let _ = win.show();
@@ -718,10 +741,13 @@ fn on_media_read(app: &AppHandle, url: String, raw: String) {
     );
 }
 
-fn spawn_media_watch(app: AppHandle) {
+fn spawn_media_watch(app: AppHandle, gen: u64) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(MEDIA_TICK).await;
+            if !watch_alive(gen) {
+                return;
+            }
             let Some(view) = app.get_webview(VIEW) else { break };
             if !SHARE.load(Ordering::Relaxed) {
                 if let Ok(mut m) = MEDIA.lock() {
@@ -939,12 +965,15 @@ fn agent_step(app: &AppHandle, s: &mut AgentState, url: &str, a: Option<AgentRea
 }
 
 /// В режиме «вместе» 8 раз в секунду читаем страницу: адрес, мышь, прокрутку.
-fn spawn_agent_watch(app: AppHandle) {
+fn spawn_agent_watch(app: AppHandle, gen: u64) {
     tauri::async_runtime::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut s = AgentState::default();
         loop {
             tokio::time::sleep(AGENT_TICK).await;
+            if !watch_alive(gen) {
+                return;
+            }
             let Some(view) = app.get_webview(VIEW) else { break };
             if !SHARE.load(Ordering::Relaxed) || !OPEN.load(Ordering::Relaxed) {
                 s = AgentState::default();

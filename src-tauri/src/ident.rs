@@ -348,8 +348,10 @@ pub fn merge_calls(calls: &mut [CallRecord], moved: &[(String, String)]) -> bool
 }
 
 /// Перед первой склейкой — копии файлов как были (на случай отката).
-fn backup(state: &AppState) {
-    for path in [state.peers_path(), state.chats_path(), state.call_history_path()] {
+fn backup(state: &AppState, chats: &HashMap<String, Vec<ChatMsg>>) {
+    // история теперь в chats/ и media/: копия — одним файлом в старом формате
+    crate::chatstore::backup_legacy_format(&state.app_dir, chats);
+    for path in [state.peers_path(), state.call_history_path()] {
         let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()) else { continue };
         let copy = path.with_file_name(format!("{name}.before-merge.json"));
         if path.exists() && !copy.exists() {
@@ -380,7 +382,7 @@ pub fn merge_at_start(state: &AppState) {
     if moved.is_empty() {
         return;
     }
-    backup(state);
+    backup(state, &chats);
     merge_chats(&mut chats, &moved);
     if merge_calls(&mut calls, &moved) {
         save_calls(state, &calls);
@@ -404,7 +406,10 @@ pub async fn merge_now(app: &tauri::AppHandle) {
     if moved.is_empty() {
         return;
     }
-    backup(&state);
+    {
+        let chats = state.chats.lock().await;
+        backup(&state, &chats);
+    }
     if merge_chats(&mut *state.chats.lock().await, &moved) {
         crate::settings::save_chats_soon(&state);
     }

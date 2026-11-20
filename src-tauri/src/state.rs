@@ -648,7 +648,6 @@ impl AppState {
     pub fn peers_path(&self) -> PathBuf { self.app_dir.join("peers.json") }
     pub fn history_path(&self) -> PathBuf { self.app_dir.join("history.json") }
     pub fn call_history_path(&self) -> PathBuf { self.app_dir.join("call-history.json") }
-    pub fn chats_path(&self) -> PathBuf { self.app_dir.join("chats.json") }
     pub fn groups_path(&self) -> PathBuf { self.app_dir.join("groups.json") }
     pub fn group_sync_path(&self) -> PathBuf { self.app_dir.join("group-sync.json") }
 }

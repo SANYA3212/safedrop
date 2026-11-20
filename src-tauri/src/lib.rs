@@ -1,3 +1,4 @@
+mod chatstore;
 mod discovery;
 #[cfg(target_os = "linux")]
 mod electron;
@@ -1723,7 +1724,6 @@ async fn factory_reset(
         state.settings_path(),
         state.peers_path(),
         state.history_path(),
-        state.chats_path(),
         state.groups_path(),
         state.group_sync_path(),
         state.call_history_path(),
@@ -1731,6 +1731,7 @@ async fn factory_reset(
     ] {
         let _ = std::fs::remove_file(f);
     }
+    chatstore::remove_all(&state.app_dir); // chats/, media/, chats.json и его копии
     let _ = std::fs::remove_dir_all(state.app_dir.join("avatars"));
     let _ = std::fs::remove_dir_all(state.app_dir.join("audio-out"));
     ghupdate::clear_downloads(); // установщики, скачанные с GitHub
@@ -2878,14 +2879,14 @@ pub fn run() {
         }
     }
     // chats loaded async after manage; do sync here
-    if let Ok(data) = std::fs::read_to_string(st.chats_path()) {
-        if let Ok(mut m) = serde_json::from_str::<std::collections::HashMap<String, Vec<ChatMsg>>>(&data) {
-            for rows in m.values_mut() {
-                rows.sort_by(|a, b| a.sent_at.cmp(&b.sent_at).then_with(|| a.id.cmp(&b.id)));
-            }
-            if let Ok(mut g) = st.chats.try_lock() {
-                *g = m;
-            }
+    {
+        let loaded = chatstore::load(&st.app_dir);
+        let dirty = loaded.needs_save();
+        if let Ok(mut g) = st.chats.try_lock() {
+            *g = loaded.chats;
+        }
+        if dirty {
+            settings::save_chats_now(&st);
         }
     }
     // один компьютер под несколькими адресами (LAN, Radmin, сервер) — один

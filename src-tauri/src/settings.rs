@@ -61,15 +61,14 @@ pub fn try_lock_briefly<T>(m: &tokio::sync::Mutex<T>) -> Option<tokio::sync::Mut
 
 static CHAT_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
 static CHATS_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static CHATS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn init_chat_saver(app: &tauri::AppHandle) {
     let _ = CHAT_APP.set(app.clone());
 }
 
-/// chats.json can be many MB (images are inline). Rewriting it inside every
-/// chat command blocked a tokio worker and held the chats lock; now a burst
-/// of changes becomes one background write about 0.4 s later.
+/// История лежит в `chats/` (по файлу на чат) и `media/` (картинки), см.
+/// chatstore.rs. Пачка изменений превращается в одну фоновую запись примерно
+/// через 0,4 с, и пишутся только изменившиеся чаты.
 pub fn save_chats_soon(state: &AppState) {
     use std::sync::atomic::Ordering;
     // свои другие устройства (ПК и телефон одного аккаунта) получат изменения
@@ -84,33 +83,20 @@ pub fn save_chats_soon(state: &AppState) {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         CHATS_DIRTY.store(false, Ordering::SeqCst);
         let state = app.state::<AppState>();
-        let data = serde_json::to_vec(&*state.chats.lock().await);
-        let (dir, path) = (state.app_dir.clone(), state.chats_path());
-        if let Ok(data) = data {
-            let _ = tauri::async_runtime::spawn_blocking(move || write_atomic(&dir, &path, &data)).await;
-        }
+        // под замком — только снимок (хеши и копии изменившихся чатов),
+        // запись на диск уже без него
+        let snap = crate::chatstore::snapshot(&*state.chats.lock().await);
+        let dir = state.app_dir.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || crate::chatstore::write(&dir, snap)).await;
     });
 }
 
 /// Synchronous save (app exit, or before the saver is set up).
 pub fn save_chats_now(state: &AppState) {
     if let Some(g) = try_lock_briefly(&state.chats) {
-        if let Ok(data) = serde_json::to_vec(&*g) {
-            drop(g);
-            write_atomic(&state.app_dir, &state.chats_path(), &data);
-        }
-    }
-}
-
-/// Write to a temp file and swap it in: a crash mid-write no longer leaves a
-/// truncated chats.json (which would lose the whole history on next start).
-fn write_atomic(dir: &std::path::Path, path: &std::path::Path, data: &[u8]) {
-    let _guard = CHATS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = fs::create_dir_all(dir);
-    let tmp = path.with_extension("json.tmp");
-    if fs::write(&tmp, data).is_ok() && fs::rename(&tmp, path).is_err() {
-        let _ = fs::write(path, data);
-        let _ = fs::remove_file(&tmp);
+        let snap = crate::chatstore::snapshot(&g);
+        drop(g);
+        crate::chatstore::write(&state.app_dir, snap);
     }
 }
 
