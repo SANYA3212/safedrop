@@ -535,8 +535,9 @@ async function loadAll() {
   if (leaveName) leaveName.textContent = settings.call_leave_sound
     ? fileName(settings.call_leave_sound)
     : (document.querySelector(`[data-call-leave="${CSS.escape(leaveMelody)}"]`)?.textContent || "Стандартный");
-  $("#msg-name").textContent = settings.message_sound ? fileName(settings.message_sound) : "Стандартный «блуп»";
-  $("#snd-file-name").textContent = settings.file_sound ? fileName(settings.file_sound) : "Стандартный сигнал";
+  $("#msg-name").textContent = settings.message_sound ? fileName(settings.message_sound) : "Стандартный «динь-дон»";
+  $("#snd-file-name").textContent = settings.file_sound ? fileName(settings.file_sound) : "Стандартный перелив";
+  $("#snd-notify-name").textContent = settings.notify_sound ? fileName(settings.notify_sound) : "Стандартный колокольчик";
   $("#gate-vol").value = settings.noise_gate ?? 12;
   $("#gate-vol-v").textContent = `${settings.noise_gate ?? 12}`;
   $("#noise-engine").value = ["rnnoise", "webrtc", "off"].includes(settings.noise_filter) ? settings.noise_filter : "rnnoise";
@@ -662,20 +663,23 @@ async function selectPeer(ip) {
 }
 function renderConv() {
   if (deferUi(renderConv)) return;
-  const signature = JSON.stringify([selectedDisplay(), !!currentCall, !!groupCall]);
+  const liveNow = curGroup() && !groupCall ? liveGroupCall(curGroup().id) : null;
+  const signature = JSON.stringify([selectedDisplay(), !!currentCall, !!groupCall, liveNow?.members.length || 0]);
   if (signature === convSignature) return;
   convSignature = signature;
   const g = curGroup();
   if (g) {
     const on = g.members.filter((m) => peers.find((p) => p.ip === m)?.online);
     $("#conv-name").textContent = g.name;
-    $("#conv-sub").innerHTML = `<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:2px"><circle cx="9" cy="8" r="3"/><path d="M14,11H4A2,2,0,0,0,2,13v5H6V15H4V13A1,1,0,0,1,5,12H13a1,1,0,0,1,1,1v2H12v3h4V13A2,2,0,0,0,14,11Z"/><circle cx="17" cy="9" r="2.5"/><path d="M20,11.5A1.5,1.5,0,0,0,18.5,10H15a3,3,0,0,1,2,2.82V18H15v3h4V14.82A3,3,0,0,1,20,13Z"/></svg> ${g.members.length} · <span style="color:#3ddc84">●</span> ${on.length} в сети`;
+    $("#conv-sub").innerHTML = `<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:2px"><circle cx="9" cy="8" r="3"/><path d="M14,11H4A2,2,0,0,0,2,13v5H6V15H4V13A1,1,0,0,1,5,12H13a1,1,0,0,1,1,1v2H12v3h4V13A2,2,0,0,0,14,11Z"/><circle cx="17" cy="9" r="2.5"/><path d="M20,11.5A1.5,1.5,0,0,0,18.5,10H15a3,3,0,0,1,2,2.82V18H15v3h4V14.82A3,3,0,0,1,20,13Z"/></svg> ${g.members.length} · <span style="color:#3ddc84">●</span> ${on.length} в сети${liveNow ? ` · <span style="color:#3ddc84">${PHONE_IC} идёт звонок: ${liveNow.members.length}</span>` : ""}`;
     setUiAvatar($("#conv-ava"), groupAva(g, "md").replace('class="ava md', 'id="conv-ava" class="ava md'));
-    $("#btn-call").innerHTML = '<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:4px"><path d="M21,15v3.93a2,2,0,0,1-2.29,2A18,18,0,0,1,3.14,5.29,2,2,0,0,1,5.13,3H9a1,1,0,0,1,1,.89,10.74,10.74,0,0,0,1,3.78,1,1,0,0,1-.42,1.26l-.86.49a1,1,0,0,0-.33,1.46,14.08,14.08,0,0,0,3.69,3.69,1,1,0,0,0,1.46-.33l.49-.86A1,1,0,0,1,16.33,13a10.74,10.74,0,0,0,3.78,1A1,1,0,0,1,21,15Z"/></svg> Группе';
+    $("#btn-call").innerHTML = `<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:4px"><path d="M21,15v3.93a2,2,0,0,1-2.29,2A18,18,0,0,1,3.14,5.29,2,2,0,0,1,5.13,3H9a1,1,0,0,1,1,.89,10.74,10.74,0,0,0,1,3.78,1,1,0,0,1-.42,1.26l-.86.49a1,1,0,0,0-.33,1.46,14.08,14.08,0,0,0,3.69,3.69,1,1,0,0,0,1.46-.33l.49-.86A1,1,0,0,1,16.33,13a10.74,10.74,0,0,0,3.78,1A1,1,0,0,1,21,15Z"/></svg> ${liveNow ? "Войти в звонок" : "Группе"}`;
+    $("#btn-call").classList.toggle("live-call", !!liveNow);
     $("#btn-hangup").classList.toggle("hidden", !groupCall);
     return;
   }
   $("#btn-call").innerHTML = '<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:4px"><path d="M21,15v3.93a2,2,0,0,1-2.29,2A18,18,0,0,1,3.14,5.29,2,2,0,0,1,5.13,3H9a1,1,0,0,1,1,.89,10.74,10.74,0,0,0,1,3.78,1,1,0,0,1-.42,1.26l-.86.49a1,1,0,0,0-.33,1.46,14.08,14.08,0,0,0,3.69,3.69,1,1,0,0,0,1.46-.33l.49-.86A1,1,0,0,1,16.33,13a10.74,10.74,0,0,0,3.78,1A1,1,0,0,1,21,15Z"/></svg> Звонок';
+  $("#btn-call").classList.remove("live-call");
   const p = sel();
   if (!p) {
     $("#conv-name").textContent = "Выбери контакт";
@@ -801,20 +805,21 @@ function renderGroups() {
   const box = $("#group-list"); if (!box) return;
   const q = ($("#peer-search").value || "").toLowerCase();
   const list = groups.filter((g) => !q || g.name.toLowerCase().includes(q));
-  const signature = JSON.stringify([selGroup, list.map((g) => [g, unread[`g:${g.id}`], typingLabel(`g:${g.id}`), g.members.map((ip) => { const p = peers.find((x) => x.ip === ip); return [p?.online, p?.state]; })])]);
+  const signature = JSON.stringify([selGroup, list.map((g) => [g, liveGroupCall(g.id)?.members.length || 0, unread[`g:${g.id}`], typingLabel(`g:${g.id}`), g.members.map((ip) => { const p = peers.find((x) => x.ip === ip); return [p?.online, p?.state]; })])]);
   if (signature === groupsSignature) return;
   groupsSignature = signature;
   box.innerHTML = "";
   if (!list.length) { box.innerHTML = `<div class="empty-hint">Групп нет. Создай кнопкой +.</div>`; return; }
   for (const g of list) {
     const on = g.members.filter((m) => peers.find((p) => p.ip === m)?.online).length;
-    const busy = g.members.some((m) => { const st = peers.find((p) => p.ip === m)?.state || ""; return st && st !== "idle"; });
+    const live = groupCall?.id === g.id ? null : liveGroupCall(g.id);
+    const busy = !live && g.members.some((m) => { const st = peers.find((p) => p.ip === m)?.state || ""; return st && st !== "idle"; });
     const d = document.createElement("div");
     d.className = "contact" + (selGroup === g.id ? " active" : "");
     d.dataset.gid = g.id;
     const groupTypingKey = `g:${g.id}`;
     const groupTypingText = typingPeers.has(groupTypingKey) && typingPeers.get(groupTypingKey)?.size ? typingLabel(groupTypingKey) : "";
-    d.innerHTML = `${groupAva(g, "sm")}<div class="meta"><b><span class="nm">${esc(g.name)}</span>${groupTypingText ? `<span class="typing-badge" style="margin-left:6px;font-size:11px;color:#3ddc84;">${esc(groupTypingText)}</span>` : ""}</b><small><svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:2px"><circle cx="9" cy="8" r="3"/><path d="M14,11H4A2,2,0,0,0,2,13v5H6V15H4V13A1,1,0,0,1,5,12H13a1,1,0,0,1,1,1v2H12v3h4V13A2,2,0,0,0,14,11Z"/><circle cx="17" cy="9" r="2.5"/><path d="M20,11.5A1.5,1.5,0,0,0,18.5,10H15a3,3,0,0,1,2,2.82V18H15v3h4V14.82A3,3,0,0,1,20,13Z"/></svg> ${g.members.length} · <span style="color:#3ddc84">●</span> ${on}${busy ? ' · <svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M21,15v3.93a2,2,0,0,1-2.29,2A18,18,0,0,1,3.14,5.29,2,2,0,0,1,5.13,3H9a1,1,0,0,1,1,.89,10.74,10.74,0,0,0,1,3.78,1,1,0,0,1-.42,1.26l-.86.49a1,1,0,0,0-.33,1.46,14.08,14.08,0,0,0,3.69,3.69,1,1,0,0,0,1.46-.33l.49-.86A1,1,0,0,1,16.33,13a10.74,10.74,0,0,0,3.78,1A1,1,0,0,1,21,15Z"/></svg>' : ""}${unread[`g:${g.id}`] ? ` · <svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M20,2H4A2,2,0,0,0,2,4V22l4-4H20a2,2,0,0,0,2-2V4A2,2,0,0,0,20,2Z"/></svg>${unread[`g:${g.id}`]}` : ""}</small></div>`;
+    d.innerHTML = `${groupAva(g, "sm")}<div class="meta"><b><span class="nm">${esc(g.name)}</span>${groupTypingText ? `<span class="typing-badge" style="margin-left:6px;font-size:11px;color:#3ddc84;">${esc(groupTypingText)}</span>` : ""}</b><small><svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px;margin-right:2px"><circle cx="9" cy="8" r="3"/><path d="M14,11H4A2,2,0,0,0,2,13v5H6V15H4V13A1,1,0,0,1,5,12H13a1,1,0,0,1,1,1v2H12v3h4V13A2,2,0,0,0,14,11Z"/><circle cx="17" cy="9" r="2.5"/><path d="M20,11.5A1.5,1.5,0,0,0,18.5,10H15a3,3,0,0,1,2,2.82V18H15v3h4V14.82A3,3,0,0,1,20,13Z"/></svg> ${g.members.length} · <span style="color:#3ddc84">●</span> ${on}${live ? ` · <span style="color:#3ddc84">${PHONE_IC} звонок: ${live.members.length}</span>` : ""}${busy ? ' · <svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M21,15v3.93a2,2,0,0,1-2.29,2A18,18,0,0,1,3.14,5.29,2,2,0,0,1,5.13,3H9a1,1,0,0,1,1,.89,10.74,10.74,0,0,0,1,3.78,1,1,0,0,1-.42,1.26l-.86.49a1,1,0,0,0-.33,1.46,14.08,14.08,0,0,0,3.69,3.69,1,1,0,0,0,1.46-.33l.49-.86A1,1,0,0,1,16.33,13a10.74,10.74,0,0,0,3.78,1A1,1,0,0,1,21,15Z"/></svg>' : ""}${unread[`g:${g.id}`] ? ` · <svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M20,2H4A2,2,0,0,0,2,4V22l4-4H20a2,2,0,0,0,2-2V4A2,2,0,0,0,20,2Z"/></svg>${unread[`g:${g.id}`]}` : ""}</small></div>`;
     d.onclick = () => selectGroup(g.id);
     box.appendChild(d);
   }
@@ -2983,6 +2988,40 @@ function playRingMelody(name) {
   } catch {}
 }
 
+// Стандартные звуки — короткие мягкие переливы синусом (без файлов):
+// [частота, начало с, длительность с, громкость].
+const SOFT_SOUNDS = {
+  message: [[880, 0, 0.22, 0.16], [1318.5, 0.08, 0.34, 0.13]],
+  file: [[784, 0, 0.18, 0.12], [987.8, 0.09, 0.18, 0.12], [1318.5, 0.18, 0.46, 0.14]],
+  notify: [[1046.5, 0, 0.7, 0.13], [1568, 0, 0.5, 0.045], [1318.5, 0.16, 0.6, 0.08]],
+};
+function softChime(name) {
+  if (!settings?.sound) return;
+  const notes = SOFT_SOUNDS[name]; if (!notes) return;
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    if (settings.speaker_id && ctx.setSinkId) ctx.setSinkId(settings.speaker_id).catch(() => {});
+    const lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 4500;
+    lp.connect(ctx.destination);
+    let end = 0;
+    for (const [freq, at, dur, vol] of notes) {
+      const t = ctx.currentTime + 0.03 + at;
+      // основной тон и тихий обертон: звучит как маленький колокольчик, а не писк
+      for (const [mul, k] of [[1, 1], [2, 0.16]]) {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = "sine"; o.frequency.value = freq * mul;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(vol * k, t + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        o.connect(g); g.connect(lp);
+        o.start(t); o.stop(t + dur + 0.05);
+      }
+      end = Math.max(end, at + dur);
+    }
+    setTimeout(() => ctx.close().catch(() => {}), (end + 0.6) * 1000);
+  } catch {}
+}
 function blip(freq = 880, ms = 120) {
   if (!settings?.sound) return;
   try {
@@ -3008,11 +3047,15 @@ function playOneShot(path, fallback) {
 }
 function playMsgSound() {
   if (!settings?.sound) return;
-  playOneShot(settings.message_sound, blip);
+  playOneShot(settings.message_sound, () => softChime("message"));
 }
 function playFileSound() {
   if (!settings?.sound) return;
-  playOneShot(settings.file_sound, () => blip(660));
+  playOneShot(settings.file_sound, () => softChime("file"));
+}
+function playNotifySound() {
+  if (!settings?.sound) return;
+  playOneShot(settings.notify_sound, () => softChime("notify"));
 }
 function playCallJoinSound() {
   if (!settings?.sound) return;
@@ -3038,7 +3081,7 @@ function unlockAudio() {
     if (ampCtx?.state === "suspended") ampCtx.resume().catch(() => {});
     if (micCtx?.state === "suspended") micCtx.resume().catch(() => {});
   } catch {}
-  for (const p of [settings?.message_sound, settings?.ringtone, settings?.file_sound, settings?.call_join_sound, settings?.call_leave_sound]) {
+  for (const p of [settings?.message_sound, settings?.ringtone, settings?.file_sound, settings?.notify_sound, settings?.call_join_sound, settings?.call_leave_sound]) {
     if (!p) continue;
     try { const t = new Audio(tauriFile(p)); t.preload = "auto"; t.load(); } catch {}
   }
@@ -3614,6 +3657,24 @@ function updateBusy() {
   const busy = inVoice() || Object.keys(myShares).length > 0 || Object.keys(views).length > 0;
   invoke("set_busy", { busy }).catch(() => {});
 }
+// Где участник группового звонка: в звонке, подключается, ещё не зашёл.
+function groupMemberState(ip) {
+  const g = gpc[ip];
+  if (!g?.pc) return "out";
+  const st = g.pc.connectionState;
+  if (st === "connected") return "in";
+  if (st === "failed" || st === "closed" || st === "disconnected") return "lost";
+  return g.pc.remoteDescription ? "joining" : "ringing";
+}
+function groupMemberLabel(ip) {
+  switch (groupMemberState(ip)) {
+    case "in": return "";
+    case "joining": return "подключается…";
+    case "ringing": return groupCall?.initiator === myIp ? "звоним…" : "ещё не зашёл";
+    case "lost": return "нет связи";
+    default: return "не в звонке";
+  }
+}
 function renderCallPanel() {
   const box = $("#cp-users"); if (!box) return; box.innerHTML = "";
   const parts = [];
@@ -3627,11 +3688,11 @@ function renderCallPanel() {
   }
   for (const ip of parts) {
     const p = peers.find((x) => x.ip === ip);
-    const alive = currentCall === ip || !!gpc[ip]?.pc;
+    const state = currentCall === ip ? "" : groupMemberLabel(ip);
     const v = peerVol(ip);
     const row = document.createElement("div");
     row.className = "cp-user";
-    row.innerHTML = `<b>${esc(p ? dispName(p) : ip)}${alive ? "" : " (вышел)"}</b><span class="cp-vol">${v}%</span><input type="range" min="0" max="200" value="${v}" /><button>${v > 0 ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><path d="M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z"/><path d="M14,3.23v2.06a7,7,0,0,1,0,13.42v2.06a9,9,0,0,0,0-17.54Z"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'}</button>`;
+    row.innerHTML = `<b>${esc(p ? dispName(p) : ip)}${state ? ` <small class="cp-state">(${esc(state)})</small>` : ""}</b><span class="cp-vol">${v}%</span><input type="range" min="0" max="200" value="${v}" /><button>${v > 0 ? '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><path d="M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z"/><path d="M14,3.23v2.06a7,7,0,0,1,0,13.42v2.06a9,9,0,0,0,0-17.54Z"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'}</button>`;
     const r = row.querySelector("input"), b = row.querySelector("button"), pctLabel = row.querySelector(".cp-vol");
     r.oninput = () => {
       ampSet("v:" + ip, (deafened || r.value == 0) ? 0 : r.value);
@@ -3764,11 +3825,12 @@ function renderCallStage() {
   box.appendChild(me.firstChild);
   const addPeer = (ip) => {
     const p = peers.find((x) => x.ip === ip);
-    const alive = currentCall === ip || !!gpc[ip]?.pc;
+    const state = currentCall === ip ? "" : groupMemberLabel(ip);
+    const alive = !state;
     // он сейчас показывает экран (мы смотрим) — видно прямо на его плитке
     const sharing = Object.values(views).some((v) => v.ip === ip);
     const d = document.createElement("div");
-    d.innerHTML = tileHTML({ key: ip, ava: avaHTML(p || { name: ip, ip, online: alive }, "lg"), name: p ? dispName(p) : ip, sub: alive ? (sharing ? `показывает экран · ${p?.ping_ms ?? "?"} мс` : `${p?.ping_ms ?? "?"} мс`) : "вышел", mic: '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><path d="M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z"/><path d="M14,3.23v2.06a7,7,0,0,1,0,13.42v2.06a9,9,0,0,0,0-17.54Z"/></svg>', off: !alive });
+    d.innerHTML = tileHTML({ key: ip, ava: avaHTML(p || { name: ip, ip, online: alive }, "lg"), name: p ? dispName(p) : ip, sub: alive ? (sharing ? `показывает экран · ${p?.ping_ms ?? "?"} мс` : `в звонке · ${p?.ping_ms ?? "?"} мс`) : state, mic: '<svg class="ic" viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><path d="M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z"/><path d="M14,3.23v2.06a7,7,0,0,1,0,13.42v2.06a9,9,0,0,0,0-17.54Z"/></svg>', off: !alive });
     box.appendChild(d.firstChild);
   };
   if (currentCall) addPeer(currentCall);
@@ -3983,7 +4045,7 @@ function renderCallScreenStage() {
       const p = callPeerByIp(m);
       const nm = p ? dispName(p) : m;
       if (!match(nm)) continue;
-      people.push({ key: m, name: nm, ava: callAvatarHTML(p, nm), muted: false });
+      people.push({ key: m, name: nm, ava: callAvatarHTML(p, nm), muted: false, state: groupMemberLabel(m) });
     }
   } else if (currentCall) {
     const p = callPeerByIp(currentCall);
@@ -3992,9 +4054,9 @@ function renderCallScreenStage() {
   }
   for (const person of people) {
     const tile = document.createElement("div");
-    tile.className = "cs-person";
+    tile.className = "cs-person" + (person.state ? " not-in" : "");
     tile.dataset.spk = person.key;
-    tile.innerHTML = `${person.ava}<b>${esc(person.name)}</b>${person.muted ? '<span class="cs-mic"><svg viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>' : ""}`;
+    tile.innerHTML = `${person.ava}<b>${esc(person.name)}</b>${person.state ? `<small class="cs-state">${esc(person.state)}</small>` : ""}${person.muted ? '<span class="cs-mic"><svg viewBox="0 0 24 24"><path d="M3,9v6h4l5,5V4L7,9Z"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>' : ""}`;
     peopleBox.appendChild(tile);
   }
   box.classList.toggle("single", !shares.length && people.length === 1);
@@ -4096,8 +4158,12 @@ async function rtcDebugCollect() {
 }
 invoke("rtc_debug_on").then((on) => { if (on) setInterval(rtcDebugTick, 4000); }).catch(() => {});
 
+const PHONE_IC = '<svg class="ic" viewBox="0 0 24 24" style="vertical-align:-3px"><path d="M21,15v3.93a2,2,0,0,1-2.29,2A18,18,0,0,1,3.14,5.29,2,2,0,0,1,5.13,3H9a1,1,0,0,1,1,.89,10.74,10.74,0,0,0,1,3.78,1,1,0,0,1-.42,1.26l-.86.49a1,1,0,0,0-.33,1.46,14.08,14.08,0,0,0,3.69,3.69,1,1,0,0,0,1.46-.33l.49-.86A1,1,0,0,1,16.33,13a10.74,10.74,0,0,0,3.78,1A1,1,0,0,1,21,15Z"/></svg>';
 // ---------- group voice mesh ----------
 let gpc = {}, groupCall = null;
+// идущие звонки групп, где нас нет (см. liveGroupCall)
+const groupCallLive = {};
+let groupStateTimer = null;
 let ginBuf = {};
 const queuedMeshOffers = new Map();
 
@@ -4130,8 +4196,12 @@ function ensureGPC(peerIp) {
   };
   c.ontrack = (e) => { attachRemoteVoice(peerIp, e.streams?.[0] || new MediaStream([e.track])); renderCallPanel(); };
   c.onconnectionstatechange = () => {
-    if (c.connectionState === "connected") { toast(`<svg class='ic' viewBox='0 0 24 24'><path d='M3,9v6h4l5,5V4L7,9Z'/><path d='M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z'/><path d='M14,3.23v2.06a7,7,0,0,1,0,13.42v2.06a9,9,0,0,0,0-17.54Z'/></svg> ${peerIp} в звонке`); renderCallPanel(); }
-    if (c.connectionState === "failed") toast(`${peerIp}: нет прямого соединения`, true);
+    if (gpc[peerIp]?.pc !== c) return;
+    const p = peers.find((x) => x.ip === peerIp);
+    const who = p ? dispName(p) : peerIp;
+    if (c.connectionState === "connected") toast(`<svg class='ic' viewBox='0 0 24 24'><path d='M3,9v6h4l5,5V4L7,9Z'/><path d='M16.5,12a4.5,4.5,0,0,0-2.5-4v8A4.5,4.5,0,0,0,16.5,12Z'/><path d='M14,3.23v2.06a7,7,0,0,1,0,13.42v2.06a9,9,0,0,0,0-17.54Z'/></svg> ${esc(who)} в звонке`);
+    if (c.connectionState === "failed") toast(`${esc(who)}: нет прямого соединения`, true);
+    renderCallPanel(); renderCallStage(); scheduleGroupCallState();
   };
   const audioStream = micTrackStream();
   micTracks().forEach((t) => { try { c.addTrack(t, audioStream); } catch {} });
@@ -4153,6 +4223,7 @@ async function offerTo(peerIp, group, roster, mesh = false) {
 }
 async function startGroupCall(g) {
   if (!g?.members?.length) return toast("В группе нет участников", true);
+  if (!groupCall && liveGroupCall(g.id)) return joinLiveGroupCall(g.id);
   if (currentCall || groupCall || pendingOffer || callSetupPeer) return toast("Сначала заверши текущий звонок или ответь на приглашение", true);
   if (noRtc()) return;
   endGroupCall(true); // before the mic starts: ending a call releases the mic
@@ -4188,9 +4259,11 @@ function showGroupUI() {
   bindSharesToCall(screenCallId(), groupCall?.members || []);
   $("#btn-hangup").classList.remove("hidden");
   startCallTimer(); renderConv(); renderCallPanel(); renderCallStage(); updateVoiceBar(); updateBusy();
+  if (groupCall) { delete groupCallLive[groupCall.id]; scheduleGroupCallState(); }
 }
 async function acceptMeshOffer(ip, sdp) {
   const c = ensureGPC(ip);
+  gpc[ip].offerSdp = sdp;
   await c.setRemoteDescription(linuxVoiceOffer(remoteDesc(sdp)));
   if (groupCall && !activeCallAnsweredAt) activeCallAnsweredAt = Date.now(); // кто-то вошёл в звонок
   await flushGin(ip);
@@ -4198,10 +4271,115 @@ async function acceptMeshOffer(ip, sdp) {
   await c.setLocalDescription(ans);
   await invoke("sig_send", { peerIp: ip, payload: { kind: "call-answer", from: myNick(), sdp: JSON.stringify(ans) } });
 }
+function groupHasMember(gid, ip) {
+  return !!groups.find((g) => g.id === gid)?.members.some((m) => groupPeerIp(m) === ip);
+}
 async function connectMeshPeer(ip, sdp, call) {
-  if (groupCall !== call || gpc[ip] || !groupCallHasPeer(call, ip)) return;
+  if (groupCall !== call) return;
+  if (gpc[ip]?.offerSdp === sdp) return; // то же предложение пришло второй раз (TCP, потом QUIC)
+  // Соединение с ним уже было, а он прислал новое предложение: он вышел и
+  // вернулся (его «отбой» мог потеряться). Старое соединение закрываем.
+  if (gpc[ip]?.pc?.remoteDescription) {
+    try { gpc[ip].pc.close(); } catch {}
+    delete gpc[ip]; dropRemoteVoice(ip);
+  }
+  if (gpc[ip]) return;
+  if (!groupCallHasPeer(call, ip)) {
+    if (!groupHasMember(call.id, ip)) return;
+    call.members.push(ip);
+  }
   try { await acceptMeshOffer(ip, sdp); }
   catch (err) { if (groupCall === call) toast(`${ip}: ${err}`, true); }
+}
+// ---------- идущий групповой звонок: видно всей группе, можно войти и вернуться ----------
+// gid -> { session, name, initiator, by: { ip отправителя: { members, at } } }
+const GROUP_LIVE_TTL = 45000;
+function liveGroupCall(gid) {
+  const e = groupCallLive[gid]; if (!e) return null;
+  const now = Date.now();
+  const members = new Set();
+  for (const [ip, r] of Object.entries(e.by)) {
+    if (now - r.at > GROUP_LIVE_TTL) { delete e.by[ip]; continue; }
+    members.add(groupPeerIp(ip));
+    for (const m of r.members) members.add(groupPeerIp(m));
+  }
+  for (const ip of [myIp, ...myIps]) members.delete(ip);
+  if (!members.size) { delete groupCallLive[gid]; return null; }
+  return { ...e, members: [...members] };
+}
+function sendGroupCallState(call, active) {
+  const g = groups.find((x) => x.id === call.id);
+  const inCall = Object.keys(gpc).filter((ip) => groupMemberState(ip) === "in");
+  const targets = new Set((g?.members || call.members).map(groupPeerIp));
+  for (const ip of [myIp, ...myIps]) targets.delete(ip);
+  if (active) for (const ip of inCall) targets.delete(ip); // они и так в звонке
+  const payload = { kind: "group-call-state", from: myNick(), group: call.id, session: call.session || "", name: call.name || "", initiator: call.initiator || "", members: [myIp, ...inCall].filter(Boolean).slice(0, 64), active };
+  for (const ip of targets) invoke("sig_send", { peerIp: ip, payload }).catch(() => {});
+}
+// после перемен — через полсекунды, и раз в 15 секунд, пока звонок идёт
+function scheduleGroupCallState() {
+  if (!groupCall || groupStateTimer) return;
+  groupStateTimer = setTimeout(() => {
+    groupStateTimer = null;
+    if (groupCall) sendGroupCallState(groupCall, true);
+  }, 500);
+}
+setInterval(() => {
+  if (groupCall) sendGroupCallState(groupCall, true);
+  // устаревшие звонки гаснут в списке групп и в шапке
+  if (Object.keys(groupCallLive).length) { for (const gid of Object.keys(groupCallLive)) liveGroupCall(gid); renderGroups(); renderConv(); }
+}, 15000);
+function onGroupCallState(v) {
+  const gid = v?.group, ip = v?.ip;
+  if (!gid || !ip || !groups.some((g) => g.id === gid)) return;
+  if (groupCall && groupCall.id === gid) return; // мы сами в этом звонке
+  let e = groupCallLive[gid];
+  if (v.active) {
+    if (!e || (v.session && e.session && e.session !== v.session)) e = groupCallLive[gid] = { session: v.session || "", name: v.name || "", initiator: v.initiator || "", by: {} };
+    if (v.name) e.name = v.name;
+    e.by[ip] = { members: Array.isArray(v.members) ? v.members.filter((m) => typeof m === "string") : [], at: Date.now() };
+  } else if (e) {
+    delete e.by[ip];
+    for (const r of Object.values(e.by)) r.members = r.members.filter((m) => groupPeerIp(m) !== ip);
+  }
+  const live = liveGroupCall(gid);
+  // звонок только начался и звонит приглашением — сообщаем, когда в нём уже говорят
+  if (live && live.members.length >= 2 && !groupCallLive[gid].notified && !inVoice() && pendingOffer?.group?.id !== gid) {
+    groupCallLive[gid].notified = true;
+    const g = groups.find((x) => x.id === gid);
+    toast(`${PHONE_IC} В группе «${esc(g?.name || live.name || "Группа")}» идёт звонок — можно войти`);
+    playNotifySound(); pingHidden();
+  }
+  renderGroups(); renderConv();
+}
+async function joinLiveGroupCall(gid) {
+  if (pendingOffer?.group?.id === gid) {
+    $("#call-modal").classList.add("hidden"); ringbackStop(); incomingRingtoneStop();
+    return joinGroupCall(pendingOffer);
+  }
+  const live = liveGroupCall(gid);
+  if (!live) { renderConv(); return toast("Звонок уже закончился", true); }
+  if (currentCall || groupCall || pendingOffer || callSetupPeer) return toast("Сначала заверши текущий звонок или ответь на приглашение", true);
+  if (noRtc()) return;
+  endGroupCall(true); // before the mic starts: ending a call releases the mic
+  callSetupPeer = myIp || gid;
+  try { await startMic(); } catch { requestMic(); return; }
+  finally { callSetupPeer = null; }
+  if (currentCall || groupCall) return;
+  const g = groups.find((x) => x.id === gid);
+  const roster = [...new Set([...live.members, myIp].filter(Boolean))];
+  const call = groupCall = { id: gid, name: g?.name || live.name || "Группа", members: roster.slice(), initiator: live.initiator || live.members[0], session: live.session || "" };
+  showGroupUI();
+  toast("Входим в звонок…");
+  await Promise.all(live.members.map(async (ip) => {
+    try { await offerTo(ip, call, roster, true); } catch (e) { if (groupCall === call) toast(`${ip}: ${e}`, true); }
+  }));
+  // никто не ответил — звонок, видимо, уже закончился
+  setTimeout(() => {
+    if (groupCall !== call || Object.values(gpc).some((x) => x.pc.remoteDescription)) return;
+    toast("Никто не ответил — звонок уже закончился", true);
+    endGroupCall(true);
+  }, 15000);
 }
 async function joinGroupCall(invitation) {
   const { group: gref, ip: viaIp, sdp: viaSdp } = invitation;
@@ -4247,6 +4425,17 @@ async function joinGroupCall(invitation) {
 }
 function endGroupCall(silent) {
   const endedGroup = groupCall;
+  if (endedGroup) {
+    const stayed = Object.keys(gpc).filter((ip) => groupMemberState(ip) === "in");
+    sendGroupCallState(endedGroup, false);
+    // остальные ещё говорят — в звонок можно вернуться кнопкой «Войти в звонок»
+    if (stayed.length) {
+      const by = {};
+      for (const ip of stayed) by[ip] = { members: [ip], at: Date.now() };
+      groupCallLive[endedGroup.id] = { notified: true, session: endedGroup.session || "", name: endedGroup.name, initiator: endedGroup.initiator, by };
+    }
+    clearTimeout(groupStateTimer); groupStateTimer = null;
+  }
   if (endedGroup && activeCallStartedAt) {
     const status = activeCallAnsweredAt ? "completed" : "unanswered";
     saveCallRecord({ direction: activeCallDirection, peer: endedGroup.name || endedGroup.id, group: true, status, participants: endedGroup.members, startedAt: activeCallStartedAt, durationFrom: activeCallAnsweredAt });
@@ -5334,7 +5523,7 @@ $("#btn-msg-pick").onclick = async () => {
 $("#btn-msg-test").onclick = () => playMsgSound();
 $("#btn-msg-clear").onclick = async () => {
   settings.message_sound = ""; try { await invoke("save_settings", { settings }); } catch (e) { return toast("Не сохранилось: " + e, true); }
-  $("#msg-name").textContent = "Стандартный «блуп»"; toast("Стандартный звук");
+  $("#msg-name").textContent = "Стандартный «динь-дон»"; toast("Стандартный звук");
 };
 $("#btn-snd-file-pick").onclick = async () => {
   try {
@@ -5349,7 +5538,22 @@ $("#btn-snd-file-pick").onclick = async () => {
 $("#btn-snd-file-test").onclick = () => playFileSound();
 $("#btn-snd-file-clear").onclick = async () => {
   settings.file_sound = ""; try { await invoke("save_settings", { settings }); } catch (e) { return toast("Не сохранилось: " + e, true); }
-  $("#snd-file-name").textContent = "Стандартный сигнал"; toast("Стандартный звук");
+  $("#snd-file-name").textContent = "Стандартный перелив"; toast("Стандартный звук");
+};
+$("#btn-snd-notify-pick").onclick = async () => {
+  try {
+    const path = await invoke("pick_audio");
+    if (!path) return;
+    const bad = await checkAudioFile(path);
+    if (bad) return toast("Звук не подойдёт: " + bad, true);
+    settings.notify_sound = path; await invoke("save_settings", { settings });
+    $("#snd-notify-name").textContent = fileName(path); toast("Звук уведомлений установлен"); playNotifySound();
+  } catch (e) { toast("" + e, true); }
+};
+$("#btn-snd-notify-test").onclick = () => playNotifySound();
+$("#btn-snd-notify-clear").onclick = async () => {
+  settings.notify_sound = ""; try { await invoke("save_settings", { settings }); } catch (e) { return toast("Не сохранилось: " + e, true); }
+  $("#snd-notify-name").textContent = "Стандартный колокольчик"; toast("Стандартный звук");
 };
 $("#btn-clear-history").onclick = async () => {
   if (!await askConfirm("Очистить всю историю передач?", "Сами файлы не тронуты.", "Очистить")) return;
@@ -5760,6 +5964,11 @@ $("#cm-accept").onclick = async () => {
   acceptCall();
 };
 $("#cm-decline").onclick = async () => {
+  if (pendingOffer?.group?.id) {
+    const gr = pendingOffer.group;
+    groupCallLive[gr.id] = { notified: true, session: gr.session || "", name: gr.name || "", initiator: gr.initiator || pendingOffer.ip, by: { [pendingOffer.ip]: { members: [pendingOffer.ip], at: Date.now() } } };
+    setTimeout(() => { renderGroups(); renderConv(); }, 0);
+  }
   if (pendingOffer) saveCallRecord({ direction: "incoming", peer: pendingOffer.group?.name || pendingOffer.ip, group: !!pendingOffer.group, status: "missed" });
   $("#call-modal").classList.add("hidden"); ringbackStop();
   if (pendingOffer) await invoke("sig_send", { peerIp: pendingOffer.ip, payload: { kind: "call-hangup", from: profile.nickname || "" } }).catch(() => {});
@@ -6355,7 +6564,7 @@ try {
     setTypingState(key, nick, true);
   });
   await listen("safedrop-transfers", () => refreshTransfers());
-  await listen("safedrop-file-offer", (e) => { incomingFileOffers.push(e.payload); showNextIncomingFileOffer(); });
+  await listen("safedrop-file-offer", (e) => { incomingFileOffers.push(e.payload); showNextIncomingFileOffer(); playNotifySound(); pingHidden(); });
   await listen("safedrop-received", (e) => { toast(`<svg class='ic' viewBox='0 0 24 24'><path d='M20,11H7.83l5.59-5.59L12,4l-8,8,8,8,1.41-1.41L7.83,13H20Z'/></svg> Получен файл: ${e.payload.filename}`); playFileSound(); pingHidden(); refreshTransfers(); });
   await listen("safedrop-cancelled", (e) => { toast(`<svg class='ic' viewBox='0 0 24 24'><path d='M6,6H18V18H6Z'/></svg> Отменено: ${e.payload.filename} (хвост удалён)`); refreshTransfers(); });
   await listen("safedrop-call-offer", async (e) => {
@@ -6462,6 +6671,7 @@ try {
     playCallLeaveSound();
     toast("Звонок завершён"); hideCallUI();
   });
+  await listen("safedrop-group-call-state", (e) => onGroupCallState(e.payload));
   await listen("safedrop-groups", (e) => {
     groups = e.payload || []; normalizeGroups();
     renderGroups(); renderConv(); renderPeerCard();

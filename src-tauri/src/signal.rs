@@ -98,6 +98,10 @@ pub(crate) enum Frame {
     ChatReact { from: String, nickname: String, id: String, emoji: String, #[serde(default)] remove: bool },
     #[serde(rename = "chat-typing")]
     ChatTyping { from: String, nickname: String, #[serde(default)] to_group: Option<String> },
+    /// Идёт ли групповой звонок и кто в нём: участники рассылают это членам
+    /// группы, чтобы те видели звонок и могли войти (или вернуться) в него.
+    #[serde(rename = "group-call-state")]
+    GroupCallState { from: String, group: String, #[serde(default)] session: String, #[serde(default)] name: String, #[serde(default)] initiator: String, #[serde(default)] members: Vec<String>, #[serde(default)] active: bool },
     #[serde(rename = "yt-sync")]
     YtSync { from: String, #[serde(default)] ip: String, #[serde(default)] nickname: String, #[serde(default)] action: String, #[serde(default)] video: String, #[serde(default)] pos: f64, #[serde(default)] paused: bool, #[serde(default)] at: i64, #[serde(default)] seq: i64, #[serde(default)] title: String, #[serde(default)] by: String, #[serde(default)] watching: bool, #[serde(default)] vertical: bool, #[serde(default)] queue: serde_json::Value, #[serde(default)] qv: i64, #[serde(default, rename = "loop")] repeat: String, #[serde(default)] lv: i64, #[serde(default)] to_group: Option<String> },
     /// «Листать вместе»: участник открыл страницу в окне браузера.
@@ -1096,6 +1100,24 @@ pub(crate) async fn process_frame(
                 persist_chats(&state).await;
                 let _ = app.emit("safedrop-chat-changed", serde_json::json!({"peer": peer}));
             }
+        }
+        Frame::GroupCallState { from: _, group, session, name, initiator, members, active } => {
+            if group.is_empty() || group.len() > 128 || name.len() > 256 || initiator.len() > 64 || members.len() > 64
+                || members.iter().any(|m| m.is_empty() || m.len() > 64)
+                || (!session.is_empty() && uuid::Uuid::parse_str(&session).is_err()) {
+                return Ok(());
+            }
+            // о звонке группы сообщает только её участник
+            let src = sender_identity(&state, &ip).await.0;
+            let groups: Vec<Group> = state.groups.lock().await.clone();
+            let sync = state.group_sync.lock().await.clone();
+            if !source_in_group(&group, &src, &groups, &sync) {
+                return Ok(());
+            }
+            let _ = app.emit("safedrop-group-call-state", serde_json::json!({
+                "ip": ip, "group": group, "session": session, "name": name,
+                "initiator": initiator, "members": members, "active": active,
+            }));
         }
         Frame::ChatTyping { from, nickname, to_group } => {
             // momentary indicator, never persisted or recorded in chat history

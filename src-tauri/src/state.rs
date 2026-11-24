@@ -249,6 +249,8 @@ pub struct Settings {
     pub message_sound: String, // path to custom incoming-message sound ("")
     #[serde(default)]
     pub file_sound: String, // path to custom file-received sound ("")
+    #[serde(default)]
+    pub notify_sound: String, // path to custom notification sound ("")
     #[serde(default = "def_vol")]
     pub mic_volume: u16, // 0..300, 100 = as-is
     #[serde(default = "def_gate")]
@@ -377,6 +379,7 @@ impl Default for Settings {
             ctx_menu: false,
             message_sound: String::new(),
             file_sound: String::new(),
+            notify_sound: String::new(),
             mic_volume: 100,
             noise_gate: 12,
             noise_suppress: def_noise_suppress(),
