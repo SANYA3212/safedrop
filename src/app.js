@@ -3230,7 +3230,7 @@ let iceOutBuf = [], iceInBuf = []; // кандидаты, пришедшие р�
 const earlyIce = {};
 function earlyIcePush(key, cand) {
   const now = Date.now();
-  for (const k of Object.keys(earlyIce)) if (now - earlyIce[k].at > 60000) delete earlyIce[k];
+  for (const k of Object.keys(earlyIce)) if (now - earlyIce[k].at > 180000) delete earlyIce[k];
   if (!earlyIce[key] && Object.keys(earlyIce).length >= 32) return;
   const e = earlyIce[key] || (earlyIce[key] = { at: now, list: [] });
   if (e.list.length < 64) e.list.push(cand);
@@ -3238,7 +3238,7 @@ function earlyIcePush(key, cand) {
 function takeEarlyIce(key) {
   const e = earlyIce[key];
   delete earlyIce[key];
-  return e && Date.now() - e.at <= 60000 ? e.list : [];
+  return e && Date.now() - e.at <= 180000 ? e.list : [];
 }
 function sendIce(peerIp, cand) {
   invoke("sig_send", { peerIp, payload: { kind: "ice", from: profile.nickname || settings.device_name, candidate: JSON.stringify(cand) } }).catch(() => {});
@@ -3667,7 +3667,9 @@ function groupMemberState(ip) {
   return g.pc.remoteDescription ? "joining" : "ringing";
 }
 function groupMemberLabel(ip) {
-  switch (groupMemberState(ip)) {
+  const st = groupMemberState(ip);
+  if (st !== "in" && st !== "joining" && groupCall?.heard?.has(ip)) return "в звонке, соединяемся…";
+  switch (st) {
     case "in": return "";
     case "joining": return "подключается…";
     case "ringing": return groupCall?.initiator === myIp ? "звоним…" : "ещё не зашёл";
@@ -4173,14 +4175,47 @@ function groupPeerIp(ip) {
 function sameGroupCall(a, b) {
   return a?.id === b.id && (!a.session || !b.session || a.session === b.session);
 }
+// Друзья знают друг друга по разным адресам (Radmin у одного, сервер у другого).
+// В приглашении у каждого участника идут и его другие адреса — по ним его
+// узнают остальные. Свои адреса друзей в LAN не рассылаем: хватает основного
+// адреса и адреса на сервере.
+function memberAliases(m) {
+  const p = peers.find((x) => x.ip === m || x.ips?.includes(m));
+  const list = [m, p?.ip, ...(p?.ips || [])].filter((a) => typeof a === "string" && a && (a === m || a === p?.ip || a.startsWith("sd-")));
+  return [...new Set(list)].slice(0, 8);
+}
+function rosterAliases(roster, prev) {
+  return roster.map((m, i) => {
+    const got = Array.isArray(prev?.[i]) ? prev[i].filter((a) => typeof a === "string" && a && a.length <= 80) : [];
+    return [...new Set([...memberAliases(m), ...got])].slice(0, 8);
+  });
+}
+// какой это у нас контакт: по любому из адресов участника
+function resolveMember(m, aliases) {
+  for (const a of [m, ...(aliases || [])]) {
+    const p = peers.find((x) => x.ip === a || x.ips?.includes(a));
+    if (p) return p.ip;
+  }
+  return m;
+}
+function isMyAddr(m, aliases) {
+  return [m, ...(aliases || [])].some((a) => a && (a === myIp || myIps.includes(a)));
+}
 function groupCallHasPeer(group, ip) {
-  return group.members.some((m) => groupPeerIp(m) === ip);
+  return group.members.some((m, i) => resolveMember(m, group.aliases?.[i]) === ip);
+}
+// номер сессии из строки o= предложения: по нему встречные предложения решают, кто уступает
+function sdpSessionKey(sdpJson) {
+  let sdp = "";
+  try { sdp = JSON.parse(sdpJson)?.sdp || ""; } catch {}
+  const m = /^o=\S+ (\d+) /m.exec(sdp);
+  return (m ? m[1] : "").padStart(24, "0") + sdp.length;
 }
 function queueMeshOffer(ip, sdp, group) {
   if (sdp.length > 64 * 1024 || group.id.length > 128) return;
   const now = Date.now();
   for (const [key, entry] of queuedMeshOffers) {
-    if (now - entry.at > 60000) queuedMeshOffers.delete(key);
+    if (now - entry.at > 180000) queuedMeshOffers.delete(key);
   }
   const key = JSON.stringify([group.id, group.session || "", ip]);
   if (queuedMeshOffers.size >= 64 && !queuedMeshOffers.has(key)) return;
@@ -4213,13 +4248,26 @@ async function flushGin(ip) {
   const buf = [...takeEarlyIce(ip), ...(ginBuf[ip] || [])]; ginBuf[ip] = [];
   for (const cd of buf) { try { await g.pc.addIceCandidate(JSON.parse(cd)); } catch {} }
 }
+function meshOfferPayload(group, roster, sdp, mesh) {
+  const aliases = group.roster === roster && Array.isArray(group.aliases) ? group.aliases : rosterAliases(roster);
+  return { kind: "call-offer", from: myNick(), sdp, group: { id: group.id, name: group.name, members: roster, aliases, initiator: group.initiator || myIp, session: group.session, mesh } };
+}
 async function offerTo(peerIp, group, roster, mesh = false) {
   if (gpc[peerIp]) return;
   const c = ensureGPC(peerIp);
   const offer = localDesc(await c.createOffer());
   await c.setLocalDescription(offer);
   if (groupCall !== group || gpc[peerIp]?.pc !== c) return;
-  await invoke("sig_send", { peerIp, payload: { kind: "call-offer", from: myNick(), sdp: JSON.stringify(offer), group: { id: group.id, name: group.name, members: roster, initiator: group.initiator || myIp, session: group.session, mesh } } });
+  const sdp = JSON.stringify(offer);
+  Object.assign(gpc[peerIp], { sentOffer: sdp, offeredAt: Date.now(), mesh });
+  await invoke("sig_send", { peerIp, payload: meshOfferPayload(group, roster, sdp, mesh) });
+}
+// своё предложение ещё ждёт ответа — переслать его же (могло потеряться)
+function resendOffer(ip, call) {
+  const g = gpc[ip];
+  if (!g?.sentOffer || g.pc.remoteDescription) return;
+  g.offeredAt = Date.now();
+  invoke("sig_send", { peerIp: ip, payload: meshOfferPayload(call, call.roster || call.members, g.sentOffer, true) }).catch(() => {});
 }
 async function startGroupCall(g) {
   if (!g?.members?.length) return toast("В группе нет участников", true);
@@ -4231,12 +4279,15 @@ async function startGroupCall(g) {
   try { await startMic(); } catch { requestMic(); return; }
   finally { callSetupPeer = null; }
   const roster = [...g.members];
-  const call = groupCall = { id: g.id, name: g.name, members: [...new Set(roster.map(groupPeerIp))], initiator: myIp, session: crypto.randomUUID() };
+  const aliases = rosterAliases(roster);
+  const others = roster.map((m, i) => isMyAddr(m, aliases[i]) ? null : resolveMember(m, aliases[i]));
+  const call = groupCall = { id: g.id, name: g.name, members: [...new Set(others.filter(Boolean))], initiator: myIp, session: crypto.randomUUID(), roster, aliases };
   showGroupUI();
   ringbackStart();
   toast(`Звоним группе «${g.name}»…`);
-  await Promise.all(roster.filter((m) => m !== myIp && !myIps.includes(m)).map(async (m) => {
-    try { await offerTo(groupPeerIp(m), call, roster); } catch (e) { if (groupCall === call) toast(`${m}: ${e}`, true); }
+  await Promise.all(others.map(async (ip) => {
+    if (!ip) return;
+    try { await offerTo(ip, call, roster); } catch (e) { if (groupCall === call) toast(`${ip}: ${e}`, true); }
   }));
 }
 function startCallTimer() {
@@ -4277,17 +4328,22 @@ function groupHasMember(gid, ip) {
 async function connectMeshPeer(ip, sdp, call) {
   if (groupCall !== call) return;
   if (gpc[ip]?.offerSdp === sdp) return; // то же предложение пришло второй раз (TCP, потом QUIC)
-  // Соединение с ним уже было, а он прислал новое предложение: он вышел и
-  // вернулся (его «отбой» мог потеряться). Старое соединение закрываем.
-  if (gpc[ip]?.pc?.remoteDescription) {
-    try { gpc[ip].pc.close(); } catch {}
+  if (!groupCallHasPeer(call, ip) && !groupHasMember(call.id, ip) && !call.heard?.has(ip)) return;
+  const cur = gpc[ip];
+  if (cur?.pc && !cur.pc.remoteDescription) {
+    // Встречные предложения (оба позвали друг друга): уступает тот, у кого номер
+    // сессии больше. Победитель пересылает своё — проигравший примет его.
+    if (cur.sentOffer && sdpSessionKey(cur.sentOffer) < sdpSessionKey(sdp)) { resendOffer(ip, call); return; }
+    try { cur.pc.close(); } catch {}
+    delete gpc[ip]; dropRemoteVoice(ip);
+  } else if (cur?.pc) {
+    // Соединение с ним уже было, а он прислал новое предложение: он вышел и
+    // вернулся (его «отбой» мог потеряться). Старое соединение закрываем.
+    try { cur.pc.close(); } catch {}
     delete gpc[ip]; dropRemoteVoice(ip);
   }
   if (gpc[ip]) return;
-  if (!groupCallHasPeer(call, ip)) {
-    if (!groupHasMember(call.id, ip)) return;
-    call.members.push(ip);
-  }
+  if (!call.members.includes(ip)) call.members.push(ip);
   try { await acceptMeshOffer(ip, sdp); }
   catch (err) { if (groupCall === call) toast(`${ip}: ${err}`, true); }
 }
@@ -4329,10 +4385,31 @@ setInterval(() => {
   // устаревшие звонки гаснут в списке групп и в шапке
   if (Object.keys(groupCallLive).length) { for (const gid of Object.keys(groupCallLive)) liveGroupCall(gid); renderGroups(); renderConv(); }
 }, 15000);
+// Участник нашего звонка сообщает «я в звонке», а связи с ним нет: его запрос
+// потерялся, устарел или он узнал нас не по тому адресу. Соединяемся сами.
+function healMeshPeer(ip, call) {
+  if (groupCall !== call || !ip || isMyAddr(ip)) return;
+  (call.heard ||= new Set()).add(ip);
+  if (!call.members.includes(ip)) call.members.push(ip);
+  const cur = gpc[ip];
+  const st = cur?.pc?.connectionState;
+  if (st === "connected" || st === "disconnected" || st === "connecting") return;
+  if (cur?.pc && !cur.pc.remoteDescription) {
+    if (Date.now() - (cur.offeredAt || 0) > 8000) resendOffer(ip, call);
+    return;
+  }
+  if (cur?.pc && st !== "failed" && st !== "closed") return; // ответ уже ушёл, ждём связь
+  if (cur?.pc) { try { cur.pc.close(); } catch {} delete gpc[ip]; dropRemoteVoice(ip); }
+  void offerTo(ip, call, call.roster || call.members, true).catch(() => {});
+  renderCallPanel(); renderCallStage();
+}
 function onGroupCallState(v) {
   const gid = v?.group, ip = v?.ip;
   if (!gid || !ip || !groups.some((g) => g.id === gid)) return;
-  if (groupCall && groupCall.id === gid) return; // мы сами в этом звонке
+  if (groupCall && groupCall.id === gid) { // мы сами в этом звонке
+    if (v.active && sameGroupCall(groupCall, { id: gid, session: v.session || "" })) healMeshPeer(ip, groupCall);
+    return;
+  }
   let e = groupCallLive[gid];
   if (v.active) {
     if (!e || (v.session && e.session && e.session !== v.session)) e = groupCallLive[gid] = { session: v.session || "", name: v.name || "", initiator: v.initiator || "", by: {} };
@@ -4368,7 +4445,7 @@ async function joinLiveGroupCall(gid) {
   if (currentCall || groupCall) return;
   const g = groups.find((x) => x.id === gid);
   const roster = [...new Set([...live.members, myIp].filter(Boolean))];
-  const call = groupCall = { id: gid, name: g?.name || live.name || "Группа", members: roster.slice(), initiator: live.initiator || live.members[0], session: live.session || "" };
+  const call = groupCall = { id: gid, name: g?.name || live.name || "Группа", members: live.members.slice(), initiator: live.initiator || live.members[0], session: live.session || "", roster, aliases: rosterAliases(roster) };
   showGroupUI();
   toast("Входим в звонок…");
   await Promise.all(live.members.map(async (ip) => {
@@ -4403,9 +4480,11 @@ async function joinGroupCall(invitation) {
   finally { callSetupPeer = null; }
   if (pendingOffer !== invitation) { stopMic(); return; }
   pendingOffer = null;
-  const roster = gref.members || [];
-  const members = [...new Set([...roster.map(groupPeerIp), viaIp])];
-  const call = groupCall = { id: gref.id, name: gref.name || "Группа", members, initiator: gref.initiator || viaIp, session: gref.session || "" };
+  const roster = Array.isArray(gref.members) ? gref.members : [];
+  const aliases = rosterAliases(roster, gref.aliases);
+  const resolved = roster.map((m, i) => isMyAddr(m, aliases[i]) ? null : resolveMember(m, aliases[i]));
+  const members = [...new Set([...resolved.filter(Boolean), viaIp])];
+  const call = groupCall = { id: gref.id, name: gref.name || "Группа", members, initiator: gref.initiator || viaIp, session: gref.session || "", roster, aliases };
   showGroupUI();
   try { await acceptMeshOffer(viaIp, viaSdp); }
   catch (e) { if (groupCall === call) { toast(`Не вступил: ${e}`, true); endGroupCall(); } return; }
@@ -4413,13 +4492,15 @@ async function joinGroupCall(invitation) {
   for (const [key, entry] of queuedMeshOffers) {
     if (!sameGroupCall(call, entry.group)) continue;
     queuedMeshOffers.delete(key);
-    if (Date.now() - entry.at <= 60000) void connectMeshPeer(entry.ip, entry.sdp, call);
+    if (Date.now() - entry.at <= 180000) void connectMeshPeer(entry.ip, entry.sdp, call);
   }
   // Compare addresses from the host's roster so exactly one side makes each offer.
-  const me = roster.find((m) => m === myIp || myIps.includes(m)) || myIp;
-  await Promise.all(roster.map(async (m) => {
-    const ip = groupPeerIp(m);
-    if (ip === viaIp || m === call.initiator || m === myIp || myIps.includes(m) || (me && me >= m)) return;
+  // Кого так не позвали (запрос потерялся) — соединит healMeshPeer по их «я в звонке».
+  const meIdx = roster.findIndex((m, i) => isMyAddr(m, aliases[i]));
+  const me = meIdx >= 0 ? roster[meIdx] : myIp;
+  await Promise.all(roster.map(async (m, i) => {
+    const ip = resolved[i];
+    if (!ip || ip === viaIp || m === call.initiator || (me && me >= m)) return;
     try { await offerTo(ip, call, roster, true); } catch (e) { if (groupCall === call) toast(`${ip}: ${e}`, true); }
   }));
 }
@@ -6577,7 +6658,7 @@ try {
       // Предложение от участника может обогнать приглашение или настройку микрофона.
       const waiting = pendingOffer?.group;
       if (group.mesh || (waiting && pendingOffer.ip !== ip && sameGroupCall(waiting, group))) {
-        if (!waiting || (sameGroupCall(waiting, group) && groupCallHasPeer(waiting, ip))) queueMeshOffer(ip, sdp, group);
+        if (!waiting || (sameGroupCall(waiting, group) && (groupCallHasPeer(waiting, ip) || groupHasMember(group.id, ip)))) queueMeshOffer(ip, sdp, group);
         return;
       }
       if (waiting && pendingOffer.ip === ip && sameGroupCall(waiting, group)) return;

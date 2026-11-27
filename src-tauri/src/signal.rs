@@ -24,6 +24,21 @@ pub struct GroupRef {
     pub session: String,
     #[serde(default)]
     pub mesh: bool,
+    /// Другие адреса каждого участника (параллельно `members`): по ним участники
+    /// узнают друг друга, если знают друг друга по разным адресам (Radmin / сервер).
+    #[serde(default)]
+    pub aliases: Vec<Vec<String>>,
+}
+
+impl GroupRef {
+    /// Не больше 64 участников по 8 коротких адресов; иначе адреса отбрасываются.
+    fn trim_aliases(&mut self) {
+        if self.aliases.len() > 64
+            || self.aliases.iter().any(|a| a.len() > 8 || a.iter().any(|x| x.is_empty() || x.len() > 80))
+        {
+            self.aliases.clear();
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -848,7 +863,10 @@ pub(crate) async fn process_frame(
                 }
             }
         }
-        Frame::CallOffer { from, sdp, group } => {
+        Frame::CallOffer { from, sdp, mut group } => {
+            if let Some(g) = group.as_mut() {
+                g.trim_aliases();
+            }
             let mesh = group.as_ref().is_some_and(|g| g.mesh);
             if mesh && (sdp.len() > 64 * 1024 || group.as_ref().is_some_and(|g| {
                 g.id.is_empty() || g.id.len() > 128
@@ -1776,6 +1794,22 @@ pub async fn announce_all(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::is_data_image;
+
+    #[test]
+    fn group_ref_aliases_are_optional_and_bounded() {
+        // приглашение старой версии — без адресов участников
+        let old: super::GroupRef = serde_json::from_str(r#"{"id":"g","members":["26.0.0.2"],"mesh":true}"#).unwrap();
+        assert!(old.aliases.is_empty());
+        let mut g: super::GroupRef = serde_json::from_str(r#"{"id":"g","members":["26.0.0.2"],"aliases":[["26.0.0.2","sd-bbbb"]]}"#).unwrap();
+        g.trim_aliases();
+        assert_eq!(g.aliases, vec![vec!["26.0.0.2".to_string(), "sd-bbbb".to_string()]]);
+        g.aliases = vec![vec!["x".repeat(81)]];
+        g.trim_aliases();
+        assert!(g.aliases.is_empty());
+        g.aliases = vec![vec!["a".to_string(); 9]];
+        g.trim_aliases();
+        assert!(g.aliases.is_empty());
+    }
 
     #[test]
     fn only_plain_image_data_urls_pass() {
