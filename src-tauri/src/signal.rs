@@ -207,6 +207,10 @@ async fn handle_frame(app: AppHandle, sock: TcpStream, ip: String) -> Result<(),
     };
     // контакт с запомненным ключом: чужой ключ или соединение без ключа не разбираем
     crate::tls::check_inbound(&ip, &auth)?;
+    // пришёл напрямую со своим ключом: по этому адресу ему можно ответить
+    if auth.fp.is_some() {
+        crate::ident::note_inbound(&ip);
+    }
     serve_frame(app, sock, ip).await
 }
 
@@ -1404,16 +1408,9 @@ async fn send_frame_one(ip: &str, port: u16, value: serde_json::Value, wait_repl
 /// advertised `chat_ack` get the new frame, so older clients stay compatible.
 async fn send_chat_ack(app: &AppHandle, peer_ip: &str, ids: Vec<String>) {
     let state: tauri::State<'_, AppState> = app.state();
-    // Gate on the peer's advertised support, but do not lose acks on a fresh
-    // contact: a scanned peer has no profile hash yet, so its flags are still
-    // defaults. Only skip when we positively know it is an older client.
-    let capable = match state.peers.lock().await.get(peer_ip) {
-        Some(p) => p.supports_chat_ack || p.phash.is_empty(),
-        None => true,
-    };
-    if !capable {
-        return;
-    }
+    // Подтверждаем всегда: незнакомый кадр старые версии просто пропускают, а
+    // флаг поддержки бывает ложным — контакт, впервые пришедший через
+    // profile-hash, записан без флагов, и ack ему не уходил (серые галочки).
     let port = state.settings.lock().await.sig_port;
     let v = serde_json::json!({"kind":"chat-ack","ids":ids});
     let _ = crate::quic::send_frame_dual(app, peer_ip, port, v, false).await;
@@ -1723,6 +1720,13 @@ pub async fn dead_online(state: &AppState, port: u16) -> Vec<String> {
     for (ip, addrs) in online {
         let mut alive = false;
         for a in &addrs {
+            // режим «через сервер»: прямой адрес не пингуем, он жив, пока
+            // собеседник сам к нам с него подключается
+            if crate::relay::active() && !crate::relay::is_relay(a)
+                && crate::ident::inbound_within(a, crate::ident::DIRECT_GRACE) {
+                alive = true;
+                break;
+            }
             if crate::discovery::tcp_ping(a, port, 1200).await.is_some() {
                 alive = true;
                 break;

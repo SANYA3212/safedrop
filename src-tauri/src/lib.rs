@@ -370,6 +370,17 @@ async fn refresh_live_inner(app: &tauri::AppHandle, state: &tauri::State<'_, App
             }
         }
         relay::apply_presence(app).await;
+        {
+            // собеседник с прямыми соединениями сам подключается к нам — он в сети
+            let mut g = state.peers.lock().await;
+            for p in g.values_mut().filter(|p| !p.online) {
+                // на 10 с дольше, чем dead_online: сначала уйдёт peer-lost (звонок закончится), потом погаснет
+                if ident::addrs_of(p).iter().any(|a| !relay::is_relay(a) && ident::direct_reply_ok(a)
+                    && ident::inbound_within(a, ident::DIRECT_GRACE + std::time::Duration::from_secs(10))) {
+                    p.online = true;
+                }
+            }
+        }
         let peers: Vec<Peer> = state.peers.lock().await.values().cloned().collect();
         let _ = app.emit("safedrop-peers", peers.clone());
         return peers;
@@ -420,7 +431,12 @@ async fn refresh_live_inner(app: &tauri::AppHandle, state: &tauri::State<'_, App
         // зачищаем ранее пролезшие свои адреса
         g.retain(|ip, _| !mine.contains(ip));
         let now = chrono::Local::now().format("%H:%M:%S").to_string();
-        for p in g.values_mut() { p.online = false; p.ping_ms = None; }
+        // Проба файлового порта короткая (450 мс) и иногда не успевает; контакт,
+        // с которым только что был живой обмен, по одной неудачной пробе не гасим.
+        for p in g.values_mut() {
+            if p.online && ident::addrs_of(p).iter().any(|a| ident::seen_within(a, ident::DIRECT_GRACE)) { continue; }
+            p.online = false; p.ping_ms = None;
+        }
         for (ip, ping) in &live {
             ident::note_alive(ip, *ping);
             // контакт ищется по первичному адресу, по любому из его адресов и по

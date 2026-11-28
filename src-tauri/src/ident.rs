@@ -24,11 +24,14 @@ struct Routes {
     addrs: HashMap<String, Vec<String>>,
     /// адрес → (пинг, когда ответил)
     alive: HashMap<String, (u64, Instant)>,
+    /// адрес → когда контакт сам подключился к нам с него по взаимному TLS
+    /// (неудачное исходящее соединение эту отметку не стирает)
+    inbound: HashMap<String, Instant>,
 }
 
 fn routes() -> &'static Mutex<Routes> {
     static R: std::sync::OnceLock<Mutex<Routes>> = std::sync::OnceLock::new();
-    R.get_or_init(|| Mutex::new(Routes { owner: HashMap::new(), addrs: HashMap::new(), alive: HashMap::new() }))
+    R.get_or_init(|| Mutex::new(Routes { owner: HashMap::new(), addrs: HashMap::new(), alive: HashMap::new(), inbound: HashMap::new() }))
 }
 
 /// Все адреса контакта: первичный и остальные, без повторов.
@@ -70,10 +73,55 @@ pub fn note_dead(addr: &str) {
     }
 }
 
+/// Контакт сам подключился к нам с этого адреса по взаимному TLS: адрес
+/// живой, и по нему можно ответить (даже если у нас режим «через сервер»,
+/// а у собеседника — прямые соединения).
+pub fn note_inbound(addr: &str) {
+    if let Ok(mut r) = routes().lock() {
+        r.inbound.insert(addr.to_string(), Instant::now());
+    }
+}
+
+/// Сколько после последнего входящего кадра контакт считается в сети и ему
+/// можно отвечать напрямую: три пропущенных сердцебиения (раз в 15 с).
+pub const DIRECT_GRACE: Duration = Duration::from_secs(45);
+
+/// Ответить напрямую на входящий можно столько: чтение большого кадра (картинки)
+/// само занимает до минуты, а подтверждение уходит уже после него.
+pub const REPLY_GRACE: Duration = Duration::from_secs(120);
+
+/// Контакт подключался к нам с этого адреса не дольше `within` назад.
+pub fn inbound_within(addr: &str, within: Duration) -> bool {
+    inbound_age(addr).is_some_and(|age| age < within)
+}
+
+fn inbound_age(addr: &str) -> Option<Duration> {
+    routes().lock().ok()?.inbound.get(addr).map(|at| at.elapsed())
+}
+
+/// С адресом был живой обмен (он ответил нам или сам подключился) не дольше `within` назад.
+pub fn seen_within(addr: &str, within: Duration) -> bool {
+    routes().lock().ok().is_some_and(|r| {
+        r.alive.get(addr).is_some_and(|(_, at)| at.elapsed() < within)
+            || r.inbound.get(addr).is_some_and(|at| at.elapsed() < within)
+    })
+}
+
+/// Режим «через сервер»: прямой адрес годится для ответа, только если контакт
+/// сам недавно пришёл с него и ключ этого адреса запомнен (ответ уйдёт по TLS
+/// с проверкой ключа). Телефон работает только через сервер.
+pub fn direct_reply_ok(addr: &str) -> bool {
+    !cfg!(target_os = "android")
+        && inbound_within(addr, REPLY_GRACE)
+        && crate::tls::pin_of(addr).is_some_and(|p| p.mutual && !p.fp.is_empty())
+}
+
 /// Куда подключаться, чтобы достучаться до контакта с адресом `addr`: его
-/// адреса в порядке предпочтения. В режиме «через сервер» — только адреса
-/// через сервер, иначе — только прямые; сначала недавно ответившие (по пингу),
-/// потом сам `addr`, потом остальные.
+/// адреса в порядке предпочтения. В режиме «через сервер» — адреса через
+/// сервер, а за ними прямые, которые сейчас живы (собеседник с прямыми
+/// соединениями сам к нам подключается — ему и отвечаем напрямую, иначе
+/// подтверждения и ответы до него не доходят). Иначе — только прямые.
+/// Сначала недавно ответившие (по пингу), потом сам `addr`, потом остальные.
 pub fn route(addr: &str) -> Vec<String> {
     let relay_mode = crate::relay::active();
     let (all, alive) = {
@@ -91,7 +139,16 @@ pub fn route(addr: &str) -> Vec<String> {
         (all, alive)
     };
     let all = same_key_only(addr, &all, key_of);
-    order(addr, &all, relay_mode, |a| alive.get(a).copied())
+    // прямые адреса, на которые можно ответить: адрес → секунд с его входящего
+    let reply_ok: HashMap<String, u64> = if relay_mode {
+        all.iter()
+            .filter(|a| !crate::relay::is_relay(a) && direct_reply_ok(a))
+            .filter_map(|a| inbound_age(a).map(|age| (a.clone(), age.as_secs())))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    order(addr, &all, relay_mode, |a| alive.get(a).copied(), |a| reply_ok.get(a).copied())
 }
 
 /// Запасные адреса — только с тем же запомненным ключом, что у контакта:
@@ -118,22 +175,44 @@ fn verified_key(addr: &str) -> Option<String> {
     crate::tls::pin_of(addr).filter(|p| p.mutual && !p.fp.is_empty()).map(|p| p.fp)
 }
 
-fn order(addr: &str, all: &[String], relay_mode: bool, alive: impl Fn(&str) -> Option<u64>) -> Vec<String> {
+fn order(addr: &str, all: &[String], relay_mode: bool, alive: impl Fn(&str) -> Option<u64>, reply_age: impl Fn(&str) -> Option<u64>) -> Vec<String> {
     let usable: Vec<&String> = all.iter().filter(|a| crate::relay::is_relay(a) == relay_mode).collect();
-    if usable.is_empty() {
+    let mut out: Vec<String> = Vec::new();
+    if !usable.is_empty() {
+        let mut live: Vec<(u64, &String)> = usable.iter().filter_map(|a| alive(a).map(|p| (p, *a))).collect();
+        live.sort_by_key(|(p, _)| *p);
+        out = live.into_iter().map(|(_, a)| a.clone()).collect();
+        if usable.iter().any(|a| *a == addr) && !out.iter().any(|a| a == addr) {
+            out.push(addr.to_string());
+        }
+        for a in usable {
+            if !out.contains(a) {
+                out.push(a.clone());
+            }
+        }
+    }
+    if relay_mode {
+        // прямые адреса, с которых контакт сам к нам пришёл: только что (до 10 с) —
+        // первыми (ответ тому же устройству, тем же путём), иначе — запасным путём
+        let mut direct: Vec<(u64, &String)> = all.iter()
+            .filter(|a| !crate::relay::is_relay(a))
+            .filter_map(|a| reply_age(a).map(|age| (age, a)))
+            .collect();
+        direct.sort_by_key(|(age, _)| *age);
+        let fresh: Vec<String> = direct.iter().filter(|(age, _)| *age < 10).map(|(_, a)| (*a).clone()).collect();
+        out.retain(|a| !fresh.contains(a));
+        let mut front = fresh;
+        front.extend(out);
+        out = front;
+        for (_, a) in direct {
+            if !out.contains(a) {
+                out.push(a.clone());
+            }
+        }
+    }
+    if out.is_empty() {
         // нет адреса для этого режима: пусть соединение само скажет почему
         return vec![addr.to_string()];
-    }
-    let mut live: Vec<(u64, &String)> = usable.iter().filter_map(|a| alive(a).map(|p| (p, *a))).collect();
-    live.sort_by_key(|(p, _)| *p);
-    let mut out: Vec<String> = live.into_iter().map(|(_, a)| a.clone()).collect();
-    if usable.iter().any(|a| *a == addr) && !out.iter().any(|a| a == addr) {
-        out.push(addr.to_string());
-    }
-    for a in usable {
-        if !out.contains(a) {
-            out.push(a.clone());
-        }
     }
     out
 }
@@ -543,8 +622,19 @@ mod tests {
         let relay = format!("sd-{}", "c".repeat(64));
         let all = vec!["10.0.0.1".to_string(), "26.0.0.1".to_string(), relay.clone()];
         let alive = |a: &str| match a { "26.0.0.1" => Some(40), _ => None };
-        assert_eq!(order("10.0.0.1", &all, false, alive), vec!["26.0.0.1", "10.0.0.1"]);
-        assert_eq!(order("10.0.0.1", &all, true, alive), vec![relay.clone()]);
-        assert_eq!(order("10.0.0.9", &["10.0.0.9".to_string()], true, |_| None), vec!["10.0.0.9"]);
+        let came = |a: &str| (a == "26.0.0.1").then_some(30);
+        let none = |_: &str| None;
+        assert_eq!(order("10.0.0.1", &all, false, alive, came), vec!["26.0.0.1", "10.0.0.1"]);
+        // режим «через сервер»: сначала сервер, потом прямой адрес, с которого контакт пришёл сам
+        assert_eq!(order("10.0.0.1", &all, true, alive, came), vec![relay.clone(), "26.0.0.1".to_string()]);
+        // просто ответивший на скан прямой адрес в режиме сервера не годится
+        assert_eq!(order("10.0.0.1", &all, true, alive, none), vec![relay.clone()]);
+        assert_eq!(order("10.0.0.9", &["10.0.0.9".to_string()], true, |_| None, none), vec!["10.0.0.9"]);
+        // контакт без адреса на сервере, но он сам пришёл напрямую — отвечаем напрямую
+        let direct_only = vec!["26.0.0.1".to_string()];
+        assert_eq!(order("26.0.0.1", &direct_only, true, |_| None, came), vec!["26.0.0.1"]);
+        // кадр пришёл напрямую только что — отвечаем тем же путём, сервер запасным
+        let just = |a: &str| (a == "26.0.0.1").then_some(2);
+        assert_eq!(order("10.0.0.1", &all, true, alive, just), vec!["26.0.0.1".to_string(), relay.clone()]);
     }
 }

@@ -520,7 +520,8 @@ pub async fn accept(sock: TcpStream) -> std::io::Result<(Stream, PeerAuth)> {
 }
 
 /// TCP до контакта: напрямую или каналом через сервер (адрес `sd-…`).
-/// Режимы не смешиваются: в режиме «через сервер» прямых соединений нет.
+/// В режиме «через сервер» прямые соединения — только ответом на живой прямой
+/// адрес: собеседник с прямыми соединениями сам подключился к нам с него.
 async fn tcp(ip: &str, port: u16, timeout: Duration) -> Result<Stream, String> {
     if crate::relay::is_relay(ip) {
         let s = tokio::time::timeout(timeout, crate::relay::open(ip, port))
@@ -528,7 +529,7 @@ async fn tcp(ip: &str, port: u16, timeout: Duration) -> Result<Stream, String> {
             .map_err(|_| "тайм-аут подключения через сервер".to_string())??;
         return Ok(Box::new(s));
     }
-    if crate::relay::active() {
+    if crate::relay::active() && !crate::ident::direct_reply_ok(ip) {
         return Err(format!("{ip}: включён режим «через сервер», прямые соединения не используются"));
     }
     let s = tokio::time::timeout(timeout, TcpStream::connect(format!("{ip}:{port}")))
@@ -570,6 +571,10 @@ pub async fn connect(ip: &str, port: u16, timeout: Duration) -> Result<Stream, S
 async fn connect_one(ip: &str, port: u16, timeout: Duration) -> Result<Stream, String> {
     let relayed = crate::relay::id_of(ip);
     let pinned = relayed.is_some() || pin_of(ip).is_some();
+    // прямой ответ в режиме «через сервер» — только с проверкой ключа
+    if relayed.is_none() && crate::relay::active() && !pinned {
+        return Err(format!("{ip}: включён режим «через сервер», прямые соединения не используются"));
+    }
     let sock = tcp(ip, port, timeout).await?;
     if !pinned && !peer_ok(ip) {
         return Ok(sock);
